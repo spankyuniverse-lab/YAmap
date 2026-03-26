@@ -1,17 +1,18 @@
 """
-Парсер Яндекс.Карт — сбор организаций по поисковому запросу.
+Парсер Яндекс.Карт — сбор организаций по поисковому запросу или по категориям.
 
 Яндекс.Карты используют динамическую подгрузку результатов (infinite scroll),
 поэтому для парсинга применяется Playwright с эмуляцией прокрутки.
 
-Два режима работы:
-  1. DOM-парсинг (по умолчанию) — скролл + извлечение из HTML
-  2. API-перехват (--api-intercept) — ловит JSON-ответы внутреннего API
+Режимы работы:
+  1. По запросу:    python yandex_parser.py "кофейни Москва"
+  2. По категориям: python yandex_parser.py --city Москва --category еда рестораны кафе
+  3. Все категории: python yandex_parser.py --city Москва --all-categories
+  4. Список категорий: python yandex_parser.py --list-categories
 
-Использование:
-    python yandex_parser.py "кофейни Москва"
-    python yandex_parser.py "автосервис Казань" --max-results 200 --output авто.xlsx
-    python yandex_parser.py "аптеки Москва" --api-intercept
+Дополнительно:
+  --api-intercept  — перехват JSON из внутреннего API (надёжнее DOM)
+  --detail         — открытие карточек для телефона/сайта
 """
 
 from __future__ import annotations
@@ -58,9 +59,124 @@ class Organization:
     category: str = ""
     working_hours: str = ""
     yandex_url: str = ""
+    search_query: str = ""
 
 
 FIELDNAMES = [f.name for f in fields(Organization)]
+
+# ---------------------------------------------------------------------------
+# Каталог категорий (аналог 2ГИС)
+#
+# Структура: группа → список поисковых запросов.
+# При парсинге каждый запрос дополняется названием города.
+# ---------------------------------------------------------------------------
+
+CATEGORIES: dict[str, list[str]] = {
+    "еда": [
+        "рестораны", "кафе", "бары", "пиццерии", "суши-бары",
+        "столовые", "фастфуд", "кофейни", "кондитерские", "пекарни",
+        "шаурма", "бургерные", "доставка еды",
+    ],
+    "продукты": [
+        "продуктовые магазины", "супермаркеты", "мясные магазины",
+        "рыбные магазины", "овощи и фрукты", "молочные продукты",
+        "алкогольные магазины", "кулинарии",
+    ],
+    "здоровье": [
+        "аптеки", "больницы", "поликлиники", "стоматологии",
+        "медицинские центры", "ветеринарные клиники", "лаборатории",
+        "оптика", "косметология",
+    ],
+    "авто": [
+        "автосервисы", "шиномонтаж", "автомойки", "автозапчасти",
+        "АЗС", "автосалоны", "эвакуаторы", "парковки",
+        "техосмотр", "автострахование",
+    ],
+    "красота": [
+        "салоны красоты", "парикмахерские", "барбершопы",
+        "маникюр", "массаж", "спа-салоны", "солярии", "тату-салоны",
+    ],
+    "покупки": [
+        "торговые центры", "магазины одежды", "магазины обуви",
+        "магазины электроники", "магазины мебели", "строительные магазины",
+        "магазины цветов", "зоомагазины", "книжные магазины",
+        "магазины подарков", "ювелирные магазины",
+    ],
+    "услуги": [
+        "банки", "банкоматы", "нотариусы", "юридические услуги",
+        "страховые компании", "фотостудии", "ателье", "химчистки",
+        "ремонт телефонов", "ремонт бытовой техники", "клининг",
+        "курьерские службы", "типографии",
+    ],
+    "образование": [
+        "школы", "детские сады", "университеты", "колледжи",
+        "языковые курсы", "автошколы", "репетиторы",
+        "курсы программирования", "музыкальные школы",
+    ],
+    "спорт": [
+        "фитнес-клубы", "тренажёрные залы", "бассейны",
+        "спортивные магазины", "йога-студии", "танцевальные студии",
+        "боксёрские клубы", "теннисные корты", "спортивные площадки",
+    ],
+    "развлечения": [
+        "кинотеатры", "театры", "музеи", "парки развлечений",
+        "боулинг", "бильярд", "караоке", "квесты",
+        "ночные клубы", "концертные залы",
+    ],
+    "туризм": [
+        "гостиницы", "хостелы", "турагентства", "достопримечательности",
+        "экскурсии", "аренда автомобилей", "визовые центры",
+    ],
+    "транспорт": [
+        "такси", "каршеринг", "автобусные станции",
+        "железнодорожные вокзалы", "аэропорты", "грузоперевозки",
+    ],
+    "недвижимость": [
+        "агентства недвижимости", "новостройки",
+        "управляющие компании", "жилые комплексы",
+    ],
+    "дом": [
+        "мебельные магазины", "сантехника", "электрика",
+        "окна и двери", "кухни на заказ", "натяжные потолки",
+        "кондиционеры", "отопление",
+    ],
+    "IT": [
+        "компьютерные магазины", "ремонт компьютеров",
+        "IT-компании", "интернет-провайдеры", "веб-студии",
+    ],
+}
+
+
+def list_categories() -> None:
+    """Вывести каталог категорий в консоль."""
+    print("\n📂 Каталог категорий (аналог 2ГИС):\n")
+    for group, items in CATEGORIES.items():
+        print(f"  [{group}]")
+        for item in items:
+            print(f"    • {item}")
+        print()
+    print("Использование:")
+    print('  python yandex_parser.py --city Москва --category еда')
+    print('  python yandex_parser.py --city Москва --category еда рестораны кафе')
+    print('  python yandex_parser.py --city Москва --all-categories')
+
+
+def resolve_categories(names: list[str]) -> list[str]:
+    """Преобразовать названия групп/категорий в список поисковых запросов.
+
+    Принимает как названия групп (еда, авто), так и конкретные запросы
+    (рестораны, кафе). Если имя совпадает с группой — разворачивает все
+    подкатегории. Иначе трактует как прямой поисковый запрос.
+    """
+    queries: list[str] = []
+    for name in names:
+        key = name.lower().strip()
+        if key in CATEGORIES:
+            queries.extend(CATEGORIES[key])
+        else:
+            queries.append(name.strip())
+    return queries
+
 
 # ---------------------------------------------------------------------------
 # Selectors
@@ -473,10 +589,43 @@ def save_csv(orgs: list[Organization], path: Path) -> None:
     log.info("CSV сохранён: %s (%d записей)", path, len(orgs))
 
 
+HEADERS_RU = {
+    "name": "Название",
+    "address": "Адрес",
+    "phone": "Телефон",
+    "website": "Сайт",
+    "rating": "Рейтинг",
+    "reviews_count": "Отзывы",
+    "category": "Категория",
+    "working_hours": "Часы работы",
+    "search_query": "Поисковый запрос",
+    "yandex_url": "Ссылка",
+}
+
+
+def _write_sheet(ws, orgs: list[Organization], include_query: bool = False) -> None:
+    """Записать организации на один лист Excel."""
+    from openpyxl.styles import Font
+
+    cols = FIELDNAMES + (["search_query"] if include_query else [])
+
+    for col_idx, field in enumerate(cols, 1):
+        cell = ws.cell(row=1, column=col_idx, value=HEADERS_RU.get(field, field))
+        cell.font = Font(bold=True)
+
+    for row_idx, org in enumerate(orgs, 2):
+        d = asdict(org)
+        for col_idx, field in enumerate(cols, 1):
+            ws.cell(row=row_idx, column=col_idx, value=d.get(field, ""))
+
+    for col in ws.columns:
+        max_len = max((len(str(c.value or "")) for c in col), default=10)
+        ws.column_dimensions[col[0].column_letter].width = min(max_len + 2, 60)
+
+
 def save_xlsx(orgs: list[Organization], path: Path) -> None:
     try:
         from openpyxl import Workbook
-        from openpyxl.styles import Font
     except ImportError:
         log.warning("openpyxl не установлен — сохраняю в CSV")
         save_csv(orgs, path.with_suffix(".csv"))
@@ -486,39 +635,137 @@ def save_xlsx(orgs: list[Organization], path: Path) -> None:
     wb = Workbook()
     ws = wb.active
     ws.title = "Яндекс.Карты"
-
-    headers_ru = {
-        "name": "Название",
-        "address": "Адрес",
-        "phone": "Телефон",
-        "website": "Сайт",
-        "rating": "Рейтинг",
-        "reviews_count": "Отзывы",
-        "category": "Категория",
-        "working_hours": "Часы работы",
-        "yandex_url": "Ссылка",
-    }
-
-    for col, field in enumerate(FIELDNAMES, 1):
-        cell = ws.cell(row=1, column=col, value=headers_ru.get(field, field))
-        cell.font = Font(bold=True)
-
-    for row_idx, org in enumerate(orgs, 2):
-        d = asdict(org)
-        for col, field in enumerate(FIELDNAMES, 1):
-            ws.cell(row=row_idx, column=col, value=d[field])
-
-    for col in ws.columns:
-        max_len = max((len(str(c.value or "")) for c in col), default=10)
-        ws.column_dimensions[col[0].column_letter].width = min(max_len + 2, 60)
-
+    _write_sheet(ws, orgs)
     wb.save(path)
     log.info("XLSX сохранён: %s (%d записей)", path, len(orgs))
+
+
+def save_xlsx_by_categories(
+    results: dict[str, list[Organization]],
+    path: Path,
+) -> None:
+    """Сохранить результаты по категориям: отдельный лист на каждую + сводный."""
+    try:
+        from openpyxl import Workbook
+    except ImportError:
+        log.warning("openpyxl не установлен — сохраняю сводный CSV")
+        all_orgs = []
+        for orgs in results.values():
+            all_orgs.extend(orgs)
+        save_csv(all_orgs, path.with_suffix(".csv"))
+        return
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    wb = Workbook()
+
+    # Сводный лист со всеми результатами
+    ws_all = wb.active
+    ws_all.title = "Все результаты"
+    all_orgs: list[Organization] = []
+    for orgs in results.values():
+        all_orgs.extend(orgs)
+    _write_sheet(ws_all, all_orgs, include_query=True)
+
+    # Отдельный лист на каждую категорию
+    for query, orgs in results.items():
+        if not orgs:
+            continue
+        # Имя листа Excel ≤ 31 символ, без спецсимволов
+        sheet_name = re.sub(r'[\\/*?\[\]:]', '', query)[:31]
+        ws = wb.create_sheet(title=sheet_name)
+        _write_sheet(ws, orgs)
+
+    wb.save(path)
+    total = sum(len(v) for v in results.values())
+    log.info(
+        "XLSX сохранён: %s (%d записей, %d листов)",
+        path, total, len(wb.sheetnames),
+    )
 
 
 # ---------------------------------------------------------------------------
 # Main parser flow
 # ---------------------------------------------------------------------------
+
+def _create_browser_context(pw, headless: bool):
+    """Создать браузер и контекст с общими настройками."""
+    browser: Browser = pw.chromium.launch(headless=headless)
+    ctx: BrowserContext = browser.new_context(
+        viewport={"width": 1280, "height": 900},
+        locale="ru-RU",
+        user_agent=(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/125.0.0.0 Safari/537.36"
+        ),
+    )
+    return browser, ctx
+
+
+def _setup_page(ctx: BrowserContext) -> Page:
+    """Создать страницу с блокировкой тяжёлых ресурсов."""
+    page: Page = ctx.new_page()
+    page.route("**/*.{png,jpg,jpeg,gif,webp,svg,ico}", lambda route: route.abort())
+    page.route("**/mc.yandex.ru/**", lambda route: route.abort())
+    page.route("**/yandex.ru/metrika/**", lambda route: route.abort())
+    return page
+
+
+def _search_and_collect(
+    page: Page,
+    query: str,
+    max_results: int,
+    scroll_pause: float,
+    api_intercept: bool,
+) -> list[Organization]:
+    """Выполнить поиск и собрать результаты (общая логика для всех режимов)."""
+    encoded_query = urllib.parse.quote(query)
+    search_url = f"https://yandex.ru/maps/?text={encoded_query}"
+    log.info("Открываю %s", search_url)
+    page.goto(search_url, wait_until="domcontentloaded", timeout=30000)
+    page.wait_for_timeout(3000)
+
+    try:
+        page.wait_for_selector(ITEM_SEL, timeout=15000)
+    except Exception:
+        log.warning("Результаты не найдены для запроса: %s", query)
+        return []
+
+    if api_intercept:
+        log.info("Режим API-перехвата")
+        orgs = run_api_intercept(page, max_results, scroll_pause)
+    else:
+        total = load_all_results(page, max_results, scroll_pause)
+        log.info("Итого загружено сниппетов: %d", total)
+
+        orgs: list[Organization] = []
+        count = min(total, max_results)
+        for i in range(count):
+            try:
+                org = parse_snippet(page, i)
+                if org.name:
+                    orgs.append(org)
+            except Exception as exc:
+                log.debug("Ошибка парсинга сниппета #%d: %s", i, exc)
+            if (i + 1) % 50 == 0:
+                log.info("Обработано карточек: %d / %d", i + 1, count)
+
+    log.info("Извлечено организаций: %d", len(orgs))
+    return orgs
+
+
+def _enrich_orgs(ctx: BrowserContext, orgs: list[Organization]) -> None:
+    """Обогатить организации данными с карточек."""
+    if not orgs:
+        return
+    log.info("Обогащаю данные с карточек организаций (%d шт)…", len(orgs))
+    detail_page = _setup_page(ctx)
+    for idx, org in enumerate(orgs):
+        enrich_from_detail(detail_page, org)
+        if (idx + 1) % 20 == 0:
+            log.info("Обогащено: %d / %d", idx + 1, len(orgs))
+    detail_page.close()
+
 
 def run_parser(
     query: str,
@@ -529,83 +776,23 @@ def run_parser(
     scroll_pause: float = 1.0,
     api_intercept: bool = False,
 ) -> list[Organization]:
-    """Главная функция парсера."""
-
+    """Парсер по одному поисковому запросу."""
     out_path = Path(output)
 
     with sync_playwright() as pw:
-        browser: Browser = pw.chromium.launch(headless=headless)
-        ctx: BrowserContext = browser.new_context(
-            viewport={"width": 1280, "height": 900},
-            locale="ru-RU",
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/125.0.0.0 Safari/537.36"
-            ),
-        )
-        page: Page = ctx.new_page()
+        browser, ctx = _create_browser_context(pw, headless)
+        page = _setup_page(ctx)
 
-        # Блокируем тяжёлые ресурсы для ускорения
-        page.route("**/*.{png,jpg,jpeg,gif,webp,svg,ico}", lambda route: route.abort())
-        page.route("**/mc.yandex.ru/**", lambda route: route.abort())
-        page.route("**/yandex.ru/metrika/**", lambda route: route.abort())
+        orgs = _search_and_collect(page, query, max_results, scroll_pause, api_intercept)
 
-        # 1. Открыть Яндекс.Карты с запросом
-        encoded_query = urllib.parse.quote(query)
-        search_url = f"https://yandex.ru/maps/?text={encoded_query}"
-        log.info("Открываю %s", search_url)
-        page.goto(search_url, wait_until="domcontentloaded", timeout=30000)
-        page.wait_for_timeout(3000)
+        for org in orgs:
+            org.search_query = query
 
-        # 2. Дождаться появления результатов
-        try:
-            page.wait_for_selector(ITEM_SEL, timeout=15000)
-        except Exception:
-            log.error("Результаты не найдены — возможно, запрос не дал результатов "
-                      "или страница не загрузилась. Проверьте запрос.")
-            browser.close()
-            return []
-
-        # 3. Собрать результаты
-        if api_intercept:
-            log.info("Режим API-перехвата")
-            orgs = run_api_intercept(page, max_results, scroll_pause)
-        else:
-            # DOM-режим: скролл + парсинг сниппетов
-            total = load_all_results(page, max_results, scroll_pause)
-            log.info("Итого загружено сниппетов: %d", total)
-
-            orgs: list[Organization] = []
-            count = min(total, max_results)
-            for i in range(count):
-                try:
-                    org = parse_snippet(page, i)
-                    if org.name:
-                        orgs.append(org)
-                except Exception as exc:
-                    log.debug("Ошибка парсинга сниппета #%d: %s", i, exc)
-                if (i + 1) % 50 == 0:
-                    log.info("Обработано карточек: %d / %d", i + 1, count)
-
-        log.info("Извлечено организаций: %d", len(orgs))
-
-        # 4. (Опционально) обогатить данные с карточек организаций
-        if detail and orgs:
-            log.info("Обогащаю данные с карточек организаций (%d шт)…", len(orgs))
-            detail_page = ctx.new_page()
-            # Блокируем картинки и на detail-странице
-            detail_page.route("**/*.{png,jpg,jpeg,gif,webp,svg,ico}", lambda route: route.abort())
-
-            for idx, org in enumerate(orgs):
-                enrich_from_detail(detail_page, org)
-                if (idx + 1) % 20 == 0:
-                    log.info("Обогащено: %d / %d", idx + 1, len(orgs))
-            detail_page.close()
+        if detail:
+            _enrich_orgs(ctx, orgs)
 
         browser.close()
 
-    # 5. Сохранить результат
     if out_path.suffix == ".csv":
         save_csv(orgs, out_path)
     else:
@@ -615,21 +802,146 @@ def run_parser(
 
 
 # ---------------------------------------------------------------------------
+# Category-based parser (аналог 2ГИС)
+# ---------------------------------------------------------------------------
+
+def run_category_parser(
+    city: str,
+    categories: list[str],
+    max_results_per_category: int = 500,
+    output: str = "categories.xlsx",
+    headless: bool = True,
+    detail: bool = False,
+    scroll_pause: float = 1.0,
+    api_intercept: bool = False,
+) -> dict[str, list[Organization]]:
+    """Парсер по категориям: для каждой категории запускает поиск «категория город».
+
+    Возвращает словарь {запрос: [организации]}.
+    Сохраняет в Excel с отдельным листом на каждую категорию + сводный лист.
+    """
+    out_path = Path(output)
+    results: dict[str, list[Organization]] = {}
+    seen_global: set[str] = set()
+
+    queries = resolve_categories(categories)
+    total_queries = len(queries)
+    log.info(
+        "Город: %s | Категорий: %d | Макс. на категорию: %d",
+        city, total_queries, max_results_per_category,
+    )
+
+    with sync_playwright() as pw:
+        browser, ctx = _create_browser_context(pw, headless)
+        page = _setup_page(ctx)
+
+        for q_idx, cat_query in enumerate(queries, 1):
+            full_query = f"{cat_query} {city}"
+            log.info(
+                "━━━ [%d/%d] %s ━━━",
+                q_idx, total_queries, full_query,
+            )
+
+            orgs = _search_and_collect(
+                page, full_query, max_results_per_category,
+                scroll_pause, api_intercept,
+            )
+
+            # Дедупликация по имени+адресу
+            unique_orgs: list[Organization] = []
+            for org in orgs:
+                key = f"{org.name}|{org.address}"
+                if key not in seen_global:
+                    seen_global.add(key)
+                    org.search_query = full_query
+                    unique_orgs.append(org)
+
+            if detail:
+                _enrich_orgs(ctx, unique_orgs)
+
+            results[full_query] = unique_orgs
+            log.info(
+                "Категория «%s»: %d организаций (уникальных)",
+                cat_query, len(unique_orgs),
+            )
+
+            # Небольшая пауза между категориями
+            if q_idx < total_queries:
+                page.wait_for_timeout(2000)
+
+        browser.close()
+
+    # Сохранение
+    if out_path.suffix == ".csv":
+        all_orgs: list[Organization] = []
+        for orgs in results.values():
+            all_orgs.extend(orgs)
+        save_csv(all_orgs, out_path)
+    else:
+        save_xlsx_by_categories(results, out_path)
+
+    total_orgs = sum(len(v) for v in results.values())
+    log.info("Всего собрано: %d организаций по %d категориям", total_orgs, total_queries)
+    return results
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Парсер организаций с Яндекс.Карт (динамический скролл)",
+        description="Парсер организаций с Яндекс.Карт — по запросу или по категориям (аналог 2ГИС)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""\
+Примеры:
+  # По запросу (как раньше)
+  python yandex_parser.py "кофейни Москва"
+  python yandex_parser.py "автосервис Казань" -n 200 -o авто.xlsx
+
+  # Список категорий
+  python yandex_parser.py --list-categories
+
+  # По категориям — группа «еда» (все подкатегории)
+  python yandex_parser.py --city Москва --category еда
+
+  # По категориям — конкретные запросы
+  python yandex_parser.py --city Москва --category рестораны кафе бары
+
+  # Комбинация группы и конкретных категорий
+  python yandex_parser.py --city СПб --category авто шиномонтаж
+
+  # Все категории сразу
+  python yandex_parser.py --city Казань --all-categories -n 100
+""",
     )
-    parser.add_argument("query", help='Поисковый запрос, напр. "кофейни Москва"')
+    parser.add_argument(
+        "query", nargs="?", default=None,
+        help='Поисковый запрос, напр. "кофейни Москва"',
+    )
+    parser.add_argument(
+        "--list-categories", action="store_true",
+        help="Показать каталог категорий и выйти",
+    )
+    parser.add_argument(
+        "--city", type=str, default=None,
+        help="Город для парсинга по категориям",
+    )
+    parser.add_argument(
+        "--category", nargs="+", default=None,
+        help="Категории или группы категорий (напр. еда рестораны кафе)",
+    )
+    parser.add_argument(
+        "--all-categories", action="store_true",
+        help="Парсить все категории из каталога",
+    )
     parser.add_argument(
         "--max-results", "-n", type=int, default=500,
-        help="Максимум организаций (по умолчанию 500)",
+        help="Максимум организаций на запрос/категорию (по умолчанию 500)",
     )
     parser.add_argument(
-        "--output", "-o", default="results.xlsx",
-        help="Файл результатов: .xlsx или .csv (по умолчанию results.xlsx)",
+        "--output", "-o", default=None,
+        help="Файл результатов: .xlsx или .csv (по умолчанию results.xlsx / categories.xlsx)",
     )
     parser.add_argument(
         "--no-headless", action="store_true",
@@ -650,17 +962,53 @@ def main() -> None:
 
     args = parser.parse_args()
 
+    # Режим: показать каталог категорий
+    if args.list_categories:
+        list_categories()
+        return
+
+    # Режим: парсинг по категориям
+    if args.city and (args.category or args.all_categories):
+        if args.all_categories:
+            cats = list(CATEGORIES.keys())
+        else:
+            cats = args.category
+
+        output = args.output or f"{args.city}_categories.xlsx"
+
+        results = run_category_parser(
+            city=args.city,
+            categories=cats,
+            max_results_per_category=args.max_results,
+            output=output,
+            headless=not args.no_headless,
+            detail=args.detail,
+            scroll_pause=args.scroll_pause,
+            api_intercept=args.api_intercept,
+        )
+
+        total = sum(len(v) for v in results.values())
+        print(f"\nГотово! Собрано {total} организаций по {len(results)} категориям → {output}")
+        return
+
+    # Режим: обычный поиск по запросу
+    if not args.query:
+        parser.print_help()
+        print("\nОшибка: укажите поисковый запрос или --city + --category")
+        sys.exit(1)
+
+    output = args.output or "results.xlsx"
     orgs = run_parser(
         query=args.query,
         max_results=args.max_results,
-        output=args.output,
+        output=output,
         headless=not args.no_headless,
         detail=args.detail,
         scroll_pause=args.scroll_pause,
         api_intercept=args.api_intercept,
     )
 
-    print(f"\nГотово! Собрано {len(orgs)} организаций → {args.output}")
+    print(f"\nГотово! Собрано {len(orgs)} организаций → {output}")
 
 
 if __name__ == "__main__":
