@@ -21,6 +21,7 @@ import argparse
 import csv
 import json
 import logging
+import random
 import re
 import sys
 import time
@@ -816,16 +817,59 @@ def _find_scroll_container(page: Page) -> str | None:
     return container_sel
 
 
-def _scroll_search_panel(page: Page, container_sel: str | None, delta: int = 600) -> None:
-    """Прокрутить панель результатов поиска вниз."""
+def _human_scroll(page: Page, container_sel: str | None) -> None:
+    """Плавный скролл с имитацией поведения человека.
+
+    - Случайная дельта прокрутки (200–700 px)
+    - Микро-шаги внутри одного скролла (3–6 шагов с паузами 50–150 мс)
+    - Случайные движения мыши в зоне панели результатов
+    - Иногда «задумывается» — длинная пауза
+    - Иногда скроллит чуть вверх (как человек, вернувшийся посмотреть)
+    """
+    # Случайное движение мыши в области левой панели
+    mouse_x = random.randint(150, 420)
+    mouse_y = random.randint(200, 700)
+    page.mouse.move(mouse_x, mouse_y)
+    page.wait_for_timeout(random.randint(50, 200))
+
+    # Общая дельта этого скролла
+    total_delta = random.randint(200, 700)
+
+    # Иногда (15%) скроллим немного вверх — как будто пересматриваем
+    if random.random() < 0.15:
+        up_delta = random.randint(50, 150)
+        _do_scroll_step(page, container_sel, -up_delta)
+        page.wait_for_timeout(random.randint(300, 800))
+
+    # Разбиваем на микро-шаги
+    steps = random.randint(3, 6)
+    for i in range(steps):
+        step_delta = total_delta // steps
+        # Добавляем немного шума к каждому шагу
+        step_delta += random.randint(-20, 20)
+        step_delta = max(30, step_delta)
+
+        _do_scroll_step(page, container_sel, step_delta)
+
+        # Микро-пауза между шагами (50–150 мс)
+        page.wait_for_timeout(random.randint(50, 150))
+
+    # Иногда (10%) «задумываемся» — длинная пауза
+    if random.random() < 0.10:
+        think_ms = random.randint(1500, 3500)
+        log.debug("Имитация паузы: %d мс", think_ms)
+        page.wait_for_timeout(think_ms)
+
+
+def _do_scroll_step(page: Page, container_sel: str | None, delta: int) -> None:
+    """Один шаг прокрутки (через контейнер или mouse.wheel)."""
     if container_sel:
         loc = page.locator(container_sel).first
         if loc.count() > 0:
             loc.evaluate(f"el => el.scrollTop += {delta}")
             return
 
-    # Fallback: прокрутить колёсиком мыши в левой части экрана
-    page.mouse.move(300, 450)
+    # Fallback: колёсико мыши
     page.mouse.wheel(0, delta)
 
 
@@ -850,45 +894,91 @@ def _click_show_more(page: Page) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Loading all results via scroll
+# Streaming scroll + parse: скроллим и парсим на лету
 # ---------------------------------------------------------------------------
 
-def load_all_results(page: Page, max_results: int, scroll_pause: float = 1.0) -> int:
-    """Скроллить панель результатов, пока не загрузятся все или max_results."""
+def scroll_and_parse(
+    page: Page,
+    max_results: int,
+    scroll_pause: float = 1.0,
+    on_org: Any = None,
+) -> list[Organization]:
+    """Скроллить и парсить сниппеты на лету по мере появления.
+
+    Вместо двухэтапного подхода (сначала весь скролл, потом парсинг)
+    каждый новый сниппет парсится сразу при появлении.
+
+    Args:
+        page: Playwright-страница с результатами поиска.
+        max_results: Максимум организаций.
+        scroll_pause: Базовая пауза между скроллами (рандомизируется).
+        on_org: Callback(org, index) — вызывается при каждой новой организации.
+
+    Returns:
+        Список собранных Organization.
+    """
+    engine = get_selector_engine()
+    item_sel = engine.get("item")
     container_sel = _find_scroll_container(page)
+
     if container_sel:
         log.info("Скролл-контейнер: %s", container_sel)
     else:
         log.warning("Скролл-контейнер не найден, используем mouse.wheel")
 
-    prev_count = 0
+    orgs: list[Organization] = []
+    parsed_indices: set[int] = set()
     stale_rounds = 0
     max_stale = 10
 
     while True:
-        cur_count = _get_loaded_count(page)
-        if cur_count >= max_results:
-            log.info("Достигнут лимит: %d / %d", cur_count, max_results)
-            break
+        cur_count = page.locator(item_sel).count()
 
-        if cur_count == prev_count:
+        # Парсим новые сниппеты, которые появились после скролла
+        new_parsed = 0
+        for i in range(cur_count):
+            if i in parsed_indices:
+                continue
+            if len(orgs) >= max_results:
+                break
+            try:
+                org = parse_snippet(page, i)
+                if org.name:
+                    orgs.append(org)
+                    if on_org:
+                        on_org(org, len(orgs))
+                    new_parsed += 1
+            except Exception as exc:
+                log.debug("Ошибка парсинга сниппета #%d: %s", i, exc)
+            parsed_indices.add(i)
+
+        if new_parsed > 0:
+            log.info("Собрано: %d организаций (новых: +%d)", len(orgs), new_parsed)
+            stale_rounds = 0
+        else:
+            # Новых сниппетов нет — пробуем «Показать ещё»
             if not _click_show_more(page):
                 stale_rounds += 1
             else:
                 stale_rounds = 0
-        else:
-            stale_rounds = 0
-            log.info("Загружено сниппетов: %d", cur_count)
 
-        if stale_rounds >= max_stale:
-            log.info("Новые результаты не появляются, завершаем (всего %d)", cur_count)
+        # Проверяем лимиты
+        if len(orgs) >= max_results:
+            log.info("Достигнут лимит: %d / %d", len(orgs), max_results)
             break
 
-        prev_count = cur_count
-        _scroll_search_panel(page, container_sel)
-        page.wait_for_timeout(int(scroll_pause * 1000))
+        if stale_rounds >= max_stale:
+            log.info("Новые результаты не появляются, завершаем (всего %d)", len(orgs))
+            break
 
-    return _get_loaded_count(page)
+        # Плавный человеческий скролл
+        _human_scroll(page, container_sel)
+
+        # Рандомизированная пауза (±30% от базовой)
+        jitter = scroll_pause * random.uniform(0.7, 1.3)
+        page.wait_for_timeout(int(jitter * 1000))
+
+    return orgs
 
 
 # ---------------------------------------------------------------------------
@@ -1162,9 +1252,12 @@ def run_api_intercept(
 
     while len(all_orgs) < max_results:
         prev = len(all_orgs)
-        _scroll_search_panel(page, container_sel)
+        _human_scroll(page, container_sel)
         _click_show_more(page)
-        page.wait_for_timeout(int(scroll_pause * 1000))
+
+        # Рандомизированная пауза
+        jitter = scroll_pause * random.uniform(0.7, 1.3)
+        page.wait_for_timeout(int(jitter * 1000))
 
         if len(all_orgs) == prev:
             stale_rounds += 1
@@ -1321,6 +1414,7 @@ def _search_and_collect(
     max_results: int,
     scroll_pause: float,
     api_intercept: bool,
+    on_org: Any = None,
 ) -> list[Organization]:
     """Выполнить поиск и собрать результаты (общая логика для всех режимов)."""
     engine = get_selector_engine()
@@ -1354,20 +1448,8 @@ def _search_and_collect(
         log.info("Режим API-перехвата")
         orgs = run_api_intercept(page, max_results, scroll_pause)
     else:
-        total = load_all_results(page, max_results, scroll_pause)
-        log.info("Итого загружено сниппетов: %d", total)
-
-        orgs: list[Organization] = []
-        count = min(total, max_results)
-        for i in range(count):
-            try:
-                org = parse_snippet(page, i)
-                if org.name:
-                    orgs.append(org)
-            except Exception as exc:
-                log.debug("Ошибка парсинга сниппета #%d: %s", i, exc)
-            if (i + 1) % 50 == 0:
-                log.info("Обработано карточек: %d / %d", i + 1, count)
+        # Стриминг: скроллим + парсим на лету
+        orgs = scroll_and_parse(page, max_results, scroll_pause, on_org=on_org)
 
     log.info("Извлечено организаций: %d", len(orgs))
     return orgs
@@ -1387,6 +1469,29 @@ def _enrich_orgs(ctx: BrowserContext, orgs: list[Organization]) -> None:
     detail_page.close()
 
 
+def _make_incremental_saver(out_path: Path, save_every: int = 25):
+    """Создать callback для инкрементального сохранения по мере сбора.
+
+    Возвращает (on_org_callback, all_orgs_list).
+    Каждые save_every организаций промежуточный результат сбрасывается в файл.
+    """
+    all_orgs: list[Organization] = []
+
+    def on_org(org: Organization, index: int) -> None:
+        all_orgs.append(org)
+        if index % save_every == 0:
+            try:
+                if out_path.suffix == ".csv":
+                    save_csv(list(all_orgs), out_path)
+                else:
+                    save_xlsx(list(all_orgs), out_path)
+                log.info("Промежуточное сохранение: %d записей → %s", len(all_orgs), out_path)
+            except Exception as exc:
+                log.debug("Ошибка промежуточного сохранения: %s", exc)
+
+    return on_org, all_orgs
+
+
 def run_parser(
     query: str,
     max_results: int = 500,
@@ -1403,7 +1508,9 @@ def run_parser(
         browser, ctx = _create_browser_context(pw, headless)
         page = _setup_page(ctx)
 
-        orgs = _search_and_collect(page, query, max_results, scroll_pause, api_intercept)
+        orgs = _search_and_collect(
+            page, query, max_results, scroll_pause, api_intercept,
+        )
 
         for org in orgs:
             org.search_query = query
@@ -1485,9 +1592,25 @@ def run_category_parser(
                 cat_query, len(unique_orgs),
             )
 
-            # Небольшая пауза между категориями
+            # Промежуточное сохранение после каждой категории
+            try:
+                if out_path.suffix == ".csv":
+                    all_orgs_tmp: list[Organization] = []
+                    for v in results.values():
+                        all_orgs_tmp.extend(v)
+                    save_csv(all_orgs_tmp, out_path)
+                else:
+                    save_xlsx_by_categories(results, out_path)
+                total_so_far = sum(len(v) for v in results.values())
+                log.info("Промежуточное сохранение: %d записей → %s", total_so_far, out_path)
+            except Exception as exc:
+                log.debug("Ошибка промежуточного сохранения: %s", exc)
+
+            # Человеческая пауза между категориями (рандом)
             if q_idx < total_queries:
-                page.wait_for_timeout(2000)
+                pause = random.randint(1500, 4000)
+                log.debug("Пауза между категориями: %d мс", pause)
+                page.wait_for_timeout(pause)
 
         browser.close()
 
