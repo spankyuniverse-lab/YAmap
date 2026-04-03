@@ -36,13 +36,29 @@ try:
 except ImportError:
     HAS_TQDM = False
 
-from playwright.sync_api import (
-    Browser,
-    BrowserContext,
-    Page,
-    Response,
-    sync_playwright,
-)
+# Patchright — drop-in замена Playwright без Runtime.enable CDP-утечки.
+# SmartCaptcha/Cloudflare/DataDome детектят Playwright через Runtime.enable —
+# patchright обходит это, выполняя JS в изолированных execution contexts.
+# API 100% совместим с Playwright, меняется только импорт.
+try:
+    from patchright.sync_api import (
+        Browser,
+        BrowserContext,
+        Page,
+        Response,
+        sync_playwright,
+    )
+    log_lib = "patchright"
+except ImportError:
+    # Fallback на обычный Playwright если patchright не установлен
+    from playwright.sync_api import (
+        Browser,
+        BrowserContext,
+        Page,
+        Response,
+        sync_playwright,
+    )
+    log_lib = "playwright"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -2102,67 +2118,64 @@ def get_throttle() -> AdaptiveThrottle:
 
 
 def _create_browser_context(pw, headless: bool, proxy_url: str | None = None):
-    """Создать persistent browser context со stealth-патчами.
+    """Создать persistent browser context с настоящим Chrome.
 
-    Использует launch_persistent_context — сохраняет ВСЁ (cookies, localStorage,
-    IndexedDB, кеш, Service Workers) на диск в .browser_profile/.
-    Один раз решил капчу → Яндекс помнит тебя при следующих запусках.
+    Ключевые принципы (почему не ловим капчу):
+    1. channel="chrome" — настоящий Chrome, не Playwright Chromium
+       (другой TLS-fingerprint, нет автоматизационных маркеров)
+    2. Persistent context — cookies/localStorage/кеш между запусками
+       (Яндекс видит «знакомого» пользователя)
+    3. НЕ подменяем User-Agent/headers — Chrome уже имеет правильные
+    4. НЕ инжектим stealth JS — с patchright + real Chrome не нужно,
+       а лишние патчи ПАЛЯТСЯ через getOwnPropertyDescriptor
+    5. НЕ блокируем Яндекс.Метрику — её отсутствие = флаг «бот»
     """
-    # Рандомизация viewport (± 20px от базового) — каждый запуск чуть отличается
-    base_w, base_h = 1280, 900
-    vw = base_w + random.randint(-20, 20)
-    vh = base_h + random.randint(-20, 20)
-
     # Создаём директорию для профиля если нет
     BROWSER_DATA_DIR.mkdir(exist_ok=True)
 
-    # Выбираем согласованный UA + заголовки
-    ua, platform, sec_ch_ua = _pick_user_agent()
-
     launch_args: dict[str, Any] = {
+        "channel": "chrome",           # НАСТОЯЩИЙ Chrome, не Chromium
         "headless": headless,
+        "no_viewport": True,            # Естественный размер окна Chrome
         "args": [
             "--disable-blink-features=AutomationControlled",
-            "--disable-features=IsolateOrigins,site-per-process",
             "--no-first-run",
             "--no-default-browser-check",
             "--disable-infobars",
-            f"--window-size={vw},{vh}",
         ],
-        "viewport": {"width": vw, "height": vh},
         "locale": "ru-RU",
         "timezone_id": "Europe/Moscow",
         "color_scheme": "light",
-        "user_agent": ua,
-        "extra_http_headers": {
-            "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-            "sec-ch-ua": sec_ch_ua,
-            "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": platform,
-        },
+        # НЕ ставим user_agent — Chrome уже имеет свой настоящий
+        # НЕ ставим extra_http_headers — избегаем inconsistency
     }
     if proxy_url:
         rotator = get_proxy_rotator()
         launch_args["proxy"] = rotator.to_playwright_arg(proxy_url)
         log.info("Прокси: %s", proxy_url.split("@")[-1] if "@" in proxy_url else proxy_url)
 
-    # Persistent context: всё состояние браузера сохраняется в .browser_profile/
-    # При следующем запуске Яндекс видит «старого знакомого» пользователя
+    # Persistent context: всё состояние браузера сохраняется на диск
     ctx: BrowserContext = pw.chromium.launch_persistent_context(
         str(BROWSER_DATA_DIR),
         **launch_args,
     )
-    log.info("Браузер с persistent-профилем: %s", BROWSER_DATA_DIR)
+    log.info("Браузер: настоящий Chrome + persistent-профиль (%s)", BROWSER_DATA_DIR)
 
-    # Инжектим stealth-скрипт ДО загрузки любой страницы
-    ctx.add_init_script(_STEALTH_JS)
+    # С patchright + channel="chrome" stealth-скрипт НЕ НУЖЕН:
+    # - patchright убирает Runtime.enable CDP-утечку
+    # - настоящий Chrome не имеет navigator.webdriver и прочих маркеров
+    # - лишние патчи только палятся (SmartCaptcha проверяет property descriptors)
+    #
+    # Если fallback на обычный playwright — инжектим минимальный stealth
+    if log_lib == "playwright":
+        log.warning("patchright не установлен, используем playwright + stealth JS")
+        ctx.add_init_script(_STEALTH_JS)
 
-    # browser=None для persistent context (ctx управляет и браузером)
     return None, ctx
 
 
 def _setup_page(ctx: BrowserContext) -> Page:
-    """Создать страницу с блокировкой тяжёлых ресурсов (НЕ картинок на карточках)."""
+    """Получить страницу из persistent-контекста."""
     # Persistent context может иметь открытые страницы — закрываем лишние
     for p in ctx.pages[1:]:
         try:
@@ -2174,11 +2187,9 @@ def _setup_page(ctx: BrowserContext) -> Page:
         page = ctx.pages[0]
     else:
         page: Page = ctx.new_page()
-    # Блокируем только тяжёлую аналитику, НЕ картинки — Яндекс может
-    # детектить блокировку картинок как признак бота
-    page.route("**/mc.yandex.ru/**", lambda route: route.abort())
-    page.route("**/yandex.ru/metrika/**", lambda route: route.abort())
-    page.route("**/an.yandex.ru/**", lambda route: route.abort())
+    # НЕ блокируем Яндекс.Метрику и аналитику!
+    # Яндекс проверяет что его собственные трекеры загрузились.
+    # Если mc.yandex.ru/metrika не отвечает — это флаг «бот».
     return page
 
 
