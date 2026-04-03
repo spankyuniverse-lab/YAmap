@@ -1786,34 +1786,165 @@ def save_xlsx_by_categories(
 # Main parser flow
 # ---------------------------------------------------------------------------
 
+_STEALTH_JS = """
+() => {
+    // 1. Убираем navigator.webdriver
+    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+
+    // 2. Подменяем navigator.plugins (у автоматизированного Chrome пустой)
+    Object.defineProperty(navigator, 'plugins', {
+        get: () => {
+            const plugins = [
+                { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
+                { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai', description: '' },
+                { name: 'Native Client', filename: 'internal-nacl-plugin', description: '' },
+            ];
+            plugins.length = 3;
+            return plugins;
+        }
+    });
+
+    // 3. Подменяем navigator.languages
+    Object.defineProperty(navigator, 'languages', { get: () => ['ru-RU', 'ru', 'en-US', 'en'] });
+
+    // 4. Подменяем permissions
+    const origQuery = window.navigator.permissions.query;
+    window.navigator.permissions.query = (parameters) => (
+        parameters.name === 'notifications' ?
+            Promise.resolve({ state: Notification.permission }) :
+            origQuery(parameters)
+    );
+
+    // 5. Скрываем chrome.runtime (если нет расширений)
+    window.chrome = { runtime: {}, loadTimes: function(){}, csi: function(){} };
+
+    // 6. Fake canvas fingerprint (небольшой шум)
+    const origToDataURL = HTMLCanvasElement.prototype.toDataURL;
+    HTMLCanvasElement.prototype.toDataURL = function(type) {
+        if (type === 'image/png' && this.width > 16) {
+            const ctx = this.getContext('2d');
+            if (ctx) {
+                const style = ctx.fillStyle;
+                ctx.fillStyle = 'rgba(0,0,1,0.003)';
+                ctx.fillRect(0, 0, 1, 1);
+                ctx.fillStyle = style;
+            }
+        }
+        return origToDataURL.apply(this, arguments);
+    };
+
+    // 7. Fake WebGL vendor/renderer
+    const getParameterOrig = WebGLRenderingContext.prototype.getParameter;
+    WebGLRenderingContext.prototype.getParameter = function(param) {
+        if (param === 37445) return 'Intel Inc.';           // UNMASKED_VENDOR_WEBGL
+        if (param === 37446) return 'Intel Iris OpenGL Engine'; // UNMASKED_RENDERER_WEBGL
+        return getParameterOrig.call(this, param);
+    };
+}
+"""
+
+
+BROWSER_DATA_DIR = Path(".browser_profile")
+
+
 def _create_browser_context(pw, headless: bool, proxy_url: str | None = None):
-    """Создать браузер и контекст с общими настройками."""
-    launch_args: dict[str, Any] = {"headless": headless}
+    """Создать браузер и контекст со stealth-патчами для обхода детекции."""
+    launch_args: dict[str, Any] = {
+        "headless": headless,
+        "args": [
+            "--disable-blink-features=AutomationControlled",
+            "--disable-features=IsolateOrigins,site-per-process",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-infobars",
+            "--window-size=1280,900",
+        ],
+    }
     if proxy_url:
         rotator = get_proxy_rotator()
         launch_args["proxy"] = rotator.to_playwright_arg(proxy_url)
         log.info("Прокси: %s", proxy_url.split("@")[-1] if "@" in proxy_url else proxy_url)
 
     browser: Browser = pw.chromium.launch(**launch_args)
+
+    # Persistent context сохраняет cookies между запусками → меньше капч
     ctx: BrowserContext = browser.new_context(
         viewport={"width": 1280, "height": 900},
         locale="ru-RU",
+        timezone_id="Europe/Moscow",
+        color_scheme="light",
         user_agent=(
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/125.0.0.0 Safari/537.36"
+            "Chrome/131.0.0.0 Safari/537.36"
         ),
+        extra_http_headers={
+            "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+            "sec-ch-ua": '"Chromium";v="131", "Not_A Brand";v="24"',
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"macOS"',
+        },
     )
+
+    # Инжектим stealth-скрипт ДО загрузки любой страницы
+    ctx.add_init_script(_STEALTH_JS)
+
     return browser, ctx
 
 
 def _setup_page(ctx: BrowserContext) -> Page:
-    """Создать страницу с блокировкой тяжёлых ресурсов."""
+    """Создать страницу с блокировкой тяжёлых ресурсов (НЕ картинок на карточках)."""
     page: Page = ctx.new_page()
-    page.route("**/*.{png,jpg,jpeg,gif,webp,svg,ico}", lambda route: route.abort())
+    # Блокируем только тяжёлую аналитику, НЕ картинки — Яндекс может
+    # детектить блокировку картинок как признак бота
     page.route("**/mc.yandex.ru/**", lambda route: route.abort())
     page.route("**/yandex.ru/metrika/**", lambda route: route.abort())
+    page.route("**/an.yandex.ru/**", lambda route: route.abort())
     return page
+
+
+_warmed_up = False
+
+
+def _warmup(page: Page, headless: bool) -> None:
+    """Прогрев: зайти на Я.Карты как обычный пользователь перед парсингом.
+
+    Яндекс меньше палит ботов, которые ведут себя как люди:
+    сначала заходят на главную, двигают мышкой, скроллят.
+    """
+    global _warmed_up
+    if _warmed_up:
+        return
+    _warmed_up = True
+
+    log.info("Прогрев: заходим на Яндекс.Карты как обычный пользователь…")
+    try:
+        page.goto("https://yandex.ru/maps/", wait_until="domcontentloaded", timeout=20000)
+        page.wait_for_timeout(random.randint(2000, 4000))
+
+        # Проверяем капчу на главной
+        if detect_captcha(page):
+            handle_captcha(page, headless)
+
+        # Двигаем мышку случайно
+        for _ in range(random.randint(3, 6)):
+            page.mouse.move(
+                random.randint(100, 900),
+                random.randint(100, 700),
+            )
+            page.wait_for_timeout(random.randint(100, 400))
+
+        # Кликаем куда-нибудь на карту
+        page.mouse.click(random.randint(500, 900), random.randint(300, 600))
+        page.wait_for_timeout(random.randint(1000, 2500))
+
+        # Скроллим карту немного
+        page.mouse.wheel(0, random.randint(-200, 200))
+        page.wait_for_timeout(random.randint(500, 1500))
+
+        log.info("Прогрев завершён")
+    except Exception as exc:
+        log.debug("Прогрев не удался: %s", exc)
 
 
 def _search_and_collect(
@@ -1827,11 +1958,15 @@ def _search_and_collect(
 ) -> list[Organization]:
     """Выполнить поиск и собрать результаты (общая логика для всех режимов)."""
     engine = get_selector_engine()
+
+    # Прогрев при первом запросе
+    _warmup(page, headless)
+
     encoded_query = urllib.parse.quote(query)
     search_url = f"https://yandex.ru/maps/?text={encoded_query}"
     log.info("Открываю %s", search_url)
     page.goto(search_url, wait_until="domcontentloaded", timeout=30000)
-    page.wait_for_timeout(3000)
+    page.wait_for_timeout(random.randint(2500, 4500))
 
     # Проверка CAPTCHA
     if detect_captcha(page):
