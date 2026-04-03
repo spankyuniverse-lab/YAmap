@@ -182,8 +182,46 @@ def detect_captcha(page: Page) -> bool:
     return False
 
 
+def _try_click_captcha(page: Page) -> bool:
+    """Попробовать автоматически кликнуть 'Я не робот' (checkbox-капча)."""
+    checkbox_sels = [
+        "[class*='CheckboxCaptcha'] .CheckboxCaptcha-Button",
+        "[class*='CheckboxCaptcha-Button']",
+        "#js-button",
+        "input[type='submit'][value*='робот']",
+        "button:has-text('робот')",
+        "[class*='captcha'] button",
+        ".smartcaptcha input[type='checkbox']",
+    ]
+    for sel in checkbox_sels:
+        try:
+            btn = page.locator(sel).first
+            if btn.count() > 0 and btn.is_visible():
+                # Двигаем мышку к кнопке по-человечески
+                box = btn.bounding_box()
+                if box:
+                    # Подъезжаем к кнопке не по прямой
+                    page.mouse.move(
+                        box["x"] + random.randint(-100, -30),
+                        box["y"] + random.randint(-50, 50),
+                    )
+                    page.wait_for_timeout(random.randint(200, 500))
+                    page.mouse.move(
+                        box["x"] + box["width"] / 2 + random.randint(-5, 5),
+                        box["y"] + box["height"] / 2 + random.randint(-3, 3),
+                    )
+                    page.wait_for_timeout(random.randint(100, 300))
+                btn.click()
+                log.info("Автоклик по кнопке капчи: %s", sel)
+                page.wait_for_timeout(3000)
+                return not detect_captcha(page)
+        except Exception:
+            continue
+    return False
+
+
 def handle_captcha(page: Page, headless: bool) -> bool:
-    """Обработать CAPTCHA: пауза и ожидание решения.
+    """Обработать CAPTCHA: автоклик → ожидание → смена прокси.
 
     Возвращает True если CAPTCHA решена, False если таймаут.
     """
@@ -192,20 +230,47 @@ def handle_captcha(page: Page, headless: bool) -> bool:
 
     log.warning("=" * 60)
     log.warning("ОБНАРУЖЕНА CAPTCHA!")
+
+    # 1. Пробуем автоклик (checkbox «Я не робот»)
+    if _try_click_captcha(page):
+        log.info("CAPTCHA решена автокликом!")
+        log.warning("=" * 60)
+        return True
+
+    # 2. Если есть прокси — пробуем сменить IP и перезагрузить
+    rotator = get_proxy_rotator()
+    if rotator.has_proxies:
+        current = rotator.current()
+        if current:
+            rotator.mark_failed(current)
+        new_proxy = rotator.next()
+        if new_proxy:
+            log.info("Смена прокси → %s, перезагрузка…",
+                     new_proxy.split("@")[-1] if "@" in new_proxy else new_proxy)
+            page.wait_for_timeout(random.randint(3000, 6000))
+            page.reload(wait_until="domcontentloaded", timeout=15000)
+            page.wait_for_timeout(3000)
+            if not detect_captcha(page):
+                log.info("CAPTCHA исчезла после смены прокси!")
+                log.warning("=" * 60)
+                return True
+
+    # 3. Ждём ручного решения
     if headless:
-        log.warning("Парсер в headless-режиме — решение капчи невозможно.")
-        log.warning("Перезапустите с --no-headless для ручного решения.")
-        log.warning("Пауза 30 секунд перед продолжением…")
-        page.wait_for_timeout(30000)
+        log.warning("Парсер в headless-режиме. Пауза 60 сек, потом retry…")
+        page.wait_for_timeout(60000)
+        page.reload(wait_until="domcontentloaded", timeout=15000)
+        page.wait_for_timeout(5000)
     else:
-        log.warning("Решите капчу в браузере. Ожидание до 120 секунд…")
-        # Ждём пока капча исчезнет (пользователь решит вручную)
-        for _ in range(24):  # 24 * 5 = 120 секунд
+        log.warning("Решите капчу в браузере вручную. Ожидание до 180 секунд…")
+        for _ in range(36):  # 36 * 5 = 180 секунд
             page.wait_for_timeout(5000)
             if not detect_captcha(page):
                 log.info("CAPTCHA решена!")
+                log.warning("=" * 60)
                 return True
-        log.error("Таймаут ожидания решения CAPTCHA (120 сек)")
+        log.error("Таймаут ожидания решения CAPTCHA (180 сек)")
+
     log.warning("=" * 60)
     return not detect_captcha(page)
 
@@ -1702,11 +1767,11 @@ HEADERS_RU = {
 }
 
 
-def _write_sheet(ws, orgs: list[Organization], include_query: bool = False) -> None:
+def _write_sheet(ws, orgs: list[Organization]) -> None:
     """Записать организации на один лист Excel."""
     from openpyxl.styles import Font
 
-    cols = FIELDNAMES + (["search_query"] if include_query else [])
+    cols = FIELDNAMES
 
     for col_idx, field in enumerate(cols, 1):
         cell = ws.cell(row=1, column=col_idx, value=HEADERS_RU.get(field, field))
@@ -1763,7 +1828,7 @@ def save_xlsx_by_categories(
     all_orgs: list[Organization] = []
     for orgs in results.values():
         all_orgs.extend(orgs)
-    _write_sheet(ws_all, all_orgs, include_query=True)
+    _write_sheet(ws_all, all_orgs)
 
     # Отдельный лист на каждую категорию
     for query, orgs in results.items():
@@ -2714,10 +2779,24 @@ def interactive_menu() -> None:
     raw_output = input(f"\nИмя файла [{default_name}]: ").strip()
     output = raw_output if raw_output else default_name
 
-    # 5. Дополнительные опции
+    # 5. Полнота данных
+    print("\n--- Какие данные собирать? ---")
+    print("  1. Базовые (название, адрес, рейтинг, категория) — быстро")
+    print("  2. Полные (+ телефон, сайт, email, соцсети, координаты) — через карточки, медленнее")
+    print("  3. Полные через API (+ телефон, сайт, координаты) — перехват JSON, надёжнее")
+    data_mode = input("\nНомер [3]: ").strip() or "3"
+
+    if data_mode == "1":
+        detail = False
+        api_intercept = False
+    elif data_mode == "2":
+        detail = True
+        api_intercept = False
+    else:
+        detail = False
+        api_intercept = True
+
     print("\n--- Дополнительные настройки ---")
-    detail = _input_yn("Открывать карточки для телефона/сайта? (медленнее, но больше данных)", False)
-    api_intercept = _input_yn("Режим перехвата API? (надёжнее, данные из JSON)", False)
     headless = not _input_yn("Показывать браузер? (для отладки)", False)
 
     # 6. Прокси
