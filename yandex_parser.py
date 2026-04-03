@@ -26,9 +26,15 @@ import re
 import sys
 import time
 import urllib.parse
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any
+
+try:
+    from tqdm import tqdm
+    HAS_TQDM = True
+except ImportError:
+    HAS_TQDM = False
 
 from playwright.sync_api import (
     Browser,
@@ -59,11 +65,283 @@ class Organization:
     reviews_count: str = ""
     category: str = ""
     working_hours: str = ""
+    latitude: str = ""
+    longitude: str = ""
+    email: str = ""
+    social_links: str = ""
     yandex_url: str = ""
     search_query: str = ""
 
 
 FIELDNAMES = [f.name for f in fields(Organization)]
+
+
+# ---------------------------------------------------------------------------
+# Proxy rotation
+# ---------------------------------------------------------------------------
+
+class ProxyRotator:
+    """Ротация прокси-серверов для обхода блокировок.
+
+    Форматы прокси:
+      - http://host:port
+      - http://user:pass@host:port
+      - socks5://host:port
+    """
+
+    def __init__(self, proxies: list[str] | None = None):
+        self._proxies = proxies or []
+        self._index = 0
+        self._fail_counts: dict[str, int] = {}
+
+    @classmethod
+    def from_file(cls, path: str) -> "ProxyRotator":
+        """Загрузить прокси из файла (одна строка = один прокси)."""
+        p = Path(path)
+        if not p.exists():
+            log.warning("Файл прокси не найден: %s", path)
+            return cls([])
+        lines = [
+            line.strip() for line in p.read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        ]
+        log.info("Загружено %d прокси из %s", len(lines), path)
+        return cls(lines)
+
+    @property
+    def has_proxies(self) -> bool:
+        return len(self._proxies) > 0
+
+    def next(self) -> str | None:
+        """Следующий прокси (round-robin)."""
+        if not self._proxies:
+            return None
+        proxy = self._proxies[self._index % len(self._proxies)]
+        self._index += 1
+        return proxy
+
+    def current(self) -> str | None:
+        if not self._proxies:
+            return None
+        return self._proxies[(self._index - 1) % len(self._proxies)]
+
+    def mark_failed(self, proxy: str) -> None:
+        self._fail_counts[proxy] = self._fail_counts.get(proxy, 0) + 1
+        if self._fail_counts[proxy] >= 3:
+            log.warning("Прокси %s — 3 ошибки, удаляю из ротации", proxy)
+            self._proxies = [p for p in self._proxies if p != proxy]
+            self._fail_counts.pop(proxy, None)
+
+    def to_playwright_arg(self, proxy_url: str) -> dict:
+        """Конвертировать URL прокси в формат Playwright."""
+        result: dict[str, str] = {"server": proxy_url}
+        parsed = urllib.parse.urlparse(proxy_url)
+        if parsed.username:
+            result["username"] = parsed.username
+        if parsed.password:
+            result["password"] = parsed.password
+        if parsed.username or parsed.password:
+            result["server"] = f"{parsed.scheme}://{parsed.hostname}:{parsed.port}"
+        return result
+
+
+# Глобальный ротатор (инициализируется в main)
+_proxy_rotator: ProxyRotator | None = None
+
+
+def get_proxy_rotator() -> ProxyRotator:
+    global _proxy_rotator
+    if _proxy_rotator is None:
+        _proxy_rotator = ProxyRotator()
+    return _proxy_rotator
+
+
+# ---------------------------------------------------------------------------
+# CAPTCHA detection
+# ---------------------------------------------------------------------------
+
+_CAPTCHA_SELECTORS = [
+    "[class*='captcha']",
+    "[class*='Captcha']",
+    "[class*='CheckboxCaptcha']",
+    "#js-button",
+    "[class*='smartcaptcha']",
+    "iframe[src*='captcha']",
+    "[class*='AdvancedCaptcha']",
+]
+
+
+def detect_captcha(page: Page) -> bool:
+    """Проверить, показала ли страница CAPTCHA."""
+    for sel in _CAPTCHA_SELECTORS:
+        if page.locator(sel).count() > 0:
+            return True
+    # Дополнительно проверяем по URL
+    if "showcaptcha" in page.url or "captcha" in page.url.lower():
+        return True
+    return False
+
+
+def handle_captcha(page: Page, headless: bool) -> bool:
+    """Обработать CAPTCHA: пауза и ожидание решения.
+
+    Возвращает True если CAPTCHA решена, False если таймаут.
+    """
+    if not detect_captcha(page):
+        return True
+
+    log.warning("=" * 60)
+    log.warning("ОБНАРУЖЕНА CAPTCHA!")
+    if headless:
+        log.warning("Парсер в headless-режиме — решение капчи невозможно.")
+        log.warning("Перезапустите с --no-headless для ручного решения.")
+        log.warning("Пауза 30 секунд перед продолжением…")
+        page.wait_for_timeout(30000)
+    else:
+        log.warning("Решите капчу в браузере. Ожидание до 120 секунд…")
+        # Ждём пока капча исчезнет (пользователь решит вручную)
+        for _ in range(24):  # 24 * 5 = 120 секунд
+            page.wait_for_timeout(5000)
+            if not detect_captcha(page):
+                log.info("CAPTCHA решена!")
+                return True
+        log.error("Таймаут ожидания решения CAPTCHA (120 сек)")
+    log.warning("=" * 60)
+    return not detect_captcha(page)
+
+
+# ---------------------------------------------------------------------------
+# Resume manager — продолжение с места остановки
+# ---------------------------------------------------------------------------
+
+class ResumeManager:
+    """Менеджер докачки: загружает уже собранные данные из файла."""
+
+    def __init__(self, path: Path | None = None):
+        self._existing: dict[str, Organization] = {}
+        self._completed_queries: set[str] = set()
+        if path and path.exists():
+            self._load(path)
+
+    def _load(self, path: Path) -> None:
+        """Загрузить существующий файл результатов."""
+        suffix = path.suffix.lower()
+        rows: list[dict] = []
+
+        if suffix == ".csv":
+            try:
+                with open(path, "r", encoding="utf-8-sig") as f:
+                    reader = csv.DictReader(f, delimiter=";")
+                    rows = list(reader)
+            except Exception as exc:
+                log.warning("Не удалось прочитать CSV для резюме: %s", exc)
+                return
+
+        elif suffix == ".xlsx":
+            try:
+                from openpyxl import load_workbook
+                wb = load_workbook(path, read_only=True)
+                ws = wb.active
+                if ws is None:
+                    return
+                headers = [cell.value for cell in next(ws.iter_rows(min_row=1, max_row=1))]
+                for row in ws.iter_rows(min_row=2, values_only=True):
+                    row_dict = {h: (v or "") for h, v in zip(headers, row) if h}
+                    rows.append(row_dict)
+                wb.close()
+            except Exception as exc:
+                log.warning("Не удалось прочитать XLSX для резюме: %s", exc)
+                return
+
+        elif suffix == ".json":
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(data, list):
+                    rows = data
+                elif isinstance(data, dict) and "organizations" in data:
+                    rows = data["organizations"]
+            except Exception as exc:
+                log.warning("Не удалось прочитать JSON для резюме: %s", exc)
+                return
+
+        # Маппинг русских заголовков на английские поля
+        ru_to_en = {v: k for k, v in HEADERS_RU.items()}
+
+        for row in rows:
+            # Нормализуем ключи (могут быть русские заголовки из xlsx)
+            norm = {}
+            for k, v in row.items():
+                en_key = ru_to_en.get(k, k)
+                norm[en_key] = str(v) if v else ""
+
+            key = f"{norm.get('name', '')}|{norm.get('address', '')}"
+            if key != "|":
+                org = Organization(**{f: norm.get(f, "") for f in FIELDNAMES if f in norm})
+                self._existing[key] = org
+                q = norm.get("search_query", "")
+                if q:
+                    self._completed_queries.add(q)
+
+        log.info(
+            "Резюме: загружено %d существующих организаций, %d выполненных запросов",
+            len(self._existing), len(self._completed_queries),
+        )
+
+    @property
+    def existing_count(self) -> int:
+        return len(self._existing)
+
+    def is_known(self, name: str, address: str) -> bool:
+        return f"{name}|{address}" in self._existing
+
+    def is_query_done(self, query: str) -> bool:
+        return query in self._completed_queries
+
+    def existing_orgs(self) -> list[Organization]:
+        return list(self._existing.values())
+
+    def existing_keys(self) -> set[str]:
+        return set(self._existing.keys())
+
+
+# ---------------------------------------------------------------------------
+# Config file support (YAML/JSON)
+# ---------------------------------------------------------------------------
+
+DEFAULT_CONFIG: dict[str, Any] = {
+    "max_results": 500,
+    "scroll_pause": 1.0,
+    "headless": True,
+    "detail": False,
+    "api_intercept": False,
+    "output": "results.xlsx",
+    "proxy": None,
+    "proxy_file": None,
+    "city": None,
+    "categories": None,
+}
+
+
+def load_config(path: str) -> dict[str, Any]:
+    """Загрузить конфиг из YAML или JSON файла."""
+    p = Path(path)
+    if not p.exists():
+        log.warning("Конфиг-файл не найден: %s", path)
+        return {}
+
+    text = p.read_text(encoding="utf-8")
+    if p.suffix in (".yaml", ".yml"):
+        try:
+            import yaml
+            return yaml.safe_load(text) or {}
+        except ImportError:
+            log.warning("PyYAML не установлен — пробую как JSON")
+    try:
+        return json.loads(text)
+    except Exception as exc:
+        log.warning("Ошибка чтения конфига %s: %s", path, exc)
+        return {}
+
 
 # ---------------------------------------------------------------------------
 # Каталог категорий (аналог 2ГИС)
@@ -931,6 +1209,11 @@ def scroll_and_parse(
     stale_rounds = 0
     max_stale = 10
 
+    # Прогресс-бар (если tqdm установлен)
+    pbar = None
+    if HAS_TQDM:
+        pbar = tqdm(total=max_results, desc="Сбор организаций", unit="орг")
+
     while True:
         cur_count = page.locator(item_sel).count()
 
@@ -948,12 +1231,15 @@ def scroll_and_parse(
                     if on_org:
                         on_org(org, len(orgs))
                     new_parsed += 1
+                    if pbar:
+                        pbar.update(1)
             except Exception as exc:
                 log.debug("Ошибка парсинга сниппета #%d: %s", i, exc)
             parsed_indices.add(i)
 
         if new_parsed > 0:
-            log.info("Собрано: %d организаций (новых: +%d)", len(orgs), new_parsed)
+            if not pbar:
+                log.info("Собрано: %d организаций (новых: +%d)", len(orgs), new_parsed)
             stale_rounds = 0
         else:
             # Новых сниппетов нет — пробуем «Показать ещё»
@@ -977,6 +1263,9 @@ def scroll_and_parse(
         # Рандомизированная пауза (±30% от базовой)
         jitter = scroll_pause * random.uniform(0.7, 1.3)
         page.wait_for_timeout(int(jitter * 1000))
+
+    if pbar:
+        pbar.close()
 
     return orgs
 
@@ -1134,10 +1423,79 @@ def enrich_from_detail(page: Page, org: Organization, _detail_detected: list[boo
             if sel:
                 org.category = _safe_text(page.locator(sel))
 
+        # Координаты — из URL (ll=lon,lat) или meta-тегов
+        if not org.latitude:
+            coords = _extract_coords_from_url(page.url)
+            if coords:
+                org.latitude, org.longitude = coords[0], coords[1]
+            else:
+                coords = page.evaluate("""() => {
+                    // Из meta-тегов
+                    const lat = document.querySelector('meta[itemprop="latitude"]');
+                    const lng = document.querySelector('meta[itemprop="longitude"]');
+                    if (lat && lng) return [lat.content, lng.content];
+                    // Из JSON-LD
+                    const scripts = document.querySelectorAll('script[type="application/ld+json"]');
+                    for (const s of scripts) {
+                        try {
+                            const d = JSON.parse(s.textContent);
+                            const geo = d.geo || (d.address && d.address.geo);
+                            if (geo) return [String(geo.latitude), String(geo.longitude)];
+                        } catch(e) {}
+                    }
+                    return null;
+                }""")
+                if coords:
+                    org.latitude, org.longitude = coords[0], coords[1]
+
+        # Email
+        if not org.email:
+            emails = page.evaluate("""() => {
+                const links = document.querySelectorAll('a[href^="mailto:"]');
+                return Array.from(links).map(a => a.href.replace('mailto:', '')).filter(Boolean);
+            }""")
+            if emails:
+                org.email = "; ".join(emails)
+
+        # Соцсети (VK, Telegram, Instagram, Facebook, OK, YouTube, Twitter/X)
+        if not org.social_links:
+            socials = page.evaluate("""() => {
+                const patterns = [
+                    'vk.com', 't.me', 'telegram', 'instagram.com',
+                    'facebook.com', 'fb.com', 'ok.ru', 'youtube.com',
+                    'twitter.com', 'x.com', 'tiktok.com',
+                ];
+                const links = document.querySelectorAll('a[href]');
+                const found = [];
+                for (const a of links) {
+                    const href = a.getAttribute('href') || '';
+                    for (const pat of patterns) {
+                        if (href.includes(pat) && !found.includes(href)) {
+                            found.push(href);
+                            break;
+                        }
+                    }
+                }
+                return found;
+            }""")
+            if socials:
+                org.social_links = "; ".join(socials)
+
     except Exception as exc:
         log.warning("Не удалось открыть карточку %s: %s", org.name, exc)
 
     return org
+
+
+def _extract_coords_from_url(url: str) -> tuple[str, str] | None:
+    """Извлечь координаты из URL Яндекс.Карт (ll=lon,lat или pt=lon,lat)."""
+    for param in ("ll", "pt"):
+        match = re.search(rf'{param}=([\d.]+)%2C([\d.]+)|{param}=([\d.]+),([\d.]+)', url)
+        if match:
+            lon = match.group(1) or match.group(3)
+            lat = match.group(2) or match.group(4)
+            return (lat, lon)
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -1195,6 +1553,33 @@ def _extract_orgs_from_api_response(data: dict) -> list[Organization]:
         if categories:
             cat_names = [c.get("name", "") for c in categories if c.get("name")]
             org.category = ", ".join(cat_names)
+
+        # Координаты (из geometry GeoJSON)
+        geometry = feat.get("geometry", {})
+        coords = geometry.get("coordinates", [])
+        if coords and len(coords) >= 2:
+            org.longitude = str(coords[0])
+            org.latitude = str(coords[1])
+
+        # Email
+        emails = company.get("Emails", company.get("emails", []))
+        if emails:
+            org.email = "; ".join(
+                e.get("value", e) if isinstance(e, dict) else str(e)
+                for e in emails
+            )
+
+        # Соцсети (из Links / links)
+        links = company.get("Links", company.get("links", []))
+        social_patterns = ("vk.com", "t.me", "instagram", "facebook", "fb.com",
+                           "ok.ru", "youtube", "twitter", "x.com", "tiktok")
+        social_urls = []
+        for link_obj in links:
+            href = link_obj.get("href", link_obj.get("url", "")) if isinstance(link_obj, dict) else str(link_obj)
+            if any(p in href for p in social_patterns):
+                social_urls.append(href)
+        if social_urls:
+            org.social_links = "; ".join(social_urls)
 
         # Ссылка
         org.yandex_url = props.get("uri", props.get("url", ""))
@@ -1286,6 +1671,19 @@ def save_csv(orgs: list[Organization], path: Path) -> None:
     log.info("CSV сохранён: %s (%d записей)", path, len(orgs))
 
 
+def save_json(orgs: list[Organization], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = {
+        "total": len(orgs),
+        "organizations": [asdict(org) for org in orgs],
+    }
+    path.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    log.info("JSON сохранён: %s (%d записей)", path, len(orgs))
+
+
 HEADERS_RU = {
     "name": "Название",
     "address": "Адрес",
@@ -1295,6 +1693,10 @@ HEADERS_RU = {
     "reviews_count": "Отзывы",
     "category": "Категория",
     "working_hours": "Часы работы",
+    "latitude": "Широта",
+    "longitude": "Долгота",
+    "email": "Email",
+    "social_links": "Соцсети",
     "search_query": "Поисковый запрос",
     "yandex_url": "Ссылка",
 }
@@ -1384,9 +1786,15 @@ def save_xlsx_by_categories(
 # Main parser flow
 # ---------------------------------------------------------------------------
 
-def _create_browser_context(pw, headless: bool):
+def _create_browser_context(pw, headless: bool, proxy_url: str | None = None):
     """Создать браузер и контекст с общими настройками."""
-    browser: Browser = pw.chromium.launch(headless=headless)
+    launch_args: dict[str, Any] = {"headless": headless}
+    if proxy_url:
+        rotator = get_proxy_rotator()
+        launch_args["proxy"] = rotator.to_playwright_arg(proxy_url)
+        log.info("Прокси: %s", proxy_url.split("@")[-1] if "@" in proxy_url else proxy_url)
+
+    browser: Browser = pw.chromium.launch(**launch_args)
     ctx: BrowserContext = browser.new_context(
         viewport={"width": 1280, "height": 900},
         locale="ru-RU",
@@ -1415,6 +1823,7 @@ def _search_and_collect(
     scroll_pause: float,
     api_intercept: bool,
     on_org: Any = None,
+    headless: bool = True,
 ) -> list[Organization]:
     """Выполнить поиск и собрать результаты (общая логика для всех режимов)."""
     engine = get_selector_engine()
@@ -1423,6 +1832,12 @@ def _search_and_collect(
     log.info("Открываю %s", search_url)
     page.goto(search_url, wait_until="domcontentloaded", timeout=30000)
     page.wait_for_timeout(3000)
+
+    # Проверка CAPTCHA
+    if detect_captcha(page):
+        if not handle_captcha(page, headless):
+            log.error("CAPTCHA не решена, пропускаю запрос: %s", query)
+            return []
 
     # Ждём появления результатов, пробуем несколько селекторов
     item_sel = engine.get("item")
@@ -1436,6 +1851,18 @@ def _search_and_collect(
             break
         except Exception:
             continue
+
+    if not found:
+        # Может быть CAPTCHA появилась после загрузки
+        if detect_captcha(page):
+            if not handle_captcha(page, headless):
+                return []
+            # Пробуем ещё раз найти результаты
+            try:
+                page.wait_for_selector(item_sel or ITEM_SEL, timeout=10000)
+                found = True
+            except Exception:
+                pass
 
     if not found:
         log.warning("Результаты не найдены для запроса: %s", query)
@@ -1492,6 +1919,59 @@ def _make_incremental_saver(out_path: Path, save_every: int = 25):
     return on_org, all_orgs
 
 
+def _save_auto(orgs: list[Organization], out_path: Path) -> None:
+    """Сохранить в формат по расширению файла (.xlsx / .csv / .json)."""
+    suffix = out_path.suffix.lower()
+    if suffix == ".csv":
+        save_csv(orgs, out_path)
+    elif suffix == ".json":
+        save_json(orgs, out_path)
+    else:
+        save_xlsx(orgs, out_path)
+
+
+def print_stats(orgs: list[Organization], label: str = "Результаты") -> None:
+    """Напечатать сводную статистику по собранным организациям."""
+    if not orgs:
+        print(f"\n{label}: 0 организаций")
+        return
+
+    total = len(orgs)
+    with_phone = sum(1 for o in orgs if o.phone)
+    with_website = sum(1 for o in orgs if o.website)
+    with_email = sum(1 for o in orgs if o.email)
+    with_social = sum(1 for o in orgs if o.social_links)
+    with_coords = sum(1 for o in orgs if o.latitude)
+    with_rating = [float(o.rating.replace(",", ".")) for o in orgs if o.rating]
+    avg_rating = sum(with_rating) / len(with_rating) if with_rating else 0
+
+    # Категории (топ-5)
+    cat_counts: dict[str, int] = {}
+    for o in orgs:
+        for c in (o.category or "").split(","):
+            c = c.strip()
+            if c:
+                cat_counts[c] = cat_counts.get(c, 0) + 1
+    top_cats = sorted(cat_counts.items(), key=lambda x: -x[1])[:5]
+
+    print(f"\n{'=' * 50}")
+    print(f"  {label}")
+    print(f"{'=' * 50}")
+    print(f"  Всего организаций:  {total}")
+    print(f"  С телефоном:        {with_phone} ({with_phone * 100 // total}%)")
+    print(f"  С сайтом:           {with_website} ({with_website * 100 // total}%)")
+    print(f"  С email:            {with_email} ({with_email * 100 // total}%)")
+    print(f"  С соцсетями:        {with_social} ({with_social * 100 // total}%)")
+    print(f"  С координатами:     {with_coords} ({with_coords * 100 // total}%)")
+    if with_rating:
+        print(f"  Средний рейтинг:    {avg_rating:.1f} (из {len(with_rating)} оценок)")
+    if top_cats:
+        print(f"  Топ категории:")
+        for cat, cnt in top_cats:
+            print(f"    {cat}: {cnt}")
+    print(f"{'=' * 50}\n")
+
+
 def run_parser(
     query: str,
     max_results: int = 500,
@@ -1500,31 +1980,44 @@ def run_parser(
     detail: bool = False,
     scroll_pause: float = 1.0,
     api_intercept: bool = False,
+    proxy_url: str | None = None,
+    resume_path: Path | None = None,
 ) -> list[Organization]:
     """Парсер по одному поисковому запросу."""
     out_path = Path(output)
 
+    # Резюме: загружаем уже собранные данные
+    resume = ResumeManager(resume_path) if resume_path else None
+    if resume and resume.existing_count > 0:
+        log.info("Резюме: %d организаций уже собраны", resume.existing_count)
+
     with sync_playwright() as pw:
-        browser, ctx = _create_browser_context(pw, headless)
+        browser, ctx = _create_browser_context(pw, headless, proxy_url=proxy_url)
         page = _setup_page(ctx)
 
         orgs = _search_and_collect(
             page, query, max_results, scroll_pause, api_intercept,
+            headless=headless,
         )
 
         for org in orgs:
             org.search_query = query
+
+        # Фильтруем уже известные (из резюме)
+        if resume:
+            before = len(orgs)
+            orgs = [o for o in orgs if not resume.is_known(o.name, o.address)]
+            if before != len(orgs):
+                log.info("Резюме: пропущено %d уже собранных", before - len(orgs))
+            orgs = resume.existing_orgs() + orgs
 
         if detail:
             _enrich_orgs(ctx, orgs)
 
         browser.close()
 
-    if out_path.suffix == ".csv":
-        save_csv(orgs, out_path)
-    else:
-        save_xlsx(orgs, out_path)
-
+    _save_auto(orgs, out_path)
+    print_stats(orgs)
     return orgs
 
 
@@ -1541,15 +2034,19 @@ def run_category_parser(
     detail: bool = False,
     scroll_pause: float = 1.0,
     api_intercept: bool = False,
+    proxy_url: str | None = None,
+    resume_path: Path | None = None,
 ) -> dict[str, list[Organization]]:
-    """Парсер по категориям: для каждой категории запускает поиск «категория город».
-
-    Возвращает словарь {запрос: [организации]}.
-    Сохраняет в Excel с отдельным листом на каждую категорию + сводный лист.
-    """
+    """Парсер по категориям: для каждой категории запускает поиск «категория город»."""
     out_path = Path(output)
     results: dict[str, list[Organization]] = {}
     seen_global: set[str] = set()
+
+    # Резюме
+    resume = ResumeManager(resume_path) if resume_path else None
+    if resume and resume.existing_count > 0:
+        seen_global = resume.existing_keys()
+        log.info("Резюме: %d организаций уже собраны", resume.existing_count)
 
     queries = resolve_categories(categories)
     total_queries = len(queries)
@@ -1558,20 +2055,30 @@ def run_category_parser(
         city, total_queries, max_results_per_category,
     )
 
+    # Прогресс по категориям
+    cat_iter = enumerate(queries, 1)
+    if HAS_TQDM:
+        cat_iter_tqdm = tqdm(list(cat_iter), desc="Категории", unit="кат")
+    else:
+        cat_iter_tqdm = None
+
     with sync_playwright() as pw:
-        browser, ctx = _create_browser_context(pw, headless)
+        browser, ctx = _create_browser_context(pw, headless, proxy_url=proxy_url)
         page = _setup_page(ctx)
 
-        for q_idx, cat_query in enumerate(queries, 1):
+        for q_idx, cat_query in (cat_iter_tqdm if cat_iter_tqdm else enumerate(queries, 1)):
             full_query = f"{cat_query} {city}"
-            log.info(
-                "━━━ [%d/%d] %s ━━━",
-                q_idx, total_queries, full_query,
-            )
+
+            # Пропускаем уже выполненные запросы (резюме)
+            if resume and resume.is_query_done(full_query):
+                log.info("Пропуск (резюме): %s", full_query)
+                continue
+
+            log.info("━━━ [%d/%d] %s ━━━", q_idx, total_queries, full_query)
 
             orgs = _search_and_collect(
                 page, full_query, max_results_per_category,
-                scroll_pause, api_intercept,
+                scroll_pause, api_intercept, headless=headless,
             )
 
             # Дедупликация по имени+адресу
@@ -1587,18 +2094,21 @@ def run_category_parser(
                 _enrich_orgs(ctx, unique_orgs)
 
             results[full_query] = unique_orgs
-            log.info(
-                "Категория «%s»: %d организаций (уникальных)",
-                cat_query, len(unique_orgs),
-            )
+            log.info("Категория «%s»: %d организаций (уникальных)", cat_query, len(unique_orgs))
 
             # Промежуточное сохранение после каждой категории
             try:
-                if out_path.suffix == ".csv":
-                    all_orgs_tmp: list[Organization] = []
+                suffix = out_path.suffix.lower()
+                if suffix == ".csv":
+                    all_tmp: list[Organization] = []
                     for v in results.values():
-                        all_orgs_tmp.extend(v)
-                    save_csv(all_orgs_tmp, out_path)
+                        all_tmp.extend(v)
+                    save_csv(all_tmp, out_path)
+                elif suffix == ".json":
+                    all_tmp = []
+                    for v in results.values():
+                        all_tmp.extend(v)
+                    save_json(all_tmp, out_path)
                 else:
                     save_xlsx_by_categories(results, out_path)
                 total_so_far = sum(len(v) for v in results.values())
@@ -1606,25 +2116,34 @@ def run_category_parser(
             except Exception as exc:
                 log.debug("Ошибка промежуточного сохранения: %s", exc)
 
-            # Человеческая пауза между категориями (рандом)
+            # Человеческая пауза между категориями
             if q_idx < total_queries:
                 pause = random.randint(1500, 4000)
-                log.debug("Пауза между категориями: %d мс", pause)
                 page.wait_for_timeout(pause)
 
         browser.close()
 
-    # Сохранение
-    if out_path.suffix == ".csv":
-        all_orgs: list[Organization] = []
-        for orgs in results.values():
-            all_orgs.extend(orgs)
+    # Финальное сохранение
+    all_orgs: list[Organization] = []
+    for v in results.values():
+        all_orgs.extend(v)
+
+    # Добавляем ранее собранные (из резюме)
+    if resume:
+        existing = resume.existing_orgs()
+        all_orgs = existing + all_orgs
+
+    suffix = out_path.suffix.lower()
+    if suffix == ".json":
+        save_json(all_orgs, out_path)
+    elif suffix == ".csv":
         save_csv(all_orgs, out_path)
     else:
         save_xlsx_by_categories(results, out_path)
 
-    total_orgs = sum(len(v) for v in results.values())
+    total_orgs = len(all_orgs)
     log.info("Всего собрано: %d организаций по %d категориям", total_orgs, total_queries)
+    print_stats(all_orgs, label=f"Статистика: {city}")
     return results
 
 
@@ -1638,24 +2157,31 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""\
 Примеры:
-  # По запросу (как раньше)
+  # По запросу
   python yandex_parser.py "кофейни Москва"
   python yandex_parser.py "автосервис Казань" -n 200 -o авто.xlsx
 
-  # Список категорий
-  python yandex_parser.py --list-categories
-
-  # По категориям — группа «еда» (все подкатегории)
+  # По категориям
   python yandex_parser.py --city Москва --category еда
+  python yandex_parser.py --city СПб --category авто красота -n 100
+  python yandex_parser.py --city Казань --all-categories
 
-  # По категориям — конкретные запросы
-  python yandex_parser.py --city Москва --category рестораны кафе бары
+  # С прокси
+  python yandex_parser.py "аптеки Москва" --proxy http://user:pass@host:port
+  python yandex_parser.py --city Москва --category еда --proxy-file proxies.txt
 
-  # Комбинация группы и конкретных категорий
-  python yandex_parser.py --city СПб --category авто шиномонтаж
+  # Продолжить прерванный сбор
+  python yandex_parser.py --city Москва --all-categories --resume Москва_categories.xlsx
 
-  # Все категории сразу
-  python yandex_parser.py --city Казань --all-categories -n 100
+  # Экспорт в JSON
+  python yandex_parser.py "рестораны Москва" -o results.json
+
+  # С конфиг-файлом
+  python yandex_parser.py --config config.yaml
+
+  # Автодетект селекторов / список категорий
+  python yandex_parser.py --detect-selectors --no-headless
+  python yandex_parser.py --list-categories
 """,
     )
     parser.add_argument(
@@ -1684,7 +2210,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--output", "-o", default=None,
-        help="Файл результатов: .xlsx или .csv (по умолчанию results.xlsx / categories.xlsx)",
+        help="Файл результатов: .xlsx, .csv или .json (по умолчанию results.xlsx / categories.xlsx)",
     )
     parser.add_argument(
         "--no-headless", action="store_true",
@@ -1701,6 +2227,22 @@ def main() -> None:
     parser.add_argument(
         "--api-intercept", action="store_true",
         help="Перехватывать JSON из внутреннего API вместо парсинга DOM",
+    )
+    parser.add_argument(
+        "--proxy", type=str, default=None,
+        help="Прокси-сервер (http://host:port или socks5://user:pass@host:port)",
+    )
+    parser.add_argument(
+        "--proxy-file", type=str, default=None,
+        help="Файл со списком прокси (одна строка = один прокси, ротация round-robin)",
+    )
+    parser.add_argument(
+        "--resume", type=str, default=None,
+        help="Путь к файлу с предыдущими результатами для продолжения сбора",
+    )
+    parser.add_argument(
+        "--config", type=str, default=None,
+        help="Конфиг-файл (JSON или YAML) с параметрами парсера",
     )
     parser.add_argument(
         "--detect-selectors", action="store_true",
@@ -1837,6 +2379,29 @@ def main() -> None:
             print("\nАвтодетект не нашёл селекторов.")
         return
 
+    # Общие параметры
+    headless = not args.no_headless
+
+    # Конфиг-файл (перезаписывает дефолты, CLI-аргументы приоритетнее)
+    if args.config:
+        cfg = load_config(args.config)
+        for k, v in cfg.items():
+            arg_key = k.replace("-", "_")
+            if hasattr(args, arg_key) and getattr(args, arg_key) is None:
+                setattr(args, arg_key, v)
+
+    # Прокси
+    proxy_url = None
+    if args.proxy:
+        proxy_url = args.proxy
+    elif args.proxy_file:
+        global _proxy_rotator
+        _proxy_rotator = ProxyRotator.from_file(args.proxy_file)
+        proxy_url = _proxy_rotator.next()
+
+    # Резюме
+    resume_path = Path(args.resume) if args.resume else None
+
     # Режим: парсинг по категориям
     if args.city and (args.category or args.all_categories):
         if args.all_categories:
@@ -1851,14 +2416,16 @@ def main() -> None:
             categories=cats,
             max_results_per_category=args.max_results,
             output=output,
-            headless=not args.no_headless,
+            headless=headless,
             detail=args.detail,
             scroll_pause=args.scroll_pause,
             api_intercept=args.api_intercept,
+            proxy_url=proxy_url,
+            resume_path=resume_path,
         )
 
         total = sum(len(v) for v in results.values())
-        print(f"\nГотово! Собрано {total} организаций по {len(results)} категориям → {output}")
+        print(f"\nГотово! Собрано {total} организаций по {len(results)} категориям -> {output}")
         return
 
     # Режим: обычный поиск по запросу
@@ -1872,13 +2439,15 @@ def main() -> None:
         query=args.query,
         max_results=args.max_results,
         output=output,
-        headless=not args.no_headless,
+        headless=headless,
         detail=args.detail,
         scroll_pause=args.scroll_pause,
         api_intercept=args.api_intercept,
+        proxy_url=proxy_url,
+        resume_path=resume_path,
     )
 
-    print(f"\nГотово! Собрано {len(orgs)} организаций → {output}")
+    print(f"\nГотово! Собрано {len(orgs)} организаций -> {output}")
 
 
 if __name__ == "__main__":
