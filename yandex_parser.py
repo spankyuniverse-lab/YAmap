@@ -182,8 +182,38 @@ def detect_captcha(page: Page) -> bool:
     return False
 
 
+def _bezier_mouse_move(page: Page, start_x: float, start_y: float,
+                       end_x: float, end_y: float, steps: int = 15) -> None:
+    """Двигаем мышь по кривой Безье (3 точки) — как человек.
+
+    Прямые линии палятся как автоматизация. Человек двигает мышь по дуге
+    с ускорением в начале и замедлением в конце.
+    """
+    # Контрольная точка — смещена вбок от прямой
+    ctrl_x = (start_x + end_x) / 2 + random.randint(-80, 80)
+    ctrl_y = (start_y + end_y) / 2 + random.randint(-60, 60)
+
+    for i in range(steps + 1):
+        t = i / steps
+        # Квадратичная Безье: B(t) = (1-t)²·P0 + 2(1-t)t·P1 + t²·P2
+        x = (1 - t) ** 2 * start_x + 2 * (1 - t) * t * ctrl_x + t ** 2 * end_x
+        y = (1 - t) ** 2 * start_y + 2 * (1 - t) * t * ctrl_y + t ** 2 * end_y
+        # Небольшой шум
+        x += random.randint(-2, 2)
+        y += random.randint(-2, 2)
+        page.mouse.move(x, y)
+        # Пауза: короткая в середине, длиннее в начале/конце (как человек)
+        if i < 3 or i > steps - 3:
+            page.wait_for_timeout(random.randint(20, 60))
+        else:
+            page.wait_for_timeout(random.randint(5, 20))
+
+
 def _try_click_captcha(page: Page) -> bool:
-    """Попробовать автоматически кликнуть 'Я не робот' (checkbox-капча)."""
+    """Попробовать автоматически кликнуть 'Я не робот' (checkbox-капча).
+
+    Использует Bezier-кривую для движения мыши — прямые линии палятся.
+    """
     checkbox_sels = [
         "[class*='CheckboxCaptcha'] .CheckboxCaptcha-Button",
         "[class*='CheckboxCaptcha-Button']",
@@ -197,21 +227,27 @@ def _try_click_captcha(page: Page) -> bool:
         try:
             btn = page.locator(sel).first
             if btn.count() > 0 and btn.is_visible():
-                # Двигаем мышку к кнопке по-человечески
                 box = btn.bounding_box()
                 if box:
-                    # Подъезжаем к кнопке не по прямой
-                    page.mouse.move(
-                        box["x"] + random.randint(-100, -30),
-                        box["y"] + random.randint(-50, 50),
-                    )
+                    # Стартуем из случайной точки на странице
+                    start_x = random.randint(200, 600)
+                    start_y = random.randint(100, 400)
+                    page.mouse.move(start_x, start_y)
                     page.wait_for_timeout(random.randint(200, 500))
-                    page.mouse.move(
-                        box["x"] + box["width"] / 2 + random.randint(-5, 5),
-                        box["y"] + box["height"] / 2 + random.randint(-3, 3),
-                    )
+
+                    # Двигаем по Безье к кнопке
+                    target_x = box["x"] + box["width"] / 2 + random.randint(-3, 3)
+                    target_y = box["y"] + box["height"] / 2 + random.randint(-2, 2)
+                    _bezier_mouse_move(page, start_x, start_y, target_x, target_y)
+
+                    # Небольшая пауза перед кликом (человек "прицеливается")
                     page.wait_for_timeout(random.randint(100, 300))
-                btn.click()
+
+                    # Клик по Безье-точке
+                    page.mouse.click(target_x, target_y)
+                else:
+                    # Нет bounding box — обычный клик
+                    btn.click()
                 log.info("Автоклик по кнопке капчи: %s", sel)
                 page.wait_for_timeout(3000)
                 return not detect_captcha(page)
@@ -221,13 +257,14 @@ def _try_click_captcha(page: Page) -> bool:
 
 
 def handle_captcha(page: Page, headless: bool) -> bool:
-    """Обработать CAPTCHA: автоклик → пауза+reload → прокси → ручное.
+    """Обработать CAPTCHA: автоклик → сразу ручное решение.
 
     Стратегия без платных сервисов:
-    1. Автоклик checkbox «Я не робот»
-    2. Долгая пауза + reload (капча иногда протухает)
-    3. Смена прокси (если есть бесплатные)
-    4. Ожидание ручного решения
+    1. Автоклик checkbox «Я не робот» (Bezier-мышь)
+    2. Если не помогло — сразу просим решить вручную (не тратим время на reload)
+    3. В headless — пауза + reload (надежда на протухание)
+
+    Один раз решил вручную → persistent profile запоминает → следующий раз без капчи.
 
     Возвращает True если CAPTCHA решена, False если таймаут.
     """
@@ -237,33 +274,13 @@ def handle_captcha(page: Page, headless: bool) -> bool:
     log.warning("=" * 60)
     log.warning("ОБНАРУЖЕНА CAPTCHA!")
 
-    # 1. Пробуем автоклик (checkbox «Я не робот»)
+    # 1. Пробуем автоклик (checkbox «Я не робот») с Bezier-движением мыши
     if _try_click_captcha(page):
         log.info("CAPTCHA решена автокликом!")
         log.warning("=" * 60)
         return True
 
-    # 2. Пауза + reload — иногда капча протухает и Яндекс пропускает
-    #    Ведём себя как человек, который ушёл и вернулся
-    log.info("Ждём 30-60 сек и перезагружаем (капча может протухнуть)…")
-    wait_sec = random.randint(30, 60)
-    page.wait_for_timeout(wait_sec * 1000)
-    try:
-        page.reload(wait_until="domcontentloaded", timeout=20000)
-        page.wait_for_timeout(random.randint(3000, 5000))
-        if not detect_captcha(page):
-            log.info("CAPTCHA исчезла после паузы и reload!")
-            log.warning("=" * 60)
-            return True
-        # Ещё раз пробуем автоклик — может теперь простая форма
-        if _try_click_captcha(page):
-            log.info("CAPTCHA решена автокликом после reload!")
-            log.warning("=" * 60)
-            return True
-    except Exception as exc:
-        log.debug("Reload после паузы не удался: %s", exc)
-
-    # 3. Если есть прокси — пробуем сменить IP и перезагрузить
+    # 2. Если есть прокси — пробуем сменить IP и перезагрузить
     rotator = get_proxy_rotator()
     if rotator.has_proxies:
         current = rotator.current()
@@ -281,25 +298,36 @@ def handle_captcha(page: Page, headless: bool) -> bool:
                 log.warning("=" * 60)
                 return True
 
-    # 4. Ждём ручного решения
+    # 3. Ручное решение / автоожидание
     if headless:
-        log.warning("Парсер в headless-режиме. Пауза 90 сек, потом retry…")
-        page.wait_for_timeout(90000)
-        page.reload(wait_until="domcontentloaded", timeout=15000)
-        page.wait_for_timeout(5000)
-        if not detect_captcha(page):
-            log.info("CAPTCHA исчезла после длинной паузы в headless!")
-            log.warning("=" * 60)
-            return True
-    else:
-        log.warning("Решите капчу в браузере вручную. Ожидание до 180 секунд…")
-        for _ in range(36):  # 36 * 5 = 180 секунд
+        # В headless ждём подольше — капча может протухнуть
+        log.warning("Headless-режим: пауза 60 сек + reload…")
+        page.wait_for_timeout(60000)
+        try:
+            page.reload(wait_until="domcontentloaded", timeout=20000)
             page.wait_for_timeout(5000)
             if not detect_captcha(page):
-                log.info("CAPTCHA решена!")
+                log.info("CAPTCHA исчезла после паузы!")
                 log.warning("=" * 60)
                 return True
-        log.error("Таймаут ожидания решения CAPTCHA (180 сек)")
+        except Exception:
+            pass
+    else:
+        # В видимом браузере — СРАЗУ просим решить вручную
+        log.warning("")
+        log.warning("  >>> РЕШИТЕ КАПЧУ В БРАУЗЕРЕ! <<<")
+        log.warning("  После решения парсер продолжит автоматически.")
+        log.warning("  (persistent profile запомнит — следующий раз без капчи)")
+        log.warning("")
+        for i in range(60):  # 60 * 5 = 300 секунд (5 минут)
+            page.wait_for_timeout(5000)
+            if not detect_captcha(page):
+                log.info("CAPTCHA решена! Продолжаем…")
+                log.warning("=" * 60)
+                return True
+            if i > 0 and i % 12 == 0:
+                log.info("Ожидание решения капчи… (%d сек)", i * 5)
+        log.error("Таймаут ожидания решения CAPTCHA (5 мин)")
 
     log.warning("=" * 60)
     return not detect_captcha(page)
@@ -1974,7 +2002,6 @@ _STEALTH_JS = """
 
 
 BROWSER_DATA_DIR = Path(".browser_profile")
-COOKIES_FILE = Path(".yandex_cookies.json")
 
 
 # ---------------------------------------------------------------------------
@@ -2073,44 +2100,24 @@ def get_throttle() -> AdaptiveThrottle:
     return _throttle
 
 
-# ---------------------------------------------------------------------------
-# Cookie persistence — сохранение/загрузка cookies между сессиями
-# ---------------------------------------------------------------------------
-
-def _save_cookies(ctx: BrowserContext) -> None:
-    """Сохранить cookies контекста в файл для следующего запуска."""
-    try:
-        cookies = ctx.cookies()
-        # Фильтруем только yandex cookies
-        ya_cookies = [c for c in cookies if "yandex" in c.get("domain", "")]
-        if ya_cookies:
-            COOKIES_FILE.write_text(json.dumps(ya_cookies, ensure_ascii=False, indent=2))
-            log.debug("Сохранено %d cookies в %s", len(ya_cookies), COOKIES_FILE)
-    except Exception as exc:
-        log.debug("Ошибка сохранения cookies: %s", exc)
-
-
-def _load_cookies(ctx: BrowserContext) -> int:
-    """Загрузить cookies из файла в контекст. Возвращает кол-во загруженных."""
-    if not COOKIES_FILE.exists():
-        return 0
-    try:
-        cookies = json.loads(COOKIES_FILE.read_text())
-        if cookies:
-            ctx.add_cookies(cookies)
-            log.info("Загружено %d cookies из предыдущей сессии", len(cookies))
-            return len(cookies)
-    except Exception as exc:
-        log.debug("Ошибка загрузки cookies: %s", exc)
-    return 0
-
 
 def _create_browser_context(pw, headless: bool, proxy_url: str | None = None):
-    """Создать браузер и контекст со stealth-патчами для обхода детекции."""
+    """Создать persistent browser context со stealth-патчами.
+
+    Использует launch_persistent_context — сохраняет ВСЁ (cookies, localStorage,
+    IndexedDB, кеш, Service Workers) на диск в .browser_profile/.
+    Один раз решил капчу → Яндекс помнит тебя при следующих запусках.
+    """
     # Рандомизация viewport (± 20px от базового) — каждый запуск чуть отличается
     base_w, base_h = 1280, 900
     vw = base_w + random.randint(-20, 20)
     vh = base_h + random.randint(-20, 20)
+
+    # Создаём директорию для профиля если нет
+    BROWSER_DATA_DIR.mkdir(exist_ok=True)
+
+    # Выбираем согласованный UA + заголовки
+    ua, platform, sec_ch_ua = _pick_user_agent()
 
     launch_args: dict[str, Any] = {
         "headless": headless,
@@ -2122,45 +2129,51 @@ def _create_browser_context(pw, headless: bool, proxy_url: str | None = None):
             "--disable-infobars",
             f"--window-size={vw},{vh}",
         ],
+        "viewport": {"width": vw, "height": vh},
+        "locale": "ru-RU",
+        "timezone_id": "Europe/Moscow",
+        "color_scheme": "light",
+        "user_agent": ua,
+        "extra_http_headers": {
+            "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+            "sec-ch-ua": sec_ch_ua,
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": platform,
+        },
     }
     if proxy_url:
         rotator = get_proxy_rotator()
         launch_args["proxy"] = rotator.to_playwright_arg(proxy_url)
         log.info("Прокси: %s", proxy_url.split("@")[-1] if "@" in proxy_url else proxy_url)
 
-    browser: Browser = pw.chromium.launch(**launch_args)
-
-    # Выбираем согласованный UA + заголовки
-    ua, platform, sec_ch_ua = _pick_user_agent()
-
-    ctx: BrowserContext = browser.new_context(
-        viewport={"width": vw, "height": vh},
-        locale="ru-RU",
-        timezone_id="Europe/Moscow",
-        color_scheme="light",
-        user_agent=ua,
-        extra_http_headers={
-            "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-            "sec-ch-ua": sec_ch_ua,
-            "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": platform,
-        },
+    # Persistent context: всё состояние браузера сохраняется в .browser_profile/
+    # При следующем запуске Яндекс видит «старого знакомого» пользователя
+    ctx: BrowserContext = pw.chromium.launch_persistent_context(
+        str(BROWSER_DATA_DIR),
+        **launch_args,
     )
+    log.info("Браузер с persistent-профилем: %s", BROWSER_DATA_DIR)
 
     # Инжектим stealth-скрипт ДО загрузки любой страницы
     ctx.add_init_script(_STEALTH_JS)
 
-    # Загружаем cookies из предыдущей сессии (Яндекс видит «знакомого» пользователя)
-    loaded = _load_cookies(ctx)
-    if loaded > 0:
-        log.info("Используем cookies предыдущей сессии — меньше шансов на капчу")
-
-    return browser, ctx
+    # browser=None для persistent context (ctx управляет и браузером)
+    return None, ctx
 
 
 def _setup_page(ctx: BrowserContext) -> Page:
     """Создать страницу с блокировкой тяжёлых ресурсов (НЕ картинок на карточках)."""
-    page: Page = ctx.new_page()
+    # Persistent context может иметь открытые страницы — закрываем лишние
+    for p in ctx.pages[1:]:
+        try:
+            p.close()
+        except Exception:
+            pass
+    # Используем первую страницу persistent-контекста если есть, иначе новую
+    if ctx.pages:
+        page = ctx.pages[0]
+    else:
+        page: Page = ctx.new_page()
     # Блокируем только тяжёлую аналитику, НЕ картинки — Яндекс может
     # детектить блокировку картинок как признак бота
     page.route("**/mc.yandex.ru/**", lambda route: route.abort())
@@ -2434,7 +2447,7 @@ def run_parser(
         log.info("Резюме: %d организаций уже собраны", resume.existing_count)
 
     with sync_playwright() as pw:
-        browser, ctx = _create_browser_context(pw, headless, proxy_url=proxy_url)
+        _, ctx = _create_browser_context(pw, headless, proxy_url=proxy_url)
         page = _setup_page(ctx)
 
         orgs = _search_and_collect(
@@ -2456,9 +2469,8 @@ def run_parser(
         if detail:
             _enrich_orgs(ctx, orgs)
 
-        # Сохраняем cookies для следующего запуска (меньше шансов на капчу)
-        _save_cookies(ctx)
-        browser.close()
+        # Persistent context сохраняет всё автоматически при закрытии
+        ctx.close()
 
     _save_auto(orgs, out_path)
     print_stats(orgs)
@@ -2507,7 +2519,7 @@ def run_category_parser(
         cat_iter_tqdm = None
 
     with sync_playwright() as pw:
-        browser, ctx = _create_browser_context(pw, headless, proxy_url=proxy_url)
+        _, ctx = _create_browser_context(pw, headless, proxy_url=proxy_url)
         page = _setup_page(ctx)
 
         for q_idx, cat_query in (cat_iter_tqdm if cat_iter_tqdm else enumerate(queries, 1)):
@@ -2578,9 +2590,8 @@ def run_category_parser(
                     page.mouse.wheel(0, random.randint(-100, 100))
                     page.wait_for_timeout(random.randint(500, 1500))
 
-        # Сохраняем cookies для следующего запуска
-        _save_cookies(ctx)
-        browser.close()
+        # Persistent context сохраняет всё автоматически при закрытии
+        ctx.close()
 
     # Финальное сохранение
     all_orgs: list[Organization] = []
@@ -2765,7 +2776,7 @@ def main() -> None:
             SELECTORS_CACHE_FILE.unlink()
 
         with sync_playwright() as pw:
-            browser, ctx = _create_browser_context(pw, headless=not args.no_headless)
+            _, ctx = _create_browser_context(pw, headless=not args.no_headless)
             page = _setup_page(ctx)
 
             encoded = urllib.parse.quote(test_query)
@@ -2826,7 +2837,7 @@ def main() -> None:
 
                     list_sels.update(detail_sels)
 
-            browser.close()
+            ctx.close()
 
         # Сохраняем результат
         if list_sels:
