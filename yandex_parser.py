@@ -221,7 +221,13 @@ def _try_click_captcha(page: Page) -> bool:
 
 
 def handle_captcha(page: Page, headless: bool) -> bool:
-    """Обработать CAPTCHA: автоклик → ожидание → смена прокси.
+    """Обработать CAPTCHA: автоклик → пауза+reload → прокси → ручное.
+
+    Стратегия без платных сервисов:
+    1. Автоклик checkbox «Я не робот»
+    2. Долгая пауза + reload (капча иногда протухает)
+    3. Смена прокси (если есть бесплатные)
+    4. Ожидание ручного решения
 
     Возвращает True если CAPTCHA решена, False если таймаут.
     """
@@ -237,7 +243,27 @@ def handle_captcha(page: Page, headless: bool) -> bool:
         log.warning("=" * 60)
         return True
 
-    # 2. Если есть прокси — пробуем сменить IP и перезагрузить
+    # 2. Пауза + reload — иногда капча протухает и Яндекс пропускает
+    #    Ведём себя как человек, который ушёл и вернулся
+    log.info("Ждём 30-60 сек и перезагружаем (капча может протухнуть)…")
+    wait_sec = random.randint(30, 60)
+    page.wait_for_timeout(wait_sec * 1000)
+    try:
+        page.reload(wait_until="domcontentloaded", timeout=20000)
+        page.wait_for_timeout(random.randint(3000, 5000))
+        if not detect_captcha(page):
+            log.info("CAPTCHA исчезла после паузы и reload!")
+            log.warning("=" * 60)
+            return True
+        # Ещё раз пробуем автоклик — может теперь простая форма
+        if _try_click_captcha(page):
+            log.info("CAPTCHA решена автокликом после reload!")
+            log.warning("=" * 60)
+            return True
+    except Exception as exc:
+        log.debug("Reload после паузы не удался: %s", exc)
+
+    # 3. Если есть прокси — пробуем сменить IP и перезагрузить
     rotator = get_proxy_rotator()
     if rotator.has_proxies:
         current = rotator.current()
@@ -255,12 +281,16 @@ def handle_captcha(page: Page, headless: bool) -> bool:
                 log.warning("=" * 60)
                 return True
 
-    # 3. Ждём ручного решения
+    # 4. Ждём ручного решения
     if headless:
-        log.warning("Парсер в headless-режиме. Пауза 60 сек, потом retry…")
-        page.wait_for_timeout(60000)
+        log.warning("Парсер в headless-режиме. Пауза 90 сек, потом retry…")
+        page.wait_for_timeout(90000)
         page.reload(wait_until="domcontentloaded", timeout=15000)
         page.wait_for_timeout(5000)
+        if not detect_captcha(page):
+            log.info("CAPTCHA исчезла после длинной паузы в headless!")
+            log.warning("=" * 60)
+            return True
     else:
         log.warning("Решите капчу в браузере вручную. Ожидание до 180 секунд…")
         for _ in range(36):  # 36 * 5 = 180 секунд
@@ -1905,15 +1935,183 @@ _STEALTH_JS = """
         if (param === 37446) return 'Intel Iris OpenGL Engine'; // UNMASKED_RENDERER_WEBGL
         return getParameterOrig.call(this, param);
     };
+
+    // 8. Скрываем автоматизацию через CDP (Chrome DevTools Protocol)
+    delete window.cdc_adoQpoasnfa76pfcZLmcfl_Array;
+    delete window.cdc_adoQpoasnfa76pfcZLmcfl_Promise;
+    delete window.cdc_adoQpoasnfa76pfcZLmcfl_Symbol;
+
+    // 9. navigator.connection — у ботов часто отсутствует
+    if (!navigator.connection) {
+        Object.defineProperty(navigator, 'connection', {
+            get: () => ({
+                effectiveType: '4g',
+                rtt: 50,
+                downlink: 10,
+                saveData: false,
+            })
+        });
+    }
+
+    // 10. Подменяем количество ядер и память (типичные значения)
+    Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
+    Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
+
+    // 11. Убираем Notification.permission = 'denied' (бот-паттерн)
+    try {
+        Object.defineProperty(Notification, 'permission', { get: () => 'default' });
+    } catch(e) {}
+
+    // 12. Fake battery API (есть у реальных браузеров)
+    if (!navigator.getBattery) {
+        navigator.getBattery = () => Promise.resolve({
+            charging: true, chargingTime: 0, dischargingTime: Infinity, level: 1.0,
+            addEventListener: () => {}, removeEventListener: () => {},
+        });
+    }
 }
 """
 
 
 BROWSER_DATA_DIR = Path(".browser_profile")
+COOKIES_FILE = Path(".yandex_cookies.json")
+
+
+# ---------------------------------------------------------------------------
+# Пул реальных User-Agent (свежие версии Chrome на macOS / Windows / Linux)
+# ---------------------------------------------------------------------------
+
+_USER_AGENTS = [
+    # Chrome 131 macOS
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    # Chrome 130 macOS
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+    # Chrome 131 Windows
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    # Chrome 130 Windows
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+    # Chrome 131 Linux
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    # Chrome 129 macOS
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
+]
+
+
+def _pick_user_agent() -> tuple[str, str, str]:
+    """Выбрать случайный UA и вернуть (ua_string, platform, sec_ch_ua).
+
+    Возвращает согласованную тройку: User-Agent, sec-ch-ua-platform, sec-ch-ua.
+    """
+    ua = random.choice(_USER_AGENTS)
+    # Определяем платформу из UA
+    if "Macintosh" in ua:
+        platform = '"macOS"'
+    elif "Windows" in ua:
+        platform = '"Windows"'
+    else:
+        platform = '"Linux"'
+    # Извлекаем версию Chrome
+    m = re.search(r"Chrome/(\d+)", ua)
+    ver = m.group(1) if m else "131"
+    sec_ch_ua = f'"Chromium";v="{ver}", "Not_A Brand";v="24"'
+    return ua, platform, sec_ch_ua
+
+
+# ---------------------------------------------------------------------------
+# Адаптивный троттлинг — замедляемся при появлении капчи
+# ---------------------------------------------------------------------------
+
+class AdaptiveThrottle:
+    """Адаптивное управление скоростью парсинга.
+
+    При появлении капчи увеличиваем паузы.
+    При успешных запросах постепенно возвращаемся к нормальной скорости.
+    """
+
+    def __init__(self):
+        self._captcha_count = 0
+        self._success_streak = 0
+        self._multiplier = 1.0
+
+    def on_captcha(self) -> None:
+        """Вызвать при обнаружении капчи."""
+        self._captcha_count += 1
+        self._success_streak = 0
+        # Каждая капча удваивает замедление (макс x8)
+        self._multiplier = min(8.0, self._multiplier * 2.0)
+        log.info("Троттлинг: замедление x%.1f (капч: %d)", self._multiplier, self._captcha_count)
+
+    def on_success(self) -> None:
+        """Вызвать при успешном запросе без капчи."""
+        self._success_streak += 1
+        # После 3 успешных запросов подряд снижаем замедление
+        if self._success_streak >= 3 and self._multiplier > 1.0:
+            self._multiplier = max(1.0, self._multiplier * 0.7)
+            self._success_streak = 0
+            log.debug("Троттлинг: ускорение до x%.1f", self._multiplier)
+
+    def get_pause(self, base_ms: int = 2000) -> int:
+        """Получить паузу в мс с учётом троттлинга + рандом."""
+        pause = int(base_ms * self._multiplier)
+        # Добавляем 20% случайного шума
+        noise = int(pause * 0.2)
+        return pause + random.randint(-noise, noise)
+
+    @property
+    def multiplier(self) -> float:
+        return self._multiplier
+
+    @property
+    def captcha_count(self) -> int:
+        return self._captcha_count
+
+
+_throttle = AdaptiveThrottle()
+
+
+def get_throttle() -> AdaptiveThrottle:
+    return _throttle
+
+
+# ---------------------------------------------------------------------------
+# Cookie persistence — сохранение/загрузка cookies между сессиями
+# ---------------------------------------------------------------------------
+
+def _save_cookies(ctx: BrowserContext) -> None:
+    """Сохранить cookies контекста в файл для следующего запуска."""
+    try:
+        cookies = ctx.cookies()
+        # Фильтруем только yandex cookies
+        ya_cookies = [c for c in cookies if "yandex" in c.get("domain", "")]
+        if ya_cookies:
+            COOKIES_FILE.write_text(json.dumps(ya_cookies, ensure_ascii=False, indent=2))
+            log.debug("Сохранено %d cookies в %s", len(ya_cookies), COOKIES_FILE)
+    except Exception as exc:
+        log.debug("Ошибка сохранения cookies: %s", exc)
+
+
+def _load_cookies(ctx: BrowserContext) -> int:
+    """Загрузить cookies из файла в контекст. Возвращает кол-во загруженных."""
+    if not COOKIES_FILE.exists():
+        return 0
+    try:
+        cookies = json.loads(COOKIES_FILE.read_text())
+        if cookies:
+            ctx.add_cookies(cookies)
+            log.info("Загружено %d cookies из предыдущей сессии", len(cookies))
+            return len(cookies)
+    except Exception as exc:
+        log.debug("Ошибка загрузки cookies: %s", exc)
+    return 0
 
 
 def _create_browser_context(pw, headless: bool, proxy_url: str | None = None):
     """Создать браузер и контекст со stealth-патчами для обхода детекции."""
+    # Рандомизация viewport (± 20px от базового) — каждый запуск чуть отличается
+    base_w, base_h = 1280, 900
+    vw = base_w + random.randint(-20, 20)
+    vh = base_h + random.randint(-20, 20)
+
     launch_args: dict[str, Any] = {
         "headless": headless,
         "args": [
@@ -1922,7 +2120,7 @@ def _create_browser_context(pw, headless: bool, proxy_url: str | None = None):
             "--no-first-run",
             "--no-default-browser-check",
             "--disable-infobars",
-            "--window-size=1280,900",
+            f"--window-size={vw},{vh}",
         ],
     }
     if proxy_url:
@@ -1932,27 +2130,30 @@ def _create_browser_context(pw, headless: bool, proxy_url: str | None = None):
 
     browser: Browser = pw.chromium.launch(**launch_args)
 
-    # Persistent context сохраняет cookies между запусками → меньше капч
+    # Выбираем согласованный UA + заголовки
+    ua, platform, sec_ch_ua = _pick_user_agent()
+
     ctx: BrowserContext = browser.new_context(
-        viewport={"width": 1280, "height": 900},
+        viewport={"width": vw, "height": vh},
         locale="ru-RU",
         timezone_id="Europe/Moscow",
         color_scheme="light",
-        user_agent=(
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/131.0.0.0 Safari/537.36"
-        ),
+        user_agent=ua,
         extra_http_headers={
             "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-            "sec-ch-ua": '"Chromium";v="131", "Not_A Brand";v="24"',
+            "sec-ch-ua": sec_ch_ua,
             "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": '"macOS"',
+            "sec-ch-ua-platform": platform,
         },
     )
 
     # Инжектим stealth-скрипт ДО загрузки любой страницы
     ctx.add_init_script(_STEALTH_JS)
+
+    # Загружаем cookies из предыдущей сессии (Яндекс видит «знакомого» пользователя)
+    loaded = _load_cookies(ctx)
+    if loaded > 0:
+        log.info("Используем cookies предыдущей сессии — меньше шансов на капчу")
 
     return browser, ctx
 
@@ -1972,26 +2173,45 @@ _warmed_up = False
 
 
 def _warmup(page: Page, headless: bool) -> None:
-    """Прогрев: зайти на Я.Карты как обычный пользователь перед парсингом.
+    """Прогрев: зайти на Яндекс как обычный пользователь перед парсингом.
 
-    Яндекс меньше палит ботов, которые ведут себя как люди:
-    сначала заходят на главную, двигают мышкой, скроллят.
+    Стратегия: сначала заходим на yandex.ru (главная), потом переходим
+    на карты — как обычный человек. Яндекс меньше подозревает юзеров
+    с естественной цепочкой переходов и реферером.
     """
     global _warmed_up
     if _warmed_up:
         return
     _warmed_up = True
 
-    log.info("Прогрев: заходим на Яндекс.Карты как обычный пользователь…")
+    log.info("Прогрев: естественная навигация yandex.ru → карты…")
     try:
-        page.goto("https://yandex.ru/maps/", wait_until="domcontentloaded", timeout=20000)
+        # Шаг 1: заходим на главную Яндекса (как обычный пользователь)
+        page.goto("https://yandex.ru/", wait_until="domcontentloaded", timeout=20000)
         page.wait_for_timeout(random.randint(2000, 4000))
 
         # Проверяем капчу на главной
         if detect_captcha(page):
             handle_captcha(page, headless)
 
-        # Двигаем мышку случайно
+        # Двигаем мышку — «осматриваемся» на главной
+        for _ in range(random.randint(2, 4)):
+            page.mouse.move(
+                random.randint(100, 900),
+                random.randint(100, 600),
+            )
+            page.wait_for_timeout(random.randint(100, 400))
+
+        # Шаг 2: переходим на карты через навигацию (реферер yandex.ru)
+        page.wait_for_timeout(random.randint(1000, 2500))
+        page.goto("https://yandex.ru/maps/", wait_until="domcontentloaded", timeout=20000)
+        page.wait_for_timeout(random.randint(2000, 4000))
+
+        # Проверяем капчу на картах
+        if detect_captcha(page):
+            handle_captcha(page, headless)
+
+        # Двигаем мышку случайно по карте
         for _ in range(random.randint(3, 6)):
             page.mouse.move(
                 random.randint(100, 900),
@@ -2003,9 +2223,22 @@ def _warmup(page: Page, headless: bool) -> None:
         page.mouse.click(random.randint(500, 900), random.randint(300, 600))
         page.wait_for_timeout(random.randint(1000, 2500))
 
-        # Скроллим карту немного
+        # Скроллим карту немного (зум)
         page.mouse.wheel(0, random.randint(-200, 200))
         page.wait_for_timeout(random.randint(500, 1500))
+
+        # Иногда (30%) «ищем что-то» на карте — создаёт видимость активности
+        if random.random() < 0.3:
+            try:
+                search_input = page.locator("input[class*='search'], input[class*='input']").first
+                if search_input.count() > 0 and search_input.is_visible():
+                    search_input.click()
+                    page.wait_for_timeout(random.randint(300, 700))
+                    # Просто кликнули и «передумали»
+                    page.mouse.click(random.randint(500, 900), random.randint(300, 600))
+                    page.wait_for_timeout(random.randint(500, 1000))
+            except Exception:
+                pass
 
         log.info("Прогрев завершён")
     except Exception as exc:
@@ -2030,14 +2263,23 @@ def _search_and_collect(
     encoded_query = urllib.parse.quote(query)
     search_url = f"https://yandex.ru/maps/?text={encoded_query}"
     log.info("Открываю %s", search_url)
+
+    # Адаптивная пауза перед запросом (замедляемся если были капчи)
+    throttle = get_throttle()
+    pre_pause = throttle.get_pause(base_ms=1000)
+    page.wait_for_timeout(pre_pause)
+
     page.goto(search_url, wait_until="domcontentloaded", timeout=30000)
     page.wait_for_timeout(random.randint(2500, 4500))
 
     # Проверка CAPTCHA
     if detect_captcha(page):
+        throttle.on_captcha()
         if not handle_captcha(page, headless):
             log.error("CAPTCHA не решена, пропускаю запрос: %s", query)
             return []
+    else:
+        throttle.on_success()
 
     # Ждём появления результатов, пробуем несколько селекторов
     item_sel = engine.get("item")
@@ -2214,6 +2456,8 @@ def run_parser(
         if detail:
             _enrich_orgs(ctx, orgs)
 
+        # Сохраняем cookies для следующего запуска (меньше шансов на капчу)
+        _save_cookies(ctx)
         browser.close()
 
     _save_auto(orgs, out_path)
@@ -2316,11 +2560,26 @@ def run_category_parser(
             except Exception as exc:
                 log.debug("Ошибка промежуточного сохранения: %s", exc)
 
-            # Человеческая пауза между категориями
+            # Адаптивная пауза между категориями (увеличивается при капчах)
             if q_idx < total_queries:
-                pause = random.randint(1500, 4000)
+                throttle = get_throttle()
+                pause = throttle.get_pause(base_ms=random.randint(3000, 6000))
+                log.debug("Пауза между категориями: %d мс (x%.1f)", pause, throttle.multiplier)
                 page.wait_for_timeout(pause)
 
+                # Иногда (20%) «гуляем» по карте между запросами — выглядит естественно
+                if random.random() < 0.20:
+                    for _ in range(random.randint(2, 4)):
+                        page.mouse.move(
+                            random.randint(500, 1000),
+                            random.randint(200, 700),
+                        )
+                        page.wait_for_timeout(random.randint(200, 600))
+                    page.mouse.wheel(0, random.randint(-100, 100))
+                    page.wait_for_timeout(random.randint(500, 1500))
+
+        # Сохраняем cookies для следующего запуска
+        _save_cookies(ctx)
         browser.close()
 
     # Финальное сохранение
