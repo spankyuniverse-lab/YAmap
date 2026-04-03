@@ -2430,9 +2430,9 @@ def main() -> None:
 
     # Режим: обычный поиск по запросу
     if not args.query:
-        parser.print_help()
-        print("\nОшибка: укажите поисковый запрос или --city + --category")
-        sys.exit(1)
+        # Нет аргументов → запускаем интерактивное меню
+        interactive_menu()
+        return
 
     output = args.output or "results.xlsx"
     orgs = run_parser(
@@ -2448,6 +2448,220 @@ def main() -> None:
     )
 
     print(f"\nГотово! Собрано {len(orgs)} организаций -> {output}")
+
+
+# ---------------------------------------------------------------------------
+# Интерактивное меню (для PyCharm / запуска без аргументов)
+# ---------------------------------------------------------------------------
+
+def _input_choice(prompt: str, options: list[str], allow_empty: bool = False) -> str:
+    """Показать пронумерованный список и запросить выбор."""
+    for i, opt in enumerate(options, 1):
+        print(f"  {i}. {opt}")
+    while True:
+        raw = input(f"\n{prompt} ").strip()
+        if allow_empty and raw == "":
+            return ""
+        if raw.isdigit():
+            idx = int(raw) - 1
+            if 0 <= idx < len(options):
+                return options[idx]
+        # Может ввели текст напрямую
+        if raw in options or allow_empty:
+            return raw
+        print("  Неверный выбор, попробуйте ещё раз.")
+
+
+def _input_yn(prompt: str, default: bool = False) -> bool:
+    """Да/нет вопрос."""
+    hint = "[Y/n]" if default else "[y/N]"
+    raw = input(f"{prompt} {hint}: ").strip().lower()
+    if raw == "":
+        return default
+    return raw in ("y", "yes", "д", "да", "1")
+
+
+def interactive_menu() -> None:
+    """Пошаговое интерактивное меню — запускается при старте без аргументов."""
+    print()
+    print("=" * 55)
+    print("  YAmap — Парсер Яндекс.Карт")
+    print("=" * 55)
+    print()
+
+    # 1. Режим работы
+    print("Выберите режим:")
+    mode = _input_choice(
+        "Номер:",
+        [
+            "Поиск по запросу",
+            "Парсинг по категориям (как 2ГИС)",
+            "Все категории города",
+            "Показать список категорий",
+            "Автодетект селекторов",
+        ],
+    )
+
+    if mode == "Показать список категорий":
+        list_categories()
+        return
+
+    if mode == "Автодетект селекторов":
+        print("\nЗапускаю автодетект селекторов…")
+        # Формируем sys.argv и перезапускаем main
+        sys.argv = [sys.argv[0], "--detect-selectors", "--no-headless"]
+        main()
+        return
+
+    # 2. Город / запрос
+    query = None
+    city = None
+    categories_input: list[str] = []
+
+    if mode == "Поиск по запросу":
+        query = input("\nПоисковый запрос (напр. кофейни Москва): ").strip()
+        if not query:
+            print("Запрос не может быть пустым!")
+            return
+
+    elif mode in ("Парсинг по категориям (как 2ГИС)", "Все категории города"):
+        city = input("\nГород: ").strip()
+        if not city:
+            print("Город не может быть пустым!")
+            return
+
+        if mode == "Парсинг по категориям (как 2ГИС)":
+            print("\nДоступные группы категорий:")
+            groups = list(CATEGORIES.keys())
+            for i, g in enumerate(groups, 1):
+                count = len(CATEGORIES[g])
+                examples = ", ".join(CATEGORIES[g][:3])
+                print(f"  {i:2d}. {g:15s} ({count} шт: {examples}…)")
+
+            print(f"\nВведите номера через пробел (напр. 1 3 5)")
+            print(f"Или названия: еда авто красота")
+            raw = input("\nКатегории: ").strip()
+            if not raw:
+                print("Категории не выбраны!")
+                return
+
+            parts = raw.split()
+            for p in parts:
+                if p.isdigit():
+                    idx = int(p) - 1
+                    if 0 <= idx < len(groups):
+                        categories_input.append(groups[idx])
+                else:
+                    categories_input.append(p)
+        else:
+            categories_input = list(CATEGORIES.keys())
+            print(f"\nБудут спарсены ВСЕ {len(categories_input)} групп категорий")
+
+    # 3. Максимум результатов
+    raw_max = input("\nМаксимум организаций на запрос [500]: ").strip()
+    max_results = int(raw_max) if raw_max.isdigit() else 500
+
+    # 4. Формат вывода
+    print("\nФормат сохранения:")
+    fmt = _input_choice("Номер:", ["Excel (.xlsx)", "CSV (.csv)", "JSON (.json)"])
+    ext_map = {"Excel (.xlsx)": ".xlsx", "CSV (.csv)": ".csv", "JSON (.json)": ".json"}
+    ext = ext_map[fmt]
+
+    # Имя файла
+    if city:
+        default_name = f"{city}_categories{ext}"
+    elif query:
+        safe_name = re.sub(r'[^\w\s-]', '', query)[:30].strip().replace(' ', '_')
+        default_name = f"{safe_name}{ext}"
+    else:
+        default_name = f"results{ext}"
+
+    raw_output = input(f"\nИмя файла [{default_name}]: ").strip()
+    output = raw_output if raw_output else default_name
+
+    # 5. Дополнительные опции
+    print("\n--- Дополнительные настройки ---")
+    detail = _input_yn("Открывать карточки для телефона/сайта? (медленнее, но больше данных)", False)
+    api_intercept = _input_yn("Режим перехвата API? (надёжнее, данные из JSON)", False)
+    headless = not _input_yn("Показывать браузер? (для отладки)", False)
+
+    # 6. Прокси
+    proxy_url = None
+    if _input_yn("Использовать прокси?", False):
+        print("\n  1. Один прокси (ввести вручную)")
+        print("  2. Файл с прокси-списком")
+        proxy_mode = input("\nНомер [1]: ").strip()
+        if proxy_mode == "2":
+            proxy_file = input("Путь к файлу с прокси: ").strip()
+            if proxy_file:
+                global _proxy_rotator
+                _proxy_rotator = ProxyRotator.from_file(proxy_file)
+                proxy_url = _proxy_rotator.next()
+        else:
+            proxy_url = input("Прокси (http://host:port): ").strip() or None
+
+    # 7. Резюме
+    resume_path = None
+    existing_file = Path(output)
+    if existing_file.exists():
+        if _input_yn(f"Файл {output} уже существует. Продолжить сбор (resume)?", True):
+            resume_path = existing_file
+
+    # 8. Подтверждение
+    print("\n" + "=" * 55)
+    print("  Параметры запуска:")
+    print("=" * 55)
+    if query:
+        print(f"  Режим:       поиск по запросу")
+        print(f"  Запрос:      {query}")
+    else:
+        print(f"  Режим:       по категориям")
+        print(f"  Город:       {city}")
+        print(f"  Категории:   {', '.join(categories_input)}")
+    print(f"  Макс. орг:   {max_results}")
+    print(f"  Файл:        {output}")
+    print(f"  Detail:      {'да' if detail else 'нет'}")
+    print(f"  API-перехват: {'да' if api_intercept else 'нет'}")
+    print(f"  Браузер:     {'видимый' if not headless else 'скрытый'}")
+    print(f"  Прокси:      {proxy_url or 'нет'}")
+    print(f"  Резюме:      {resume_path or 'нет'}")
+    print("=" * 55)
+
+    if not _input_yn("\nЗапустить?", True):
+        print("Отменено.")
+        return
+
+    print()
+
+    # 9. Запуск
+    if query:
+        orgs = run_parser(
+            query=query,
+            max_results=max_results,
+            output=output,
+            headless=headless,
+            detail=detail,
+            scroll_pause=1.0,
+            api_intercept=api_intercept,
+            proxy_url=proxy_url,
+            resume_path=resume_path,
+        )
+        print(f"\nГотово! Собрано {len(orgs)} организаций -> {output}")
+    else:
+        results = run_category_parser(
+            city=city,
+            categories=categories_input,
+            max_results_per_category=max_results,
+            output=output,
+            headless=headless,
+            detail=detail,
+            scroll_pause=1.0,
+            api_intercept=api_intercept,
+            proxy_url=proxy_url,
+            resume_path=resume_path,
+        )
+        total = sum(len(v) for v in results.values())
+        print(f"\nГотово! Собрано {total} организаций по {len(results)} категориям -> {output}")
 
 
 if __name__ == "__main__":
