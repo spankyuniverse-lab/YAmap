@@ -1,0 +1,33 @@
+# Пример конфиг-файла для yandex_parser.py
+# Использование: python yandex_parser.py --config config.yaml
+
+# Город для парсинга по категориям
+city: "Москва"
+
+# Категории (группы или конкретные)
+categories:
+  - еда
+  - авто
+  - здоровье
+
+# Максимум организаций на запрос/категорию
+max_results: 200
+
+# Пауза между скроллами (секунды)
+scroll_pause: 1.2
+
+# Файл результатов (.xlsx, .csv, .json)
+output: "results.xlsx"
+
+# Показывать браузер
+headless: true
+
+# Открывать карточки для телефона/сайта
+detail: false
+
+# Режим перехвата API
+api_intercept: false
+
+# Прокси (опционально)
+# proxy: "http://user:pass@host:port"
+# proxy_file: "proxies.txt"
