@@ -92,6 +92,32 @@ class Organization:
 FIELDNAMES = [f.name for f in fields(Organization)]
 
 
+def _normalize_for_dedup(text: str) -> str:
+    """Нормализовать строку для дедупликации.
+
+    'ул. Ленина, 5' и 'улица Ленина, 5' → одинаковый ключ.
+    """
+    s = text.lower().strip()
+    # Стандартные сокращения
+    s = re.sub(r'\bулица\b', 'ул', s)
+    s = re.sub(r'\bпроспект\b', 'пр-т', s)
+    s = re.sub(r'\bпереулок\b', 'пер', s)
+    s = re.sub(r'\bбульвар\b', 'б-р', s)
+    s = re.sub(r'\bпроезд\b', 'пр-д', s)
+    s = re.sub(r'\bнабережная\b', 'наб', s)
+    s = re.sub(r'\bплощадь\b', 'пл', s)
+    s = re.sub(r'\bмикрорайон\b', 'мкр', s)
+    # Убираем точки, лишние пробелы, запятые
+    s = s.replace('.', '').replace(',', ' ')
+    s = re.sub(r'\s+', ' ', s).strip()
+    return s
+
+
+def _dedup_key(org: Organization) -> str:
+    """Ключ для дедупликации организации."""
+    return f"{_normalize_for_dedup(org.name)}|{_normalize_for_dedup(org.address)}"
+
+
 # ---------------------------------------------------------------------------
 # Proxy rotation
 # ---------------------------------------------------------------------------
@@ -413,7 +439,7 @@ class ResumeManager:
                 en_key = ru_to_en.get(k, k)
                 norm[en_key] = str(v) if v else ""
 
-            key = f"{norm.get('name', '')}|{norm.get('address', '')}"
+            key = f"{_normalize_for_dedup(norm.get('name', ''))}|{_normalize_for_dedup(norm.get('address', ''))}"
             if key != "|":
                 org = Organization(**{f: norm.get(f, "") for f in FIELDNAMES if f in norm})
                 self._existing[key] = org
@@ -431,7 +457,7 @@ class ResumeManager:
         return len(self._existing)
 
     def is_known(self, name: str, address: str) -> bool:
-        return f"{name}|{address}" in self._existing
+        return f"{_normalize_for_dedup(name)}|{_normalize_for_dedup(address)}" in self._existing
 
     def is_query_done(self, query: str) -> bool:
         return query in self._completed_queries
@@ -1668,11 +1694,15 @@ def _extract_orgs_from_api_response(data: dict) -> list[Organization]:
         org.name = company.get("name", props.get("name", ""))
         org.address = company.get("address", props.get("address", ""))
 
-        # Телефоны
+        # Телефоны — все номера через "; "
         phones = company.get("Phones", company.get("phones", []))
         if phones:
-            formatted = phones[0].get("formatted", phones[0].get("number", ""))
-            org.phone = formatted
+            phone_list = []
+            for ph in phones:
+                num = ph.get("formatted") or ph.get("number") or ph.get("value", "")
+                if num and num not in phone_list:
+                    phone_list.append(num)
+            org.phone = "; ".join(phone_list)
 
         # Сайт
         url_obj = company.get("url", company.get("Url", ""))
@@ -1785,7 +1815,7 @@ def run_api_intercept(
 
         orgs = _extract_orgs_from_api_response(body)
         for org in orgs:
-            key = f"{org.name}|{org.address}"
+            key = _dedup_key(org)
             if key not in seen_names:
                 seen_names.add(key)
                 all_orgs.append(org)
@@ -2181,6 +2211,60 @@ def _warmup(page: Page, headless: bool) -> None:
         log.debug("Прогрев не удался: %s", exc)
 
 
+def _type_like_human(page: Page, selector: str, text: str) -> None:
+    """Напечатать текст по буквам с человеческими задержками между символами."""
+    el = page.locator(selector).first
+    el.click()
+    page.wait_for_timeout(random.randint(200, 500))
+    # Очищаем поле (Ctrl+A → Delete)
+    el.press("Control+a")
+    page.wait_for_timeout(random.randint(50, 150))
+    el.press("Delete")
+    page.wait_for_timeout(random.randint(100, 300))
+    # Печатаем по буквам
+    for char in text:
+        el.press_sequentially(char, delay=random.randint(40, 120))
+        # Иногда (5%) микро-пауза — человек думает
+        if random.random() < 0.05:
+            page.wait_for_timeout(random.randint(200, 600))
+
+
+def _do_search(page: Page, query: str, headless: bool) -> bool:
+    """Выполнить поиск: ввести запрос в строку поиска как человек.
+
+    Возвращает True если удалось ввести и отправить запрос.
+    Fallback: если строка поиска не найдена — goto по URL.
+    """
+    # Пробуем найти строку поиска на странице
+    search_sels = [
+        "input[class*='input__control']",
+        "input[class*='search-form']",
+        "[class*='search-form-view__input'] input",
+        "input[placeholder*='Поиск']",
+        "input[aria-label*='Поиск']",
+    ]
+    for sel in search_sels:
+        try:
+            inp = page.locator(sel).first
+            if inp.count() > 0 and inp.is_visible():
+                log.info("Ввожу запрос в строку поиска: %s", query)
+                _type_like_human(page, sel, query)
+                page.wait_for_timeout(random.randint(300, 700))
+                inp.press("Enter")
+                return True
+        except Exception:
+            continue
+
+    # Fallback: goto по URL (менее естественно, но работает)
+    log.debug("Строка поиска не найдена — используем goto")
+    encoded_query = urllib.parse.quote(query)
+    page.goto(
+        f"https://yandex.ru/maps/?text={encoded_query}",
+        wait_until="domcontentloaded", timeout=30000,
+    )
+    return True
+
+
 def _search_and_collect(
     page: Page,
     query: str,
@@ -2196,16 +2280,15 @@ def _search_and_collect(
     # Прогрев при первом запросе
     _warmup(page, headless)
 
-    encoded_query = urllib.parse.quote(query)
-    search_url = f"https://yandex.ru/maps/?text={encoded_query}"
-    log.info("Открываю %s", search_url)
+    log.info("Поиск: %s", query)
 
     # Адаптивная пауза перед запросом (замедляемся если были капчи)
     throttle = get_throttle()
     pre_pause = throttle.get_pause(base_ms=1000)
     page.wait_for_timeout(pre_pause)
 
-    page.goto(search_url, wait_until="domcontentloaded", timeout=30000)
+    # Вводим запрос через строку поиска (как человек)
+    _do_search(page, query, headless)
     page.wait_for_timeout(random.randint(2500, 4500))
 
     # Проверка CAPTCHA
@@ -2260,19 +2343,94 @@ def _search_and_collect(
     return orgs
 
 
-def _enrich_orgs(ctx: BrowserContext, orgs: list[Organization]) -> None:
-    """Обогатить организации данными с карточек."""
+def _search_with_retry(
+    page: Page,
+    query: str,
+    max_results: int,
+    scroll_pause: float,
+    api_intercept: bool,
+    on_org: Any = None,
+    headless: bool = True,
+    max_retries: int = 3,
+) -> list[Organization]:
+    """Обёртка над _search_and_collect с retry при ошибках."""
+    for attempt in range(1, max_retries + 1):
+        try:
+            orgs = _search_and_collect(
+                page, query, max_results, scroll_pause,
+                api_intercept, on_org=on_org, headless=headless,
+            )
+            if orgs:
+                return orgs
+            # Пустой результат — может стоит попробовать ещё
+            if attempt < max_retries:
+                log.warning("Пустой результат для «%s», попытка %d/%d…",
+                            query, attempt, max_retries)
+                page.wait_for_timeout(random.randint(5000, 10000))
+            else:
+                return []
+        except Exception as exc:
+            if attempt < max_retries:
+                wait_sec = attempt * 10
+                log.warning("Ошибка при поиске «%s»: %s. Retry через %d сек (попытка %d/%d)",
+                            query, exc, wait_sec, attempt, max_retries)
+                page.wait_for_timeout(wait_sec * 1000)
+                # Возвращаемся на карты перед retry
+                try:
+                    page.goto("https://yandex.ru/maps/", wait_until="domcontentloaded", timeout=15000)
+                    page.wait_for_timeout(random.randint(2000, 4000))
+                except Exception:
+                    pass
+            else:
+                log.error("Не удалось выполнить поиск «%s» после %d попыток: %s",
+                          query, max_retries, exc)
+                return []
+    return []
+
+
+def _enrich_orgs(ctx: BrowserContext, orgs: list[Organization], n_tabs: int = 3) -> None:
+    """Обогатить организации данными с карточек.
+
+    Использует n_tabs параллельных вкладок для ускорения.
+    """
     if not orgs:
         return
-    log.info("Обогащаю данные с карточек организаций (%d шт)…", len(orgs))
-    # Создаём НОВУЮ страницу для detail-парсинга (не трогаем основную)
-    detail_page = ctx.new_page()
-    detail_detected = [False]  # мутабельный флаг для одноразовой детекции
+    log.info("Обогащаю данные с карточек организаций (%d шт, %d вкладок)…", len(orgs), n_tabs)
+
+    # Создаём пул вкладок
+    pages: list[Page] = []
+    for _ in range(min(n_tabs, len(orgs))):
+        try:
+            pages.append(ctx.new_page())
+        except Exception:
+            break
+    if not pages:
+        pages.append(ctx.new_page())
+
+    detail_detected = [False]
+    pbar = None
+    if HAS_TQDM:
+        pbar = tqdm(total=len(orgs), desc="Обогащение карточек", unit="орг")
+
+    # Распределяем организации по вкладкам round-robin
     for idx, org in enumerate(orgs):
-        enrich_from_detail(detail_page, org, _detail_detected=detail_detected)
-        if (idx + 1) % 20 == 0:
+        page = pages[idx % len(pages)]
+        enrich_from_detail(page, org, _detail_detected=detail_detected)
+        if pbar:
+            pbar.update(1)
+        elif (idx + 1) % 20 == 0:
             log.info("Обогащено: %d / %d", idx + 1, len(orgs))
-    detail_page.close()
+        # Небольшая пауза между карточками (не бомбить сервер)
+        page.wait_for_timeout(random.randint(300, 800))
+
+    if pbar:
+        pbar.close()
+
+    for p in pages:
+        try:
+            p.close()
+        except Exception:
+            pass
 
 
 def _make_incremental_saver(out_path: Path, save_every: int = 25):
@@ -2372,13 +2530,16 @@ def run_parser(
     if resume and resume.existing_count > 0:
         log.info("Резюме: %d организаций уже собраны", resume.existing_count)
 
+    # Промежуточное сохранение: каждые 25 организаций сбрасываем в файл
+    on_org, incremental_orgs = _make_incremental_saver(out_path, save_every=25)
+
     with sync_playwright() as pw:
         _, ctx = _create_browser_context(pw, headless, proxy_url=proxy_url)
         page = _setup_page(ctx)
 
-        orgs = _search_and_collect(
+        orgs = _search_with_retry(
             page, query, max_results, scroll_pause, api_intercept,
-            headless=headless,
+            on_org=on_org, headless=headless,
         )
 
         for org in orgs:
@@ -2460,7 +2621,7 @@ def run_category_parser(
 
             log.info("━━━ [%d/%d] %s ━━━", q_idx, total_queries, full_query)
 
-            orgs = _search_and_collect(
+            orgs = _search_with_retry(
                 page, full_query, max_results_per_category,
                 scroll_pause, api_intercept, headless=headless,
             )
@@ -2468,7 +2629,7 @@ def run_category_parser(
             # Дедупликация по имени+адресу
             unique_orgs: list[Organization] = []
             for org in orgs:
-                key = f"{org.name}|{org.address}"
+                key = _dedup_key(org)
                 if key not in seen_global:
                     seen_global.add(key)
                     org.search_query = full_query
