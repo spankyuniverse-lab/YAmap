@@ -296,23 +296,23 @@ def handle_captcha(page: Page, headless: bool) -> bool:
         log.warning("=" * 60)
         return True
 
-    # 2. Если есть прокси — пробуем сменить IP и перезагрузить
-    rotator = get_proxy_rotator()
-    if rotator.has_proxies:
-        current = rotator.current()
-        if current:
-            rotator.mark_failed(current)
-        new_proxy = rotator.next()
-        if new_proxy:
-            log.info("Смена прокси → %s, перезагрузка…",
-                     new_proxy.split("@")[-1] if "@" in new_proxy else new_proxy)
-            page.wait_for_timeout(random.randint(3000, 6000))
-            page.reload(wait_until="domcontentloaded", timeout=15000)
-            page.wait_for_timeout(3000)
-            if not detect_captcha(page):
-                log.info("CAPTCHA исчезла после смены прокси!")
-                log.warning("=" * 60)
-                return True
+    # 2. Пауза + reload — иногда капча протухает после ожидания
+    log.info("Пауза 15-25 сек + reload (капча может протухнуть)…")
+    page.wait_for_timeout(random.randint(15000, 25000))
+    try:
+        page.reload(wait_until="domcontentloaded", timeout=20000)
+        page.wait_for_timeout(random.randint(3000, 5000))
+        if not detect_captcha(page):
+            log.info("CAPTCHA исчезла после паузы и reload!")
+            log.warning("=" * 60)
+            return True
+        # Ещё раз пробуем автоклик — может теперь простая форма
+        if _try_click_captcha(page):
+            log.info("CAPTCHA решена автокликом после reload!")
+            log.warning("=" * 60)
+            return True
+    except Exception:
+        pass
 
     # 3. Ручное решение / автоожидание
     if headless:
@@ -1687,6 +1687,30 @@ def _extract_orgs_from_api_response(data: dict) -> list[Organization]:
             text = hours.get("text", "")
             org.working_hours = text
 
+        # Рейтинг и отзывы
+        rating_val = (
+            company.get("rating", {}) if isinstance(company.get("rating"), dict)
+            else props.get("rating", {}) if isinstance(props.get("rating"), dict)
+            else {}
+        )
+        if isinstance(rating_val, dict):
+            org.rating = str(rating_val.get("value", rating_val.get("score", "")))
+            org.reviews_count = str(rating_val.get("ratings", rating_val.get("count", "")))
+        # Fallback: рейтинг как простое число
+        if not org.rating:
+            for key in ("rating", "Rating", "score"):
+                val = company.get(key) or props.get(key)
+                if val and not isinstance(val, dict):
+                    org.rating = str(val)
+                    break
+        # Fallback: кол-во отзывов
+        if not org.reviews_count:
+            for key in ("reviewCount", "ratingCount", "totalRatings"):
+                val = company.get(key) or props.get(key)
+                if val:
+                    org.reviews_count = str(val)
+                    break
+
         # Категории
         categories = company.get("Categories", company.get("categories", []))
         if categories:
@@ -1774,6 +1798,10 @@ def run_api_intercept(
     container_sel = _find_scroll_container(page)
     stale_rounds = 0
 
+    pbar = None
+    if HAS_TQDM:
+        pbar = tqdm(total=max_results, desc="API-перехват", unit="орг")
+
     while len(all_orgs) < max_results:
         prev = len(all_orgs)
         _human_scroll(page, container_sel)
@@ -1783,14 +1811,20 @@ def run_api_intercept(
         jitter = scroll_pause * random.uniform(0.7, 1.3)
         page.wait_for_timeout(int(jitter * 1000))
 
-        if len(all_orgs) == prev:
-            stale_rounds += 1
-        else:
+        new_count = len(all_orgs) - prev
+        if new_count > 0:
             stale_rounds = 0
+            if pbar:
+                pbar.update(new_count)
+        else:
+            stale_rounds += 1
 
         if stale_rounds >= 12:
             log.info("API: новые данные не поступают, завершаем (всего %d)", len(all_orgs))
             break
+
+    if pbar:
+        pbar.close()
 
     page.remove_listener("response", on_response)
     return all_orgs[:max_results]
@@ -1925,139 +1959,17 @@ def save_xlsx_by_categories(
 # Main parser flow
 # ---------------------------------------------------------------------------
 
+# Минимальный stealth JS — используется ТОЛЬКО как fallback для обычного Playwright.
+# С patchright + channel="chrome" этот скрипт НЕ инжектится.
 _STEALTH_JS = """
 () => {
-    // 1. Убираем navigator.webdriver
     Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-
-    // 2. Подменяем navigator.plugins (у автоматизированного Chrome пустой)
-    Object.defineProperty(navigator, 'plugins', {
-        get: () => {
-            const plugins = [
-                { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
-                { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai', description: '' },
-                { name: 'Native Client', filename: 'internal-nacl-plugin', description: '' },
-            ];
-            plugins.length = 3;
-            return plugins;
-        }
-    });
-
-    // 3. Подменяем navigator.languages
-    Object.defineProperty(navigator, 'languages', { get: () => ['ru-RU', 'ru', 'en-US', 'en'] });
-
-    // 4. Подменяем permissions
-    const origQuery = window.navigator.permissions.query;
-    window.navigator.permissions.query = (parameters) => (
-        parameters.name === 'notifications' ?
-            Promise.resolve({ state: Notification.permission }) :
-            origQuery(parameters)
-    );
-
-    // 5. Скрываем chrome.runtime (если нет расширений)
     window.chrome = { runtime: {}, loadTimes: function(){}, csi: function(){} };
-
-    // 6. Fake canvas fingerprint (небольшой шум)
-    const origToDataURL = HTMLCanvasElement.prototype.toDataURL;
-    HTMLCanvasElement.prototype.toDataURL = function(type) {
-        if (type === 'image/png' && this.width > 16) {
-            const ctx = this.getContext('2d');
-            if (ctx) {
-                const style = ctx.fillStyle;
-                ctx.fillStyle = 'rgba(0,0,1,0.003)';
-                ctx.fillRect(0, 0, 1, 1);
-                ctx.fillStyle = style;
-            }
-        }
-        return origToDataURL.apply(this, arguments);
-    };
-
-    // 7. Fake WebGL vendor/renderer
-    const getParameterOrig = WebGLRenderingContext.prototype.getParameter;
-    WebGLRenderingContext.prototype.getParameter = function(param) {
-        if (param === 37445) return 'Intel Inc.';           // UNMASKED_VENDOR_WEBGL
-        if (param === 37446) return 'Intel Iris OpenGL Engine'; // UNMASKED_RENDERER_WEBGL
-        return getParameterOrig.call(this, param);
-    };
-
-    // 8. Скрываем автоматизацию через CDP (Chrome DevTools Protocol)
-    delete window.cdc_adoQpoasnfa76pfcZLmcfl_Array;
-    delete window.cdc_adoQpoasnfa76pfcZLmcfl_Promise;
-    delete window.cdc_adoQpoasnfa76pfcZLmcfl_Symbol;
-
-    // 9. navigator.connection — у ботов часто отсутствует
-    if (!navigator.connection) {
-        Object.defineProperty(navigator, 'connection', {
-            get: () => ({
-                effectiveType: '4g',
-                rtt: 50,
-                downlink: 10,
-                saveData: false,
-            })
-        });
-    }
-
-    // 10. Подменяем количество ядер и память (типичные значения)
-    Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
-    Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
-
-    // 11. Убираем Notification.permission = 'denied' (бот-паттерн)
-    try {
-        Object.defineProperty(Notification, 'permission', { get: () => 'default' });
-    } catch(e) {}
-
-    // 12. Fake battery API (есть у реальных браузеров)
-    if (!navigator.getBattery) {
-        navigator.getBattery = () => Promise.resolve({
-            charging: true, chargingTime: 0, dischargingTime: Infinity, level: 1.0,
-            addEventListener: () => {}, removeEventListener: () => {},
-        });
-    }
 }
 """
 
 
 BROWSER_DATA_DIR = Path(".browser_profile")
-
-
-# ---------------------------------------------------------------------------
-# Пул реальных User-Agent (свежие версии Chrome на macOS / Windows / Linux)
-# ---------------------------------------------------------------------------
-
-_USER_AGENTS = [
-    # Chrome 131 macOS
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-    # Chrome 130 macOS
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
-    # Chrome 131 Windows
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-    # Chrome 130 Windows
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
-    # Chrome 131 Linux
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-    # Chrome 129 macOS
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
-]
-
-
-def _pick_user_agent() -> tuple[str, str, str]:
-    """Выбрать случайный UA и вернуть (ua_string, platform, sec_ch_ua).
-
-    Возвращает согласованную тройку: User-Agent, sec-ch-ua-platform, sec-ch-ua.
-    """
-    ua = random.choice(_USER_AGENTS)
-    # Определяем платформу из UA
-    if "Macintosh" in ua:
-        platform = '"macOS"'
-    elif "Windows" in ua:
-        platform = '"Windows"'
-    else:
-        platform = '"Linux"'
-    # Извлекаем версию Chrome
-    m = re.search(r"Chrome/(\d+)", ua)
-    ver = m.group(1) if m else "131"
-    sec_ch_ua = f'"Chromium";v="{ver}", "Not_A Brand";v="24"'
-    return ua, platform, sec_ch_ua
 
 
 # ---------------------------------------------------------------------------
@@ -2353,7 +2265,8 @@ def _enrich_orgs(ctx: BrowserContext, orgs: list[Organization]) -> None:
     if not orgs:
         return
     log.info("Обогащаю данные с карточек организаций (%d шт)…", len(orgs))
-    detail_page = _setup_page(ctx)
+    # Создаём НОВУЮ страницу для detail-парсинга (не трогаем основную)
+    detail_page = ctx.new_page()
     detail_detected = [False]  # мутабельный флаг для одноразовой детекции
     for idx, org in enumerate(orgs):
         enrich_from_detail(detail_page, org, _detail_detected=detail_detected)
@@ -2450,6 +2363,8 @@ def run_parser(
     resume_path: Path | None = None,
 ) -> list[Organization]:
     """Парсер по одному поисковому запросу."""
+    global _warmed_up
+    _warmed_up = False  # Сброс для нового контекста браузера
     out_path = Path(output)
 
     # Резюме: загружаем уже собранные данные
@@ -2505,6 +2420,8 @@ def run_category_parser(
     resume_path: Path | None = None,
 ) -> dict[str, list[Organization]]:
     """Парсер по категориям: для каждой категории запускает поиск «категория город»."""
+    global _warmed_up
+    _warmed_up = False  # Сброс для нового контекста браузера
     out_path = Path(output)
     results: dict[str, list[Organization]] = {}
     seen_global: set[str] = set()
@@ -2566,16 +2483,9 @@ def run_category_parser(
             # Промежуточное сохранение после каждой категории
             try:
                 suffix = out_path.suffix.lower()
-                if suffix == ".csv":
-                    all_tmp: list[Organization] = []
-                    for v in results.values():
-                        all_tmp.extend(v)
-                    save_csv(all_tmp, out_path)
-                elif suffix == ".json":
-                    all_tmp = []
-                    for v in results.values():
-                        all_tmp.extend(v)
-                    save_json(all_tmp, out_path)
+                if suffix in (".csv", ".json"):
+                    all_tmp = [o for v in results.values() for o in v]
+                    (save_csv if suffix == ".csv" else save_json)(all_tmp, out_path)
                 else:
                     save_xlsx_by_categories(results, out_path)
                 total_so_far = sum(len(v) for v in results.values())
@@ -3078,7 +2988,7 @@ def interactive_menu() -> None:
         api_intercept = True
 
     print("\n--- Дополнительные настройки ---")
-    headless = not _input_yn("Показывать браузер? (для отладки)", False)
+    headless = not _input_yn("Показывать браузер? (рекомендуется для решения капчи)", True)
 
     # 6. Прокси
     proxy_url = None
