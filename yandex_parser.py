@@ -23,6 +23,8 @@ import json
 import logging
 import random
 import re
+import shutil
+import signal
 import sys
 import time
 import urllib.parse
@@ -637,39 +639,125 @@ def resolve_categories(names: list[str]) -> list[str]:
 
 # -- Список результатов (левая панель) --
 # Поле ввода поиска
-SEARCH_INPUT_SEL = "[class*='search-form-view__input'] input, input.input__control"
+SEARCH_INPUT_SEL = (
+    "[class*='search-form-view__input'] input, "
+    "input.input__control, "
+    "input[placeholder*='Поиск' i], "
+    "input[aria-label*='Поиск' i]"
+)
 # Кнопка поиска
-SEARCH_BUTTON_SEL = "[class*='small-search-form-view__button'], [class*='search-form-view'] button[type='submit']"
+SEARCH_BUTTON_SEL = (
+    "[class*='small-search-form-view__button'], "
+    "[class*='search-form-view'] button[type='submit'], "
+    "button[aria-label*='Найти' i]"
+)
 
 # Контейнер прокрутки результатов
-SCROLL_CONTAINER_SEL = "[class*='scroll__container']"
+SCROLL_CONTAINER_SEL = (
+    "[class*='scroll__container'], "
+    "[class*='search-list-view'], "
+    "[class*='sidebar'] [class*='scroll']"
+)
 # Ползунок скроллбара (для определения наличия прокрутки)
 SCROLLBAR_THUMB_SEL = "[class*='scroll__scrollbar-thumb']"
 
 # Один сниппет организации в списке результатов
-ITEM_SEL = "[class*='search-snippet-view']"
+ITEM_SEL = (
+    "[class*='search-snippet-view'], "
+    "[class*='search-business-snippet-view'], "
+    "li[class*='search-snippet']"
+)
 # Ссылка-оверлей на карточку организации
-LINK_SEL = "[class*='search-snippet-view__link-overlay']"
+LINK_SEL = (
+    "[class*='search-snippet-view__link-overlay'], "
+    "a[href*='/maps/org/'][class*='link-overlay'], "
+    "a[href*='/maps/org/']"
+)
 # Кнопка «Показать ещё»
-SHOW_MORE_SEL = "[class*='show-more'] button, [class*='search-list-view__more'] button"
+SHOW_MORE_SEL = (
+    "[class*='show-more'] button, "
+    "[class*='search-list-view__more'] button, "
+    "button[class*='more'][class*='button']"
+)
 
 # -- Поля внутри сниппета (список результатов) --
-SNIPPET_TITLE_SEL = "[class*='search-business-snippet-view__title']"
-SNIPPET_ADDRESS_SEL = "[class*='search-business-snippet-view__address']"
-SNIPPET_CATEGORY_SEL = "[class*='search-business-snippet-view__categories']"
-SNIPPET_HOURS_SEL = "[class*='search-business-snippet-view__open-hours']"
-SNIPPET_RATING_SEL = "[class*='business-rating-badge-view__rating-text'], [class*='business-summary-rating-badge-view__rating-text']"
-SNIPPET_REVIEWS_SEL = "[class*='business-rating-badge-view__rating-count']"
+SNIPPET_TITLE_SEL = (
+    "[class*='search-business-snippet-view__title'], "
+    "[class*='snippet-view__title'], "
+    "[class*='search-snippet-view__title']"
+)
+SNIPPET_ADDRESS_SEL = (
+    "[class*='search-business-snippet-view__address'], "
+    "[class*='snippet-view__address']"
+)
+SNIPPET_CATEGORY_SEL = (
+    "[class*='search-business-snippet-view__categories'], "
+    "[class*='snippet-view__categories']"
+)
+SNIPPET_HOURS_SEL = (
+    "[class*='search-business-snippet-view__open-hours'], "
+    "[class*='business-working-status-view__text']"
+)
+SNIPPET_RATING_SEL = (
+    "[class*='business-rating-badge-view__rating-text'], "
+    "[class*='business-summary-rating-badge-view__rating-text'], "
+    "span[itemprop='ratingValue']"
+)
+SNIPPET_REVIEWS_SEL = (
+    "[class*='business-rating-badge-view__rating-count'], "
+    "[class*='business-rating-amount-view'], "
+    "meta[itemprop='reviewCount']"
+)
 
 # -- Карточка организации (detail page) --
-DETAIL_NAME_SEL = "h1[class*='orgpage-header-view__header'], h1[class*='card-title-view__title']"
-DETAIL_ADDRESS_SEL = "[class*='business-contacts-view__address-link'], [class*='orgpage-header-view__address'], [class*='card-title-view__subtitle']"
-DETAIL_PHONE_SEL = "[class*='card-phones-view__phone-number'], [class*='orgpage-phones-view__phone-number'], a[href^='tel:']"
-DETAIL_WEBSITE_SEL = "[class*='business-urls-view__text'], [class*='card-feature-view__content'] a[href], [class*='orgpage-feature-view__content'] a[href]"
-DETAIL_RATING_SEL = "[class*='business-summary-rating-badge-view__rating-text'], [class*='business-rating-badge-view__rating-text']"
-DETAIL_REVIEWS_COUNT_SEL = "[class*='tabs-select-view__counter']"
-DETAIL_HOURS_SEL = "meta[itemprop='openingHours'], [class*='business-working-status-view__text']"
-DETAIL_CATEGORY_SEL = "[class*='business-categories-view__category'], [class*='breadcrumbs-view__text']"
+DETAIL_NAME_SEL = (
+    "h1[class*='orgpage-header-view__header'], "
+    "h1[class*='card-title-view__title'], "
+    "h1[itemprop='name']"
+)
+DETAIL_ADDRESS_SEL = (
+    "[class*='business-contacts-view__address-link'], "
+    "[class*='orgpage-header-view__address'], "
+    "[class*='card-title-view__subtitle'], "
+    "[class*='business-contacts-view__address'], "
+    "a[href*='/maps/'][itemprop='address'], "
+    "[itemprop='address']"
+)
+DETAIL_PHONE_SEL = (
+    "[class*='card-phones-view__phone-number'], "
+    "[class*='orgpage-phones-view__phone-number'], "
+    "[class*='business-phones-view__phone'], "
+    "a[href^='tel:'], "
+    "[itemprop='telephone']"
+)
+DETAIL_WEBSITE_SEL = (
+    "[class*='business-urls-view__text'], "
+    "[class*='business-urls-view'] a[href], "
+    "[class*='card-feature-view__content'] a[href], "
+    "[class*='orgpage-feature-view__content'] a[href], "
+    "a[itemprop='url']"
+)
+DETAIL_RATING_SEL = (
+    "[class*='business-summary-rating-badge-view__rating-text'], "
+    "[class*='business-rating-badge-view__rating-text'], "
+    "span[itemprop='ratingValue']"
+)
+DETAIL_REVIEWS_COUNT_SEL = (
+    "[class*='tabs-select-view__counter'], "
+    "[class*='business-header-rating-view__text'], "
+    "meta[itemprop='reviewCount']"
+)
+DETAIL_HOURS_SEL = (
+    "meta[itemprop='openingHours'], "
+    "[class*='business-working-status-view__text'], "
+    "[class*='business-working-intervals-view'], "
+    "[itemprop='openingHours']"
+)
+DETAIL_CATEGORY_SEL = (
+    "[class*='business-categories-view__category'], "
+    "[class*='breadcrumbs-view__text'], "
+    "a[class*='breadcrumbs__link']"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -1787,25 +1875,36 @@ def run_api_intercept(
     page: Page,
     max_results: int,
     scroll_pause: float,
+    on_org: Any = None,
 ) -> list[Organization]:
     """Скроллить и перехватывать JSON из XHR-ответов."""
     all_orgs: list[Organization] = []
     seen_names: set[str] = set()
 
+    # Расширенный список паттернов API Яндекс Карт (актуально на 2025).
+    # Сюда попадают и старые ручки `/maps/api/...`, и новые pmaps2.
+    API_PATTERNS = (
+        "/maps/api/search",
+        "/maps/api/business",
+        "/maps/api/searchOrgs",
+        "searchBusinesses",
+        "search?",
+        "/search/v2",
+        "pmaps2",
+        "yandsearch",
+    )
+    SKIP_PATTERNS = ("csrfToken", "suggest", "geocode", "metrika", "matomo")
+
     def on_response(response: Response) -> None:
         url = response.url
-        # Ловим запросы к API поиска/бизнесов
-        api_patterns = [
-            "/maps/api/search",
-            "/maps/api/business",
-            "searchBusinesses",
-            "/search/",
-            "csrfToken",  # skip
-        ]
-        is_api = any(p in url for p in api_patterns[:4])
-        if not is_api:
+        if any(s in url for s in SKIP_PATTERNS):
+            return
+        if not any(p in url for p in API_PATTERNS):
             return
         if response.status != 200:
+            return
+        ct = (response.headers or {}).get("content-type", "")
+        if "json" not in ct.lower():
             return
 
         try:
@@ -1814,14 +1913,21 @@ def run_api_intercept(
             return
 
         orgs = _extract_orgs_from_api_response(body)
+        added = 0
         for org in orgs:
             key = _dedup_key(org)
             if key not in seen_names:
                 seen_names.add(key)
                 all_orgs.append(org)
+                added += 1
+                if on_org:
+                    try:
+                        on_org(org, len(all_orgs))
+                    except Exception as e:
+                        log.debug("on_org callback error: %s", e)
 
-        if orgs:
-            log.info("API перехвачено: +%d (всего %d)", len(orgs), len(all_orgs))
+        if added:
+            log.info("API перехвачено: +%d (всего %d)", added, len(all_orgs))
 
     page.on("response", on_response)
 
@@ -2334,7 +2440,7 @@ def _search_and_collect(
 
     if api_intercept:
         log.info("Режим API-перехвата")
-        orgs = run_api_intercept(page, max_results, scroll_pause)
+        orgs = run_api_intercept(page, max_results, scroll_pause, on_org=on_org)
     else:
         # Стриминг: скроллим + парсим на лету
         orgs = scroll_and_parse(page, max_results, scroll_pause, on_org=on_org)
@@ -2456,6 +2562,53 @@ def _make_incremental_saver(out_path: Path, save_every: int = 25):
     return on_org, all_orgs
 
 
+def _is_valid_org(org: Organization) -> bool:
+    """Минимальная валидация: организация должна иметь имя."""
+    if not org.name or not org.name.strip():
+        return False
+    # Чисто мусорные значения
+    name = org.name.strip().lower()
+    if name in ("none", "null", "undefined", "—", "-"):
+        return False
+    return True
+
+
+def _filter_valid(orgs: list[Organization]) -> list[Organization]:
+    """Отфильтровать пустые/невалидные организации."""
+    valid = [o for o in orgs if _is_valid_org(o)]
+    dropped = len(orgs) - len(valid)
+    if dropped:
+        log.info("Отфильтровано %d невалидных записей (без имени)", dropped)
+    return valid
+
+
+# Глобальный флаг для graceful shutdown
+_shutdown_requested = False
+
+
+def _install_sigint_handler() -> None:
+    """Установить обработчик SIGINT для graceful shutdown.
+
+    При первом Ctrl+C ставим флаг — основной цикл сохранит данные и завершится.
+    При втором Ctrl+C — немедленный выход.
+    """
+    def handler(signum, frame):
+        global _shutdown_requested
+        if _shutdown_requested:
+            log.warning("Повторный SIGINT — немедленный выход")
+            sys.exit(130)
+        _shutdown_requested = True
+        log.warning(
+            "Получен SIGINT — завершаюсь после текущей операции "
+            "(нажмите Ctrl+C ещё раз для немедленного выхода)"
+        )
+    try:
+        signal.signal(signal.SIGINT, handler)
+    except (ValueError, OSError):
+        # signal работает только в главном потоке
+        pass
+
+
 def _save_auto(orgs: list[Organization], out_path: Path) -> None:
     """Сохранить в формат по расширению файла (.xlsx / .csv / .json)."""
     suffix = out_path.suffix.lower()
@@ -2523,6 +2676,7 @@ def run_parser(
     """Парсер по одному поисковому запросу."""
     global _warmed_up
     _warmed_up = False  # Сброс для нового контекста браузера
+    _install_sigint_handler()
     out_path = Path(output)
 
     # Резюме: загружаем уже собранные данные
@@ -2553,12 +2707,13 @@ def run_parser(
                 log.info("Резюме: пропущено %d уже собранных", before - len(orgs))
             orgs = resume.existing_orgs() + orgs
 
-        if detail:
+        if detail and not _shutdown_requested:
             _enrich_orgs(ctx, orgs)
 
         # Persistent context сохраняет всё автоматически при закрытии
         ctx.close()
 
+    orgs = _filter_valid(orgs)
     _save_auto(orgs, out_path)
     print_stats(orgs)
     return orgs
@@ -2583,6 +2738,7 @@ def run_category_parser(
     """Парсер по категориям: для каждой категории запускает поиск «категория город»."""
     global _warmed_up
     _warmed_up = False  # Сброс для нового контекста браузера
+    _install_sigint_handler()
     out_path = Path(output)
     results: dict[str, list[Organization]] = {}
     seen_global: set[str] = set()
@@ -2612,6 +2768,10 @@ def run_category_parser(
         page = _setup_page(ctx)
 
         for q_idx, cat_query in (cat_iter_tqdm if cat_iter_tqdm else enumerate(queries, 1)):
+            if _shutdown_requested:
+                log.warning("Graceful shutdown — прерываю обход категорий")
+                break
+
             full_query = f"{cat_query} {city}"
 
             # Пропускаем уже выполненные запросы (резюме)
@@ -2626,16 +2786,16 @@ def run_category_parser(
                 scroll_pause, api_intercept, headless=headless,
             )
 
-            # Дедупликация по имени+адресу
+            # Валидация + дедупликация по имени+адресу
             unique_orgs: list[Organization] = []
-            for org in orgs:
+            for org in _filter_valid(orgs):
                 key = _dedup_key(org)
                 if key not in seen_global:
                     seen_global.add(key)
                     org.search_query = full_query
                     unique_orgs.append(org)
 
-            if detail:
+            if detail and not _shutdown_requested:
                 _enrich_orgs(ctx, unique_orgs)
 
             results[full_query] = unique_orgs
@@ -3051,6 +3211,7 @@ def interactive_menu() -> None:
             "Все категории города",
             "Показать список категорий",
             "Автодетект селекторов",
+            "Сбросить профиль браузера (при проблемах с капчей)",
         ],
     )
 
@@ -3063,6 +3224,22 @@ def interactive_menu() -> None:
         # Формируем sys.argv и перезапускаем main
         sys.argv = [sys.argv[0], "--detect-selectors", "--no-headless"]
         main()
+        return
+
+    if mode == "Сбросить профиль браузера (при проблемах с капчей)":
+        if BROWSER_DATA_DIR.exists():
+            if _input_yn(
+                f"Удалить {BROWSER_DATA_DIR}? Это сбросит все cookies/localStorage", False
+            ):
+                try:
+                    shutil.rmtree(BROWSER_DATA_DIR)
+                    print(f"Профиль удалён: {BROWSER_DATA_DIR}")
+                except Exception as exc:
+                    print(f"Ошибка: {exc}")
+            else:
+                print("Отменено.")
+        else:
+            print(f"Профиль не существует: {BROWSER_DATA_DIR}")
         return
 
     # 2. Город / запрос
