@@ -69,6 +69,10 @@ logging.basicConfig(
 )
 log = logging.getLogger("yandex_parser")
 
+# Глобальный флаг graceful shutdown — устанавливается SIGINT-обработчиком.
+# Проверяется во всех длительных циклах (скролл, парсинг, обогащение).
+_shutdown_requested = False
+
 # ---------------------------------------------------------------------------
 # Data model
 # ---------------------------------------------------------------------------
@@ -374,7 +378,19 @@ def handle_captcha(page: Page, headless: bool) -> bool:
         log.error("Таймаут ожидания решения CAPTCHA (5 мин)")
 
     log.warning("=" * 60)
-    return not detect_captcha(page)
+
+    # Если капча не решена и используется прокси — помечаем его как failed,
+    # следующий перезапуск контекста подхватит другой из ротации.
+    still_captcha = detect_captcha(page)
+    if still_captcha:
+        rotator = get_proxy_rotator()
+        current = rotator.current()
+        if current:
+            log.warning("Капча не решена — помечаю прокси как failed: %s",
+                        current.split("@")[-1] if "@" in current else current)
+            rotator.mark_failed(current)
+
+    return not still_captcha
 
 
 # ---------------------------------------------------------------------------
@@ -1468,6 +1484,11 @@ def scroll_and_parse(
         pbar = tqdm(total=max_results, desc="Сбор организаций", unit="орг")
 
     while True:
+        # Graceful shutdown — прервать скролл, сохранить что есть
+        if _shutdown_requested:
+            log.warning("Graceful shutdown — прерываю скролл (собрано %d)", len(orgs))
+            break
+
         cur_count = page.locator(item_sel).count()
 
         # Парсим новые сниппеты, которые появились после скролла
@@ -1476,6 +1497,8 @@ def scroll_and_parse(
             if i in parsed_indices:
                 continue
             if len(orgs) >= max_results:
+                break
+            if _shutdown_requested:
                 break
             try:
                 org = parse_snippet(page, i)
@@ -1584,8 +1607,18 @@ def parse_snippet(page: Page, index: int) -> Organization:
 # Detail page parsing (phone, website, etc.)
 # ---------------------------------------------------------------------------
 
-def enrich_from_detail(page: Page, org: Organization, _detail_detected: list[bool] | None = None) -> Organization:
-    """Открыть карточку организации и дополнить данные."""
+def enrich_from_detail(
+    page: Page,
+    org: Organization,
+    _detail_detected: list[bool] | None = None,
+    budget_sec: float = 25.0,
+) -> Organization:
+    """Открыть карточку организации и дополнить данные.
+
+    Args:
+        budget_sec: Общий бюджет времени на обогащение одной карточки.
+                    Если превышен — прерываем дальнейшие извлечения.
+    """
     if not org.yandex_url:
         return org
 
@@ -1594,9 +1627,17 @@ def enrich_from_detail(page: Page, org: Organization, _detail_detected: list[boo
     if url.startswith("/"):
         url = f"https://yandex.ru{url}"
 
+    deadline = time.monotonic() + budget_sec
+
+    def over_budget() -> bool:
+        return time.monotonic() > deadline
+
     try:
         page.goto(url, wait_until="domcontentloaded", timeout=15000)
         page.wait_for_timeout(2500)
+        if over_budget():
+            log.debug("enrich_from_detail: бюджет исчерпан на загрузке %s", org.name)
+            return org
 
         # При первом открытии detail-страницы — детектим селекторы
         if _detail_detected is not None and not _detail_detected[0]:
@@ -1676,6 +1717,9 @@ def enrich_from_detail(page: Page, org: Organization, _detail_detected: list[boo
             if sel:
                 org.category = _safe_text(page.locator(sel))
 
+        if over_budget():
+            return org
+
         # Координаты — из URL (ll=lon,lat) или meta-тегов
         if not org.latitude:
             coords = _extract_coords_from_url(page.url)
@@ -1700,6 +1744,9 @@ def enrich_from_detail(page: Page, org: Organization, _detail_detected: list[boo
                 }""")
                 if coords:
                     org.latitude, org.longitude = coords[0], coords[1]
+
+        if over_budget():
+            return org
 
         # Email
         if not org.email:
@@ -1939,6 +1986,11 @@ def run_api_intercept(
         pbar = tqdm(total=max_results, desc="API-перехват", unit="орг")
 
     while len(all_orgs) < max_results:
+        # Graceful shutdown
+        if _shutdown_requested:
+            log.warning("Graceful shutdown — прерываю API-перехват (собрано %d)", len(all_orgs))
+            break
+
         prev = len(all_orgs)
         _human_scroll(page, container_sel)
         _click_show_more(page)
@@ -2250,11 +2302,36 @@ def _warmup(page: Page, headless: bool) -> None:
     Стратегия: сначала заходим на yandex.ru (главная), потом переходим
     на карты — как обычный человек. Яндекс меньше подозревает юзеров
     с естественной цепочкой переходов и реферером.
+
+    Если persistent-профиль уже открыт на yandex.ru/maps — пропускаем
+    навигацию через главную (экономим 5-10 сек между категориями).
     """
     global _warmed_up
     if _warmed_up:
         return
     _warmed_up = True
+
+    # Если уже на картах (например, между категориями) — короткий прогрев
+    current_url = ""
+    try:
+        current_url = page.url or ""
+    except Exception:
+        pass
+    if "yandex.ru/maps" in current_url or "yandex.com/maps" in current_url:
+        log.info("Уже на Я.Картах — короткий прогрев (без перехода через главную)")
+        try:
+            # Пара случайных движений мыши — имитация активности
+            for _ in range(random.randint(2, 4)):
+                page.mouse.move(
+                    random.randint(100, 900),
+                    random.randint(100, 600),
+                )
+                page.wait_for_timeout(random.randint(100, 400))
+            if detect_captcha(page):
+                handle_captcha(page, headless)
+        except Exception:
+            pass
+        return
 
     log.info("Прогрев: естественная навигация yandex.ru → карты…")
     try:
@@ -2520,6 +2597,14 @@ def _enrich_orgs(ctx: BrowserContext, orgs: list[Organization], n_tabs: int = 3)
 
     # Распределяем организации по вкладкам round-robin
     for idx, org in enumerate(orgs):
+        # Graceful shutdown — останавливаем обогащение
+        if _shutdown_requested:
+            log.warning(
+                "Graceful shutdown — прерываю обогащение (%d/%d)",
+                idx, len(orgs),
+            )
+            break
+
         page = pages[idx % len(pages)]
         enrich_from_detail(page, org, _detail_detected=detail_detected)
         if pbar:
@@ -2580,10 +2665,6 @@ def _filter_valid(orgs: list[Organization]) -> list[Organization]:
     if dropped:
         log.info("Отфильтровано %d невалидных записей (без имени)", dropped)
     return valid
-
-
-# Глобальный флаг для graceful shutdown
-_shutdown_requested = False
 
 
 def _install_sigint_handler() -> None:
@@ -2767,10 +2848,37 @@ def run_category_parser(
         _, ctx = _create_browser_context(pw, headless, proxy_url=proxy_url)
         page = _setup_page(ctx)
 
+        # Точка отсчёта капч — чтобы засечь «подряд N капч без решения»
+        # и перезапустить контекст с новым прокси.
+        throttle = get_throttle()
+        captcha_baseline = throttle.captcha_count
+        rotator = get_proxy_rotator()
+
         for q_idx, cat_query in (cat_iter_tqdm if cat_iter_tqdm else enumerate(queries, 1)):
             if _shutdown_requested:
                 log.warning("Graceful shutdown — прерываю обход категорий")
                 break
+
+            # Ротация прокси: если капч стало >=2 с момента последнего сброса
+            # и есть ещё прокси — закрываем контекст и открываем с новым.
+            if (rotator.has_proxies
+                    and throttle.captcha_count - captcha_baseline >= 2):
+                new_proxy = rotator.next()
+                if new_proxy and new_proxy != proxy_url:
+                    log.warning(
+                        "Ротация прокси: %d капч подряд → пересоздаю контекст (%s)",
+                        throttle.captcha_count - captcha_baseline,
+                        new_proxy.split("@")[-1] if "@" in new_proxy else new_proxy,
+                    )
+                    try:
+                        ctx.close()
+                    except Exception:
+                        pass
+                    proxy_url = new_proxy
+                    _, ctx = _create_browser_context(pw, headless, proxy_url=proxy_url)
+                    page = _setup_page(ctx)
+                    captcha_baseline = throttle.captcha_count
+                    _warmed_up = False
 
             full_query = f"{cat_query} {city}"
 
@@ -2781,24 +2889,62 @@ def run_category_parser(
 
             log.info("━━━ [%d/%d] %s ━━━", q_idx, total_queries, full_query)
 
+            # Инкрементальный callback: сохраняет весь накопленный results
+            # каждые N организаций. Работает и для DOM-парсинга, и для API.
+            SAVE_EVERY = 25
+            save_counter = {"n": 0}
+
+            def _save_all_now() -> None:
+                try:
+                    suffix2 = out_path.suffix.lower()
+                    if suffix2 == ".csv":
+                        all_tmp = [o for v in results.values() for o in v]
+                        save_csv(all_tmp, out_path)
+                    elif suffix2 == ".json":
+                        all_tmp = [o for v in results.values() for o in v]
+                        save_json(all_tmp, out_path)
+                    else:
+                        save_xlsx_by_categories(results, out_path)
+                except Exception as exc:
+                    log.debug("Ошибка инкрементального сохранения: %s", exc)
+
+            def on_org_incremental(org: Organization, _index: int) -> None:
+                # Добавляем на лету в текущую категорию + дедуп
+                key = _dedup_key(org)
+                if key in seen_global:
+                    return
+                seen_global.add(key)
+                org.search_query = full_query
+                results.setdefault(full_query, []).append(org)
+                save_counter["n"] += 1
+                if save_counter["n"] % SAVE_EVERY == 0:
+                    _save_all_now()
+
             orgs = _search_with_retry(
                 page, full_query, max_results_per_category,
-                scroll_pause, api_intercept, headless=headless,
+                scroll_pause, api_intercept,
+                on_org=on_org_incremental,
+                headless=headless,
             )
 
-            # Валидация + дедупликация по имени+адресу
-            unique_orgs: list[Organization] = []
+            # on_org_incremental уже добавил всё в results[full_query]
+            # с дедупликацией по seen_global. Но на всякий случай —
+            # обрабатываем то, что callback мог пропустить (например,
+            # если весь сбор вернулся после фатальной ошибки).
             for org in _filter_valid(orgs):
                 key = _dedup_key(org)
                 if key not in seen_global:
                     seen_global.add(key)
                     org.search_query = full_query
-                    unique_orgs.append(org)
+                    results.setdefault(full_query, []).append(org)
+
+            # Валидируем то, что уже накопилось в results (убираем пустые)
+            results[full_query] = _filter_valid(results.get(full_query, []))
 
             if detail and not _shutdown_requested:
-                _enrich_orgs(ctx, unique_orgs)
+                _enrich_orgs(ctx, results[full_query])
 
-            results[full_query] = unique_orgs
+            unique_orgs = results[full_query]
             log.info("Категория «%s»: %d организаций (уникальных)", cat_query, len(unique_orgs))
 
             # Промежуточное сохранение после каждой категории
