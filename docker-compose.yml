@@ -1,0 +1,11 @@
+services:
+  parser:
+    build: .
+    volumes:
+      - ./results:/app/results
+      - ./.browser_profile:/app/.browser_profile
+    environment:
+      - DISPLAY=:99
+    # Примеры:
+    #   docker compose run parser "кофейни Москва" -o results/кофейни.xlsx
+    #   docker compose run parser --city Москва --category еда -o results/еда.xlsx
