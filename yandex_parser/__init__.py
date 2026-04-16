@@ -3,6 +3,13 @@
 from .models import Organization, FIELDNAMES, HEADERS_RU, print_stats
 from .config import CATEGORIES, list_categories, resolve_categories, ResumeManager
 from .export import save_csv, save_json, save_xlsx, save_auto
+from .geography import (
+    GeoEntry,
+    build_search_url,
+    list_cities,
+    list_regions,
+    resolve as resolve_place,
+)
 
 
 def __getattr__(name):
@@ -32,4 +39,9 @@ __all__ = [
     "save_xlsx",
     "save_auto",
     "print_stats",
+    "GeoEntry",
+    "build_search_url",
+    "list_cities",
+    "list_regions",
+    "resolve_place",
 ]

@@ -455,7 +455,14 @@ def setup_page(ctx: BrowserContext) -> Page:
 _warmed_up = False
 
 
-def _warmup(page: Page, headless: bool) -> None:
+def _maps_url(geo: Any = None) -> str:
+    """Построить URL Яндекс.Карт с учётом GeoEntry (если передан)."""
+    if geo is not None and hasattr(geo, "geo_id") and hasattr(geo, "slug"):
+        return f"https://yandex.ru/maps/{geo.geo_id}/{geo.slug}/"
+    return "https://yandex.ru/maps/"
+
+
+def _warmup(page: Page, headless: bool, geo: Any = None) -> None:
     """Прогрев: зайти на Яндекс как обычный пользователь перед парсингом.
 
     Стратегия: сначала заходим на yandex.ru (главная), потом переходим
@@ -464,6 +471,9 @@ def _warmup(page: Page, headless: bool) -> None:
 
     Если persistent-профиль уже открыт на yandex.ru/maps — пропускаем
     навигацию через главную (экономим 5-10 сек между категориями).
+
+    Если передан ``geo`` (GeoEntry), конечный URL будет региональным
+    (``/maps/<geo_id>/<slug>/``), и поиск будет ограничен этим регионом.
     """
     global _warmed_up
     if _warmed_up:
@@ -512,7 +522,7 @@ def _warmup(page: Page, headless: bool) -> None:
 
         # Шаг 2: переходим на карты через навигацию (реферер yandex.ru)
         page.wait_for_timeout(random.randint(1000, 2500))
-        page.goto("https://yandex.ru/maps/", wait_until="domcontentloaded", timeout=20000)
+        page.goto(_maps_url(geo), wait_until="domcontentloaded", timeout=20000)
         page.wait_for_timeout(random.randint(2000, 4000))
 
         # Проверяем капчу на картах
@@ -571,11 +581,12 @@ def _type_like_human(page: Page, selector: str, text: str) -> None:
             page.wait_for_timeout(random.randint(200, 600))
 
 
-def _do_search(page: Page, query: str, headless: bool) -> bool:
+def _do_search(page: Page, query: str, headless: bool, geo: Any = None) -> bool:
     """Выполнить поиск: ввести запрос в строку поиска как человек.
 
     Возвращает True если удалось ввести и отправить запрос.
     Fallback: если строка поиска не найдена — goto по URL.
+    Если передан ``geo``, fallback-URL ограничен регионом.
     """
     # Пробуем найти строку поиска на странице
     search_sels = [
@@ -600,8 +611,9 @@ def _do_search(page: Page, query: str, headless: bool) -> bool:
     # Fallback: goto по URL (менее естественно, но работает)
     log.debug("Строка поиска не найдена — используем goto")
     encoded_query = urllib.parse.quote(query)
+    base = _maps_url(geo).rstrip("/")
     page.goto(
-        f"https://yandex.ru/maps/?text={encoded_query}",
+        f"{base}/?text={encoded_query}",
         wait_until="domcontentloaded", timeout=30000,
     )
     return True

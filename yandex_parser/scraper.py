@@ -709,12 +709,18 @@ def _search_and_collect(
     api_intercept: bool,
     on_org: Any = None,
     headless: bool = True,
+    geo: Any = None,
 ) -> list[Organization]:
-    """Выполнить поиск и собрать результаты (общая логика для всех режимов)."""
+    """Выполнить поиск и собрать результаты (общая логика для всех режимов).
+
+    ``geo`` — опциональный GeoEntry для ограничения поиска регионом.
+    Если задан, прогрев и fallback-goto используют URL
+    ``/maps/<geo_id>/<slug>/`` вместо общего ``/maps/``.
+    """
     engine = get_selector_engine()
 
     # Прогрев при первом запросе
-    _browser._warmup(page, headless)
+    _browser._warmup(page, headless, geo=geo)
 
     log.info("Поиск: %s", query)
 
@@ -724,7 +730,7 @@ def _search_and_collect(
     page.wait_for_timeout(pre_pause)
 
     # Вводим запрос через строку поиска (как человек)
-    _browser._do_search(page, query, headless)
+    _browser._do_search(page, query, headless, geo=geo)
     page.wait_for_timeout(random.randint(2500, 4500))
 
     # Проверка CAPTCHA
@@ -788,13 +794,14 @@ def _search_with_retry(
     on_org: Any = None,
     headless: bool = True,
     max_retries: int = 3,
+    geo: Any = None,
 ) -> list[Organization]:
     """Обёртка над _search_and_collect с retry при ошибках."""
     for attempt in range(1, max_retries + 1):
         try:
             orgs = _search_and_collect(
                 page, query, max_results, scroll_pause,
-                api_intercept, on_org=on_org, headless=headless,
+                api_intercept, on_org=on_org, headless=headless, geo=geo,
             )
             if orgs:
                 return orgs
@@ -811,9 +818,12 @@ def _search_with_retry(
                 log.warning("Ошибка при поиске «%s»: %s. Retry через %d сек (попытка %d/%d)",
                             query, exc, wait_sec, attempt, max_retries)
                 page.wait_for_timeout(wait_sec * 1000)
-                # Возвращаемся на карты перед retry
+                # Возвращаемся на карты перед retry (в регион если задан geo)
                 try:
-                    page.goto("https://yandex.ru/maps/", wait_until="domcontentloaded", timeout=15000)
+                    page.goto(
+                        _browser._maps_url(geo),
+                        wait_until="domcontentloaded", timeout=15000,
+                    )
                     page.wait_for_timeout(random.randint(2000, 4000))
                 except Exception:
                     pass

@@ -19,6 +19,7 @@ except ImportError:
 from . import browser as _browser
 from .models import Organization, _dedup_key, _filter_valid, print_stats
 from .config import ResumeManager, resolve_categories
+from .geography import resolve as _geo_resolve
 from .export import (
     save_auto,
     save_csv,
@@ -45,8 +46,13 @@ def run_parser(
     api_intercept: bool = False,
     proxy_url: str | None = None,
     resume_path: Path | None = None,
+    place: str | None = None,
 ) -> list[Organization]:
-    """Парсер по одному поисковому запросу."""
+    """Парсер по одному поисковому запросу.
+
+    ``place`` — опциональный город/регион; если разрешается в geo_id
+    из справочника, поиск ограничивается URL /maps/<geo_id>/<slug>/.
+    """
     _browser._warmed_up = False
     _browser._install_sigint_handler()
     out_path = Path(output)
@@ -54,6 +60,10 @@ def run_parser(
     resume = ResumeManager(resume_path) if resume_path else None
     if resume and resume.existing_count > 0:
         log.info("Резюме: %d организаций уже собраны", resume.existing_count)
+
+    geo = _geo_resolve(place) if place else None
+    if geo is not None:
+        log.info("Регион: %s (geo_id=%d, %s)", geo.name, geo.geo_id, geo.kind)
 
     on_org, incremental_orgs = _make_incremental_saver(out_path, save_every=25)
 
@@ -63,7 +73,7 @@ def run_parser(
 
         orgs = _search_with_retry(
             page, query, max_results, scroll_pause, api_intercept,
-            on_org=on_org, headless=headless,
+            on_org=on_org, headless=headless, geo=geo,
         )
 
         for org in orgs:
@@ -113,10 +123,22 @@ def run_category_parser(
 
     queries = resolve_categories(categories)
     total_queries = len(queries)
-    log.info(
-        "Город: %s | Категорий: %d | Макс. на категорию: %d",
-        city, total_queries, max_results_per_category,
-    )
+
+    # Если город разрешается в известный geo_id — поиск будет ограничен
+    # границами региона (URL /maps/<geo_id>/<slug>/), а в текст запроса
+    # город не добавляем (Яндекс уже знает регион из URL).
+    geo = _geo_resolve(city)
+    if geo is not None:
+        log.info(
+            "Город: %s → geo_id=%d (%s, %s) | Категорий: %d | Макс.: %d",
+            city, geo.geo_id, geo.slug, geo.kind,
+            total_queries, max_results_per_category,
+        )
+    else:
+        log.info(
+            "Город: %s (без geo_id) | Категорий: %d | Макс.: %d",
+            city, total_queries, max_results_per_category,
+        )
 
     cat_iter = enumerate(queries, 1)
     if HAS_TQDM:
@@ -159,7 +181,12 @@ def run_category_parser(
                     captcha_baseline = throttle.captcha_count
                     _browser._warmed_up = False
 
-            full_query = f"{cat_query} {city}"
+            # Если регион определён, не дублируем город в тексте запроса —
+            # область уже ограничена URL. Если нет — добавляем к тексту.
+            if geo is not None:
+                full_query = cat_query
+            else:
+                full_query = f"{cat_query} {city}"
 
             if resume and resume.is_query_done(full_query):
                 log.info("Пропуск (резюме): %s", full_query)
@@ -201,6 +228,7 @@ def run_category_parser(
                 scroll_pause, api_intercept,
                 on_org=on_org_incremental,
                 headless=headless,
+                geo=geo,
             )
 
             # Fallback: если callback пропустил что-то

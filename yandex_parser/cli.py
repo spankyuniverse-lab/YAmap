@@ -31,6 +31,8 @@ def main() -> None:
         epilog="""\
 Примеры:
   python -m yandex_parser "кофейни Москва"
+  python -m yandex_parser "кофейни" --region Москва          # по geo_id=213
+  python -m yandex_parser "аптеки" --region "Московская область"  # geo_id=1
   python -m yandex_parser "автосервис Казань" -n 200 -o авто.xlsx
   python -m yandex_parser --city Москва --category еда
   python -m yandex_parser --city СПб --category авто красота -n 100
@@ -39,6 +41,7 @@ def main() -> None:
   python -m yandex_parser --city Москва --all-categories --resume Москва_categories.xlsx
   python -m yandex_parser --detect-selectors --no-headless
   python -m yandex_parser --list-categories
+  python -m yandex_parser --list-regions
 """,
     )
     parser.add_argument(
@@ -46,7 +49,15 @@ def main() -> None:
         help='Поисковый запрос, напр. "кофейни Москва"',
     )
     parser.add_argument("--list-categories", action="store_true")
+    parser.add_argument("--list-regions", action="store_true",
+                        help="Показать список поддерживаемых регионов/городов")
     parser.add_argument("--city", type=str, default=None)
+    parser.add_argument(
+        "--region", type=str, default=None,
+        help='Регион поиска для одиночного запроса, напр. "Москва", '
+             '"Московская область", "СПб". Если известен geo_id — '
+             'поиск ограничивается границами субъекта/города.',
+    )
     parser.add_argument("--category", nargs="+", default=None)
     parser.add_argument("--all-categories", action="store_true")
     parser.add_argument("--max-results", "-n", type=int, default=500)
@@ -93,6 +104,18 @@ def main() -> None:
 
     if args.list_categories:
         list_categories()
+        return
+
+    if args.list_regions:
+        from .geography import list_regions, list_cities
+        print("\nПоддерживаемые регионы (субъекты РФ):\n")
+        for e in list_regions():
+            print(f"  {e.geo_id:>6}  {e.slug:<45} {e.name}")
+        print("\nПоддерживаемые города:\n")
+        for e in list_cities():
+            print(f"  {e.geo_id:>6}  {e.slug:<45} {e.name}")
+        print("\nОстальные города ищутся по тексту запроса "
+              "(без ограничения по региону).")
         return
 
     if args.detect_selectors:
@@ -156,6 +179,7 @@ def main() -> None:
         api_intercept=args.api_intercept,
         proxy_url=proxy_url,
         resume_path=resume_path,
+        place=args.region,
     )
     print(f"\nГотово! Собрано {len(orgs)} организаций -> {output}")
 
