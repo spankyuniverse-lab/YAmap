@@ -1,18 +1,21 @@
 """Справочник географии Яндекса и построение URL (Казахстан).
 
-Яндекс.Карты используют URL вида:
-    https://yandex.kz/maps/<geo_id>/<slug>/?text=<запрос>
+Яндекс.Карты используют два вида URL регионов:
 
-где ``geo_id`` — числовой код из единого справочника Яндекса (он же ``lr``
-в поиске). Иерархия: страна → область → город.
+* «classic» — короткий числовой geo_id:
+    ``https://yandex.kz/maps/<geo_id>/<slug>/?text=<запрос>``
+* «geo» — большой внутренний id:
+    ``https://yandex.kz/maps/geo/<slug>/<big_geo_id>/?text=<запрос>``
 
-Если при поиске открыта страница ``/maps/<geo_id>/<slug>/``, Яндекс
-ограничивает выдачу границами указанного объекта.
+Для большинства городов Казахстана работает classic-форма (Алматы=162,
+Астана=163, Караганда=164, Актобе=20273, ...). Для Шымкента, Кызылорды,
+Туркестана и Талдыкоргана Яндекс использует только geo-форму.
 
-Модуль содержит только проверенные записи (встреченные в официальных
-URL Яндекс.Карт). Остальные города Казахстана (Шымкент, Караганда,
-Актобе, Павлодар, Тараз, Костанай и т.д.) при необходимости ищутся
-по тексту запроса.
+Если при поиске открыта страница региона, выдача не выходит за его
+границы — этим мы и пользуемся, чтобы ``--region Алматы`` действительно
+означал «только Алматы».
+
+Справочник покрывает 19 крупнейших городов Казахстана + саму страну.
 """
 
 from __future__ import annotations
@@ -24,45 +27,165 @@ from typing import Optional
 
 @dataclass(frozen=True)
 class GeoEntry:
-    """Запись справочника географии."""
+    """Запись справочника географии.
+
+    ``url_style``:
+        ``"classic"`` — ``/maps/<geo_id>/<slug>/``
+        ``"geo"`` — ``/maps/geo/<slug>/<geo_id>/``
+    """
 
     geo_id: int
     slug: str
     name: str
     kind: str  # "country" | "region" | "city"
+    url_style: str = "classic"  # "classic" | "geo"
 
 
 # ---------------------------------------------------------------------------
-# Справочник (только проверенные записи с yandex.com/maps, домен .kz)
+# Справочник: страна + 19 крупнейших городов Казахстана
 # ---------------------------------------------------------------------------
 
 KAZAKHSTAN = GeoEntry(159, "kazakhstan", "Қазақстан / Казахстан", "country")
+
+# --- classic URL: /maps/<geo_id>/<slug>/ ---
 ALMATY = GeoEntry(162, "almaty", "Алматы", "city")
 ASTANA = GeoEntry(163, "astana", "Астана", "city")
+KARAGANDA = GeoEntry(164, "karaganda", "Караганда", "city")
+SEMEY = GeoEntry(165, "semey", "Семей", "city")
+PAVLODAR = GeoEntry(190, "pavlodar", "Павлодар", "city")
+ATYRAU = GeoEntry(10291, "atyrau", "Атырау", "city")
+KOSTANAY = GeoEntry(10295, "kostanai", "Костанай", "city")
+PETROPAVLOVSK = GeoEntry(10298, "petropavlovsk", "Петропавловск", "city")
+URALSK = GeoEntry(10305, "uralsk", "Уральск", "city")
+OSKEMEN = GeoEntry(10306, "ust-kamenogorsk", "Усть-Каменогорск", "city")
+AKTOBE = GeoEntry(20273, "aktobe", "Актобе", "city")
+KOKSHETAU = GeoEntry(20809, "kokshetau", "Кокшетау", "city")
+TARAZ = GeoEntry(21094, "taraz", "Тараз", "city")
+AKTAU = GeoEntry(29575, "aktau", "Актау", "city")
+TEMIRTAU = GeoEntry(35393, "temirtau", "Темиртау", "city")
+
+# --- geo URL: /maps/geo/<slug>/<big_id>/ ---
+SHYMKENT = GeoEntry(1842519191, "shymkent", "Шымкент", "city", url_style="geo")
+KYZYLORDA = GeoEntry(53168216, "qyzylorda", "Кызылорда", "city", url_style="geo")
+TURKISTAN = GeoEntry(53168220, "turkistan", "Туркестан", "city", url_style="geo")
+TALDYKORGAN = GeoEntry(
+    53168289, "taldyqorghan", "Талдыкорган", "city", url_style="geo"
+)
 
 
 # Ключи нормализуются (lower/strip/ё→е), поэтому регистр и пробелы не важны.
 GEO_ENTRIES: dict[str, GeoEntry] = {
-    # Казахстан (страна)
+    # --- Страна ---
     "казахстан": KAZAKHSTAN,
     "қазақстан": KAZAKHSTAN,
     "kazakhstan": KAZAKHSTAN,
     "qazaqstan": KAZAKHSTAN,
     "кз": KAZAKHSTAN,
     "kz": KAZAKHSTAN,
-    # Алматы (город)
+    # --- Алматы ---
     "алматы": ALMATY,
     "алма-ата": ALMATY,
     "алма ата": ALMATY,
     "almaty": ALMATY,
     "alma-ata": ALMATY,
-    # Астана (город, бывш. Нур-Султан/Целиноград)
+    # --- Астана (бывш. Нур-Султан / Целиноград / Акмола) ---
     "астана": ASTANA,
     "astana": ASTANA,
     "нур-султан": ASTANA,
     "нур султан": ASTANA,
     "nur-sultan": ASTANA,
     "nur sultan": ASTANA,
+    # --- Шымкент ---
+    "шымкент": SHYMKENT,
+    "чимкент": SHYMKENT,
+    "shymkent": SHYMKENT,
+    "chimkent": SHYMKENT,
+    # --- Караганда ---
+    "караганда": KARAGANDA,
+    "қарағанды": KARAGANDA,
+    "karaganda": KARAGANDA,
+    "qaraghandy": KARAGANDA,
+    # --- Актобе ---
+    "актобе": AKTOBE,
+    "ақтөбе": AKTOBE,
+    "актюбинск": AKTOBE,
+    "aktobe": AKTOBE,
+    "aqtobe": AKTOBE,
+    # --- Тараз ---
+    "тараз": TARAZ,
+    "джамбул": TARAZ,
+    "жамбыл": TARAZ,
+    "taraz": TARAZ,
+    "jambyl": TARAZ,
+    # --- Павлодар ---
+    "павлодар": PAVLODAR,
+    "pavlodar": PAVLODAR,
+    # --- Усть-Каменогорск (Өскемен) ---
+    "усть-каменогорск": OSKEMEN,
+    "усть каменогорск": OSKEMEN,
+    "өскемен": OSKEMEN,
+    "оскемен": OSKEMEN,
+    "ust-kamenogorsk": OSKEMEN,
+    "ust kamenogorsk": OSKEMEN,
+    "oskemen": OSKEMEN,
+    # --- Семей (Семипалатинск) ---
+    "семей": SEMEY,
+    "семипалатинск": SEMEY,
+    "semey": SEMEY,
+    "semipalatinsk": SEMEY,
+    # --- Атырау (Гурьев) ---
+    "атырау": ATYRAU,
+    "гурьев": ATYRAU,
+    "atyrau": ATYRAU,
+    # --- Кызылорда ---
+    "кызылорда": KYZYLORDA,
+    "қызылорда": KYZYLORDA,
+    "кзыл-орда": KYZYLORDA,
+    "kyzylorda": KYZYLORDA,
+    "qyzylorda": KYZYLORDA,
+    # --- Костанай (Кустанай) ---
+    "костанай": KOSTANAY,
+    "қостанай": KOSTANAY,
+    "кустанай": KOSTANAY,
+    "kostanai": KOSTANAY,
+    "kostanay": KOSTANAY,
+    "qostanai": KOSTANAY,
+    # --- Уральск (Орал) ---
+    "уральск": URALSK,
+    "орал": URALSK,
+    "uralsk": URALSK,
+    "oral": URALSK,
+    # --- Петропавловск ---
+    "петропавловск": PETROPAVLOVSK,
+    "петропавл": PETROPAVLOVSK,
+    "petropavlovsk": PETROPAVLOVSK,
+    "petropavl": PETROPAVLOVSK,
+    # --- Актау (Шевченко) ---
+    "актау": AKTAU,
+    "ақтау": AKTAU,
+    "шевченко": AKTAU,
+    "aktau": AKTAU,
+    "aqtau": AKTAU,
+    # --- Темиртау ---
+    "темиртау": TEMIRTAU,
+    "теміртау": TEMIRTAU,
+    "temirtau": TEMIRTAU,
+    # --- Талдыкорган ---
+    "талдыкорган": TALDYKORGAN,
+    "талдықорған": TALDYKORGAN,
+    "taldykorgan": TALDYKORGAN,
+    "taldyqorghan": TALDYKORGAN,
+    # --- Туркестан ---
+    "туркестан": TURKISTAN,
+    "түркістан": TURKISTAN,
+    "turkistan": TURKISTAN,
+    "turkestan": TURKISTAN,
+    # --- Кокшетау (Кокчетав) ---
+    "кокшетау": KOKSHETAU,
+    "көкшетау": KOKSHETAU,
+    "кокчетав": KOKSHETAU,
+    "kokshetau": KOKSHETAU,
+    "kokchetav": KOKSHETAU,
 }
 
 
@@ -105,6 +228,13 @@ def list_cities() -> list[GeoEntry]:
     return out
 
 
+def _region_path(entry: GeoEntry) -> str:
+    """Путь регионального сегмента URL (с ведущим слэшем, без query-string)."""
+    if entry.url_style == "geo":
+        return f"/maps/geo/{entry.slug}/{entry.geo_id}/"
+    return f"/maps/{entry.geo_id}/{entry.slug}/"
+
+
 def build_search_url(
     query: str,
     place: str | GeoEntry | None = None,
@@ -134,15 +264,16 @@ def build_search_url(
     -------
     str
         Полный URL вида
-        ``https://yandex.kz/maps/<geo_id>/<slug>/?text=...`` либо
-        ``https://yandex.kz/maps/?text=...`` если регион не разрешён.
+        ``https://yandex.kz/maps/<geo_id>/<slug>/?text=...`` (classic),
+        ``https://yandex.kz/maps/geo/<slug>/<geo_id>/?text=...`` (geo)
+        либо ``https://yandex.kz/maps/?text=...`` если регион не разрешён.
 
     Examples
     --------
     >>> build_search_url("кафе", "Алматы")
     'https://yandex.kz/maps/162/almaty/?text=%D0%BA%D0%B0%D1%84%D0%B5'
-    >>> build_search_url("аптека", "Астана")
-    'https://yandex.kz/maps/163/astana/?text=%D0%B0%D0%BF%D1%82%D0%B5%D0%BA%D0%B0'
+    >>> build_search_url("аптека", "Шымкент")
+    'https://yandex.kz/maps/geo/shymkent/1842519191/?text=%D0%B0%D0%BF%D1%82%D0%B5%D0%BA%D0%B0'
     """
     entry: Optional[GeoEntry]
     text = query
@@ -170,7 +301,7 @@ def build_search_url(
 
     qs = urllib.parse.urlencode(params)
     if entry is not None:
-        return f"https://yandex.kz/maps/{entry.geo_id}/{entry.slug}/?{qs}"
+        return f"https://yandex.kz{_region_path(entry)}?{qs}"
     return f"https://yandex.kz/maps/?{qs}"
 
 
@@ -178,8 +309,28 @@ __all__ = [
     "GeoEntry",
     "GEO_ENTRIES",
     "KAZAKHSTAN",
+    # classic-style cities
     "ALMATY",
     "ASTANA",
+    "KARAGANDA",
+    "SEMEY",
+    "PAVLODAR",
+    "ATYRAU",
+    "KOSTANAY",
+    "PETROPAVLOVSK",
+    "URALSK",
+    "OSKEMEN",
+    "AKTOBE",
+    "KOKSHETAU",
+    "TARAZ",
+    "AKTAU",
+    "TEMIRTAU",
+    # geo-style cities
+    "SHYMKENT",
+    "KYZYLORDA",
+    "TURKISTAN",
+    "TALDYKORGAN",
+    # API
     "resolve",
     "list_regions",
     "list_cities",
