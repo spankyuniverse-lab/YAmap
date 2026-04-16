@@ -30,15 +30,15 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""\
 Примеры:
-  python -m yandex_parser "кофейни Москва"
-  python -m yandex_parser "кофейни" --region Москва          # по geo_id=213
-  python -m yandex_parser "аптеки" --region "Московская область"  # geo_id=1
-  python -m yandex_parser "автосервис Казань" -n 200 -o авто.xlsx
-  python -m yandex_parser --city Москва --category еда
-  python -m yandex_parser --city СПб --category авто красота -n 100
-  python -m yandex_parser --city Казань --all-categories
-  python -m yandex_parser --city Москва --category еда --proxy-file proxies.txt
-  python -m yandex_parser --city Москва --all-categories --resume Москва_categories.xlsx
+  python -m yandex_parser "кофейни Алматы"
+  python -m yandex_parser "кофейни" --region Алматы          # geo_id=162
+  python -m yandex_parser "аптеки" --region Астана           # geo_id=163
+  python -m yandex_parser "автосервис Шымкент" -n 200 -o авто.xlsx
+  python -m yandex_parser --city Алматы --category еда
+  python -m yandex_parser --city Астана --category авто красота -n 100
+  python -m yandex_parser --city Шымкент --all-categories
+  python -m yandex_parser --city Алматы --category еда --proxy-file proxies.txt
+  python -m yandex_parser --city Алматы --all-categories --resume Алматы_categories.xlsx
   python -m yandex_parser --detect-selectors --no-headless
   python -m yandex_parser --list-categories
   python -m yandex_parser --list-regions
@@ -46,7 +46,7 @@ def main() -> None:
     )
     parser.add_argument(
         "query", nargs="?", default=None,
-        help='Поисковый запрос, напр. "кофейни Москва"',
+        help='Поисковый запрос, напр. "кофейни Алматы"',
     )
     parser.add_argument("--list-categories", action="store_true")
     parser.add_argument("--list-regions", action="store_true",
@@ -54,9 +54,9 @@ def main() -> None:
     parser.add_argument("--city", type=str, default=None)
     parser.add_argument(
         "--region", type=str, default=None,
-        help='Регион поиска для одиночного запроса, напр. "Москва", '
-             '"Московская область", "СПб". Если известен geo_id — '
-             'поиск ограничивается границами субъекта/города.',
+        help='Регион поиска для одиночного запроса, напр. "Алматы", '
+             '"Астана", "Казахстан". Если известен geo_id — '
+             'поиск ограничивается границами города/страны.',
     )
     parser.add_argument("--category", nargs="+", default=None)
     parser.add_argument("--all-categories", action="store_true")
@@ -108,14 +108,16 @@ def main() -> None:
 
     if args.list_regions:
         from .geography import list_regions, list_cities
-        print("\nПоддерживаемые регионы (субъекты РФ):\n")
-        for e in list_regions():
-            print(f"  {e.geo_id:>6}  {e.slug:<45} {e.name}")
-        print("\nПоддерживаемые города:\n")
+        regions = list_regions()
+        if regions:
+            print("\nПоддерживаемые области Казахстана:\n")
+            for e in regions:
+                print(f"  {e.geo_id:>6}  {e.slug:<45} {e.name}")
+        print("\nПоддерживаемые города Казахстана:\n")
         for e in list_cities():
             print(f"  {e.geo_id:>6}  {e.slug:<45} {e.name}")
-        print("\nОстальные города ищутся по тексту запроса "
-              "(без ограничения по региону).")
+        print("\nОстальные города Казахстана (Шымкент, Караганда и др.) "
+              "ищутся по тексту запроса без ограничения по региону.")
         return
 
     if args.detect_selectors:
@@ -186,7 +188,7 @@ def main() -> None:
 
 def _run_detect_selectors(args) -> None:
     """Принудительная детекция селекторов."""
-    test_query = args.query or "кофейни Москва"
+    test_query = args.query or "кофейни Алматы"
     print(f"\nЗапуск автодетекта (запрос: «{test_query}»)…\n")
 
     if SELECTORS_CACHE_FILE.exists():
@@ -198,7 +200,7 @@ def _run_detect_selectors(args) -> None:
 
         encoded = urllib.parse.quote(test_query)
         page.goto(
-            f"https://yandex.ru/maps/?text={encoded}",
+            f"https://yandex.kz/maps/?text={encoded}",
             wait_until="domcontentloaded", timeout=30000,
         )
         page.wait_for_timeout(4000)
@@ -229,7 +231,7 @@ def _run_detect_selectors(args) -> None:
                 href = link.get_attribute("href") or ""
             if href:
                 if href.startswith("/"):
-                    href = f"https://yandex.ru{href}"
+                    href = f"https://yandex.kz{href}"
                 print(f"\n--- Детекция карточки ({href[:60]}…) ---")
                 page.goto(href, wait_until="domcontentloaded", timeout=15000)
                 page.wait_for_timeout(3000)
@@ -333,7 +335,7 @@ def interactive_menu() -> None:
     categories_input: list[str] = []
 
     if mode == "Поиск по запросу":
-        query = input("\nПоисковый запрос (напр. кофейни Москва): ").strip()
+        query = input("\nПоисковый запрос (напр. кофейни Алматы): ").strip()
         if not query:
             print("Запрос не может быть пустым!")
             return

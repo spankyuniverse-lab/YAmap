@@ -1,23 +1,18 @@
-"""Справочник географии Яндекса и построение URL.
+"""Справочник географии Яндекса и построение URL (Казахстан).
 
 Яндекс.Карты используют URL вида:
-    https://yandex.ru/maps/<geo_id>/<slug>/?text=<запрос>
+    https://yandex.kz/maps/<geo_id>/<slug>/?text=<запрос>
 
 где ``geo_id`` — числовой код из единого справочника Яндекса (он же ``lr``
-в поиске). Иерархия: страна → федеральный округ → субъект РФ
-(область/край/республика) → город → район.
+в поиске). Иерархия: страна → область → город.
 
-Важное различие:
-  * ``1`` / ``moscow-and-moscow-oblast`` — Москва + МО (субъект)
-  * ``213`` / ``moscow`` — только город Москва
-  * ``10174`` / ``saint-petersburg-and-leningrad-oblast`` — СПб + ЛО
-  * ``2`` / ``saint-petersburg`` — только СПб
-
-При поиске с ``<geo_id>/<slug>/`` Яндекс ограничивает выдачу границами
-указанного объекта (город не «залезает» в область и наоборот).
+Если при поиске открыта страница ``/maps/<geo_id>/<slug>/``, Яндекс
+ограничивает выдачу границами указанного объекта.
 
 Модуль содержит только проверенные записи (встреченные в официальных
-URL Яндекс.Карт). Остальные города поиск найдёт по текстовому запросу.
+URL Яндекс.Карт). Остальные города Казахстана (Шымкент, Караганда,
+Актобе, Павлодар, Тараз, Костанай и т.д.) при необходимости ищутся
+по тексту запроса.
 """
 
 from __future__ import annotations
@@ -38,50 +33,36 @@ class GeoEntry:
 
 
 # ---------------------------------------------------------------------------
-# Справочник (только проверенные записи с yandex.com/maps)
+# Справочник (только проверенные записи с yandex.com/maps, домен .kz)
 # ---------------------------------------------------------------------------
 
-# Страны
-RUSSIA = GeoEntry(225, "russia", "Россия", "country")
-
-# Субъекты РФ (область + её центр)
-MOSCOW_OBLAST = GeoEntry(1, "moscow-and-moscow-oblast",
-                         "Москва и Московская область", "region")
-SPB_OBLAST = GeoEntry(10174, "saint-petersburg-and-leningrad-oblast",
-                      "Санкт-Петербург и Ленинградская область", "region")
-
-# Города
-MOSCOW = GeoEntry(213, "moscow", "Москва", "city")
-SPB = GeoEntry(2, "saint-petersburg", "Санкт-Петербург", "city")
+KAZAKHSTAN = GeoEntry(159, "kazakhstan", "Қазақстан / Казахстан", "country")
+ALMATY = GeoEntry(162, "almaty", "Алматы", "city")
+ASTANA = GeoEntry(163, "astana", "Астана", "city")
 
 
-# Ключи — приводятся к lower()/замене ё→е, поэтому «Москва», «МОСКВА», «москва» — одно и то же.
+# Ключи нормализуются (lower/strip/ё→е), поэтому регистр и пробелы не важны.
 GEO_ENTRIES: dict[str, GeoEntry] = {
-    # Россия
-    "россия": RUSSIA,
-    "russia": RUSSIA,
-    "рф": RUSSIA,
-    # Москва (город)
-    "москва": MOSCOW,
-    "moscow": MOSCOW,
-    "мск": MOSCOW,
-    # Москва + область (субъект)
-    "москва и область": MOSCOW_OBLAST,
-    "москва и московская область": MOSCOW_OBLAST,
-    "московская область": MOSCOW_OBLAST,
-    "подмосковье": MOSCOW_OBLAST,
-    # Санкт-Петербург (город)
-    "санкт-петербург": SPB,
-    "санкт петербург": SPB,
-    "saint-petersburg": SPB,
-    "saint petersburg": SPB,
-    "спб": SPB,
-    "питер": SPB,
-    # СПб + область (субъект)
-    "санкт-петербург и область": SPB_OBLAST,
-    "санкт-петербург и ленинградская область": SPB_OBLAST,
-    "ленинградская область": SPB_OBLAST,
-    "ло": SPB_OBLAST,
+    # Казахстан (страна)
+    "казахстан": KAZAKHSTAN,
+    "қазақстан": KAZAKHSTAN,
+    "kazakhstan": KAZAKHSTAN,
+    "qazaqstan": KAZAKHSTAN,
+    "кз": KAZAKHSTAN,
+    "kz": KAZAKHSTAN,
+    # Алматы (город)
+    "алматы": ALMATY,
+    "алма-ата": ALMATY,
+    "алма ата": ALMATY,
+    "almaty": ALMATY,
+    "alma-ata": ALMATY,
+    # Астана (город, бывш. Нур-Султан/Целиноград)
+    "астана": ASTANA,
+    "astana": ASTANA,
+    "нур-султан": ASTANA,
+    "нур султан": ASTANA,
+    "nur-sultan": ASTANA,
+    "nur sultan": ASTANA,
 }
 
 
@@ -103,7 +84,7 @@ def resolve(name: str) -> Optional[GeoEntry]:
 
 
 def list_regions() -> list[GeoEntry]:
-    """Уникальные записи-регионы (субъекты РФ)."""
+    """Уникальные записи-области. Пока пусто (в справочнике только города+страна)."""
     seen: set[int] = set()
     out: list[GeoEntry] = []
     for e in GEO_ENTRIES.values():
@@ -132,7 +113,7 @@ def build_search_url(
     z: int | None = None,
     spn: tuple[float, float] | None = None,
 ) -> str:
-    """Собрать URL поиска Яндекс.Карт.
+    """Собрать URL поиска Яндекс.Карт (домен .kz).
 
     Parameters
     ----------
@@ -153,15 +134,15 @@ def build_search_url(
     -------
     str
         Полный URL вида
-        ``https://yandex.ru/maps/<geo_id>/<slug>/?text=...`` либо
-        ``https://yandex.ru/maps/?text=...`` если регион не разрешён.
+        ``https://yandex.kz/maps/<geo_id>/<slug>/?text=...`` либо
+        ``https://yandex.kz/maps/?text=...`` если регион не разрешён.
 
     Examples
     --------
-    >>> build_search_url("кафе", "Москва")
-    'https://yandex.ru/maps/213/moscow/?text=%D0%BA%D0%B0%D1%84%D0%B5'
-    >>> build_search_url("аптека", "Московская область")
-    'https://yandex.ru/maps/1/moscow-and-moscow-oblast/?text=%D0%B0%D0%BF%D1%82%D0%B5%D0%BA%D0%B0'
+    >>> build_search_url("кафе", "Алматы")
+    'https://yandex.kz/maps/162/almaty/?text=%D0%BA%D0%B0%D1%84%D0%B5'
+    >>> build_search_url("аптека", "Астана")
+    'https://yandex.kz/maps/163/astana/?text=%D0%B0%D0%BF%D1%82%D0%B5%D0%BA%D0%B0'
     """
     entry: Optional[GeoEntry]
     text = query
@@ -189,18 +170,16 @@ def build_search_url(
 
     qs = urllib.parse.urlencode(params)
     if entry is not None:
-        return f"https://yandex.ru/maps/{entry.geo_id}/{entry.slug}/?{qs}"
-    return f"https://yandex.ru/maps/?{qs}"
+        return f"https://yandex.kz/maps/{entry.geo_id}/{entry.slug}/?{qs}"
+    return f"https://yandex.kz/maps/?{qs}"
 
 
 __all__ = [
     "GeoEntry",
     "GEO_ENTRIES",
-    "RUSSIA",
-    "MOSCOW",
-    "MOSCOW_OBLAST",
-    "SPB",
-    "SPB_OBLAST",
+    "KAZAKHSTAN",
+    "ALMATY",
+    "ASTANA",
     "resolve",
     "list_regions",
     "list_cities",

@@ -307,7 +307,7 @@ def enrich_from_detail(
     engine = get_selector_engine()
     url = org.yandex_url
     if url.startswith("/"):
-        url = f"https://yandex.ru{url}"
+        url = f"https://yandex.kz{url}"
 
     deadline = time.monotonic() + budget_sec
 

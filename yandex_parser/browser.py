@@ -456,20 +456,20 @@ _warmed_up = False
 
 
 def _maps_url(geo: Any = None) -> str:
-    """Построить URL Яндекс.Карт с учётом GeoEntry (если передан)."""
+    """Построить URL Яндекс.Карт (домен .kz) с учётом GeoEntry (если передан)."""
     if geo is not None and hasattr(geo, "geo_id") and hasattr(geo, "slug"):
-        return f"https://yandex.ru/maps/{geo.geo_id}/{geo.slug}/"
-    return "https://yandex.ru/maps/"
+        return f"https://yandex.kz/maps/{geo.geo_id}/{geo.slug}/"
+    return "https://yandex.kz/maps/"
 
 
 def _warmup(page: Page, headless: bool, geo: Any = None) -> None:
     """Прогрев: зайти на Яндекс как обычный пользователь перед парсингом.
 
-    Стратегия: сначала заходим на yandex.ru (главная), потом переходим
+    Стратегия: сначала заходим на yandex.kz (главная), потом переходим
     на карты — как обычный человек. Яндекс меньше подозревает юзеров
     с естественной цепочкой переходов и реферером.
 
-    Если persistent-профиль уже открыт на yandex.ru/maps — пропускаем
+    Если persistent-профиль уже открыт на yandex.kz/maps — пропускаем
     навигацию через главную (экономим 5-10 сек между категориями).
 
     Если передан ``geo`` (GeoEntry), конечный URL будет региональным
@@ -486,7 +486,11 @@ def _warmup(page: Page, headless: bool, geo: Any = None) -> None:
         current_url = page.url or ""
     except Exception:
         pass
-    if "yandex.ru/maps" in current_url or "yandex.com/maps" in current_url:
+    if (
+        "yandex.kz/maps" in current_url
+        or "yandex.ru/maps" in current_url
+        or "yandex.com/maps" in current_url
+    ):
         log.info("Уже на Я.Картах — короткий прогрев (без перехода через главную)")
         try:
             # Пара случайных движений мыши — имитация активности
@@ -502,10 +506,10 @@ def _warmup(page: Page, headless: bool, geo: Any = None) -> None:
             pass
         return
 
-    log.info("Прогрев: естественная навигация yandex.ru → карты…")
+    log.info("Прогрев: естественная навигация yandex.kz → карты…")
     try:
         # Шаг 1: заходим на главную Яндекса (как обычный пользователь)
-        page.goto("https://yandex.ru/", wait_until="domcontentloaded", timeout=20000)
+        page.goto("https://yandex.kz/", wait_until="domcontentloaded", timeout=20000)
         page.wait_for_timeout(random.randint(2000, 4000))
 
         # Проверяем капчу на главной
@@ -520,7 +524,7 @@ def _warmup(page: Page, headless: bool, geo: Any = None) -> None:
             )
             page.wait_for_timeout(random.randint(100, 400))
 
-        # Шаг 2: переходим на карты через навигацию (реферер yandex.ru)
+        # Шаг 2: переходим на карты через навигацию (реферер yandex.kz)
         page.wait_for_timeout(random.randint(1000, 2500))
         page.goto(_maps_url(geo), wait_until="domcontentloaded", timeout=20000)
         page.wait_for_timeout(random.randint(2000, 4000))

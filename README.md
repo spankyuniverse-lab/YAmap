@@ -1,6 +1,8 @@
-# YAmap — Парсер Яндекс.Карт
+# YAmap — Парсер Яндекс.Карт (Казахстан)
 
-Парсер организаций с Яндекс.Карт с поддержкой динамической подгрузки (infinite scroll) и парсинга по категориям (аналог 2ГИС).
+Парсер организаций с Яндекс.Карт (домен `yandex.kz`) с поддержкой
+динамической подгрузки (infinite scroll), парсинга по категориям
+(аналог 2ГИС) и привязки поиска к geo_id городов Казахстана.
 
 ## Установка
 
@@ -18,10 +20,13 @@ playwright install chromium
 python -m yandex_parser
 
 # По запросу
-python -m yandex_parser "кофейни Москва"
+python -m yandex_parser "кофейни Алматы"
+
+# С явным geo_id (поиск ограничен границами города)
+python -m yandex_parser "кофейни" --region Алматы
 
 # По категориям
-python -m yandex_parser --city Москва --category еда
+python -m yandex_parser --city Алматы --category еда
 ```
 
 ## Использование
@@ -29,10 +34,15 @@ python -m yandex_parser --city Москва --category еда
 ### По поисковому запросу
 
 ```bash
-python -m yandex_parser "кофейни Москва"
-python -m yandex_parser "автосервис Казань" -n 200 -o авто.csv
-python -m yandex_parser "аптеки Москва" --api-intercept
-python -m yandex_parser "рестораны СПб" --detail
+python -m yandex_parser "кофейни Алматы"
+python -m yandex_parser "автосервис Шымкент" -n 200 -o авто.csv
+python -m yandex_parser "аптеки Астана" --api-intercept
+python -m yandex_parser "рестораны Караганда" --detail
+
+# Привязка к geo_id (выдача не выходит за границы региона)
+python -m yandex_parser "кофейни" --region Алматы   # geo_id=162
+python -m yandex_parser "аптеки" --region Астана    # geo_id=163
+python -m yandex_parser --list-regions              # показать справочник
 ```
 
 ### По категориям (аналог 2ГИС)
@@ -42,16 +52,16 @@ python -m yandex_parser "рестораны СПб" --detail
 python -m yandex_parser --list-categories
 
 # Группа «еда» (рестораны, кафе, бары, пиццерии, ...)
-python -m yandex_parser --city Москва --category еда
+python -m yandex_parser --city Алматы --category еда
 
 # Конкретные категории
-python -m yandex_parser --city Москва --category рестораны кафе бары
+python -m yandex_parser --city Алматы --category рестораны кафе бары
 
 # Несколько групп
-python -m yandex_parser --city СПб --category авто красота
+python -m yandex_parser --city Астана --category авто красота
 
 # Все категории каталога
-python -m yandex_parser --city Казань --all-categories -n 100
+python -m yandex_parser --city Шымкент --all-categories -n 100
 ```
 
 Результат по категориям в Excel: лист «Все результаты» + отдельный лист на каждую категорию.
@@ -60,24 +70,24 @@ python -m yandex_parser --city Казань --all-categories -n 100
 
 ```bash
 # Один прокси
-python -m yandex_parser "аптеки Москва" --proxy http://user:pass@host:port
+python -m yandex_parser "аптеки Алматы" --proxy http://user:pass@host:port
 
 # Файл с прокси (ротация round-robin, авто-переключение при капче)
-python -m yandex_parser --city Москва --category еда --proxy-file proxies.txt
+python -m yandex_parser --city Алматы --category еда --proxy-file proxies.txt
 ```
 
 ### Продолжение прерванного сбора
 
 ```bash
-python -m yandex_parser --city Москва --all-categories --resume Москва_categories.xlsx
+python -m yandex_parser --city Алматы --all-categories --resume Алматы_categories.xlsx
 ```
 
 ### Docker
 
 ```bash
 docker compose build
-docker compose run parser "кофейни Москва" -o results/кофейни.xlsx
-docker compose run parser --city Москва --category еда -o results/еда.xlsx
+docker compose run parser "кофейни Алматы" -o results/кофейни.xlsx
+docker compose run parser --city Алматы --category еда -o results/еда.xlsx
 ```
 
 ## Параметры
