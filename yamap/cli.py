@@ -13,6 +13,7 @@ from ._playwright import sync_playwright
 from .browser import create_browser_context, setup_page
 from .categories import CATEGORIES, list_categories
 from .config import load_config
+from .logging_utils import setup_logging
 from .proxy import ProxyRotator, set_proxy_rotator
 from .runner import run_category_parser, run_parser
 from .selectors import (
@@ -28,11 +29,9 @@ from .selectors import (
 )
 
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(levelname)-8s  %(message)s",
-    datefmt="%H:%M:%S",
-)
+# Базовая консольная настройка применяется сразу для импортных сообщений;
+# `setup_logging()` потом перенастраивает с учётом --log-file.
+setup_logging()
 log = logging.getLogger("yandex_parser")
 
 
@@ -105,8 +104,13 @@ def main() -> None:
                         help="Показать текущие активные селекторы (из кеша или hardcoded)")
     parser.add_argument("--reset-selectors", action="store_true",
                         help="Удалить кеш селекторов и вернуться к hardcoded")
+    parser.add_argument("--log-file", type=str, default=None,
+                        help="Путь к лог-файлу. Полный DEBUG-лог с ротацией 5MB × 3 копии.")
 
     args = parser.parse_args()
+
+    if args.log_file:
+        setup_logging(log_file=args.log_file)
 
     if args.show_selectors:
         engine = get_selector_engine()

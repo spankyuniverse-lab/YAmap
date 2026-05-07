@@ -19,6 +19,7 @@ from .selectors import (
     get_selector_engine,
 )
 from .throttle import get_throttle
+from .validators import normalize_org
 
 
 log = logging.getLogger("yandex_parser")
@@ -147,6 +148,7 @@ def parse_snippet(page: Page, index: int) -> Organization:
         if link.count() > 0:
             org.yandex_url = link.get_attribute("href") or ""
 
+    normalize_org(org)
     return org
 
 
@@ -385,6 +387,7 @@ def enrich_from_detail(
     except Exception as exc:
         log.warning("Не удалось открыть карточку %s: %s", org.name, exc)
 
+    normalize_org(org)
     return org
 
 
@@ -489,6 +492,7 @@ def _extract_orgs_from_api_response(data: dict) -> list[Organization]:
         org.yandex_url = props.get("uri", props.get("url", ""))
 
         if org.name:
+            normalize_org(org)
             orgs.append(org)
 
     return orgs
