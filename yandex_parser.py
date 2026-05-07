@@ -92,6 +92,24 @@ class Organization:
 FIELDNAMES = [f.name for f in fields(Organization)]
 
 
+HEADERS_RU = {
+    "name": "Название",
+    "address": "Адрес",
+    "phone": "Телефон",
+    "website": "Сайт",
+    "rating": "Рейтинг",
+    "reviews_count": "Отзывы",
+    "category": "Категория",
+    "working_hours": "Часы работы",
+    "latitude": "Широта",
+    "longitude": "Долгота",
+    "email": "Email",
+    "social_links": "Соцсети",
+    "search_query": "Поисковый запрос",
+    "yandex_url": "Ссылка",
+}
+
+
 def _normalize_for_dedup(text: str) -> str:
     """Нормализовать строку для дедупликации.
 
@@ -732,7 +750,8 @@ class SelectorCache:
             try:
                 self._data = json.loads(self._path.read_text(encoding="utf-8"))
                 log.info("Загружен кеш селекторов: %s (%d записей)", self._path, len(self._data))
-            except Exception:
+            except (json.JSONDecodeError, OSError) as exc:
+                log.warning("Кеш селекторов повреждён (%s) — запускаю автодетект", exc)
                 self._data = {}
 
     def save(self) -> None:
@@ -1810,7 +1829,8 @@ def run_api_intercept(
 
         try:
             body = response.json()
-        except Exception:
+        except (json.JSONDecodeError, ValueError) as exc:
+            log.debug("API-ответ не JSON (%s): %s", exc, url[:80])
             return
 
         orgs = _extract_orgs_from_api_response(body)
@@ -1887,38 +1907,20 @@ def save_json(orgs: list[Organization], path: Path) -> None:
     log.info("JSON сохранён: %s (%d записей)", path, len(orgs))
 
 
-HEADERS_RU = {
-    "name": "Название",
-    "address": "Адрес",
-    "phone": "Телефон",
-    "website": "Сайт",
-    "rating": "Рейтинг",
-    "reviews_count": "Отзывы",
-    "category": "Категория",
-    "working_hours": "Часы работы",
-    "latitude": "Широта",
-    "longitude": "Долгота",
-    "email": "Email",
-    "social_links": "Соцсети",
-    "search_query": "Поисковый запрос",
-    "yandex_url": "Ссылка",
-}
-
-
 def _write_sheet(ws, orgs: list[Organization]) -> None:
     """Записать организации на один лист Excel."""
     from openpyxl.styles import Font
 
     cols = FIELDNAMES
 
-    for col_idx, field in enumerate(cols, 1):
-        cell = ws.cell(row=1, column=col_idx, value=HEADERS_RU.get(field, field))
+    for col_idx, field_name in enumerate(cols, 1):
+        cell = ws.cell(row=1, column=col_idx, value=HEADERS_RU.get(field_name, field_name))
         cell.font = Font(bold=True)
 
     for row_idx, org in enumerate(orgs, 2):
         d = asdict(org)
-        for col_idx, field in enumerate(cols, 1):
-            ws.cell(row=row_idx, column=col_idx, value=d.get(field, ""))
+        for col_idx, field_name in enumerate(cols, 1):
+            ws.cell(row=row_idx, column=col_idx, value=d.get(field_name, ""))
 
     for col in ws.columns:
         max_len = max((len(str(c.value or "")) for c in col), default=10)
@@ -2243,6 +2245,7 @@ def _do_search(page: Page, query: str, headless: bool) -> bool:
         "input[placeholder*='Поиск']",
         "input[aria-label*='Поиск']",
     ]
+    last_exc: Exception | None = None
     for sel in search_sels:
         try:
             inp = page.locator(sel).first
@@ -2252,11 +2255,15 @@ def _do_search(page: Page, query: str, headless: bool) -> bool:
                 page.wait_for_timeout(random.randint(300, 700))
                 inp.press("Enter")
                 return True
-        except Exception:
+        except Exception as exc:
+            last_exc = exc
             continue
 
     # Fallback: goto по URL (менее естественно, но работает)
-    log.debug("Строка поиска не найдена — используем goto")
+    if last_exc:
+        log.debug("Не удалось использовать строку поиска (%s) — fallback goto", last_exc)
+    else:
+        log.debug("Строка поиска не найдена — используем goto")
     encoded_query = urllib.parse.quote(query)
     page.goto(
         f"https://yandex.ru/maps/?text={encoded_query}",
@@ -2379,8 +2386,8 @@ def _search_with_retry(
                 try:
                     page.goto("https://yandex.ru/maps/", wait_until="domcontentloaded", timeout=15000)
                     page.wait_for_timeout(random.randint(2000, 4000))
-                except Exception:
-                    pass
+                except Exception as goto_exc:
+                    log.debug("Не удалось вернуться на /maps/ перед retry: %s", goto_exc)
             else:
                 log.error("Не удалось выполнить поиск «%s» после %d попыток: %s",
                           query, max_retries, exc)
@@ -2402,7 +2409,8 @@ def _enrich_orgs(ctx: BrowserContext, orgs: list[Organization], n_tabs: int = 3)
     for _ in range(min(n_tabs, len(orgs))):
         try:
             pages.append(ctx.new_page())
-        except Exception:
+        except Exception as exc:
+            log.debug("Не удалось создать вкладку (имеется %d): %s", len(pages), exc)
             break
     if not pages:
         pages.append(ctx.new_page())
@@ -2479,7 +2487,18 @@ def print_stats(orgs: list[Organization], label: str = "Результаты") -
     with_email = sum(1 for o in orgs if o.email)
     with_social = sum(1 for o in orgs if o.social_links)
     with_coords = sum(1 for o in orgs if o.latitude)
-    with_rating = [float(o.rating.replace(",", ".")) for o in orgs if o.rating]
+    # Парсим рейтинг устойчиво к мусору ("—", "5/5", "Н/Д", пустая строка)
+    with_rating: list[float] = []
+    for o in orgs:
+        if not o.rating:
+            continue
+        m = re.search(r'\d+[.,]?\d*', o.rating)
+        if not m:
+            continue
+        try:
+            with_rating.append(float(m.group(0).replace(",", ".")))
+        except ValueError:
+            continue
     avg_rating = sum(with_rating) / len(with_rating) if with_rating else 0
 
     # Категории (топ-5)
