@@ -90,8 +90,9 @@ _HARDCODED: dict[str, str] = {
 class SelectorCache:
     """Кеш обнаруженных селекторов в JSON-файле."""
 
-    def __init__(self, path: Path = SELECTORS_CACHE_FILE):
-        self._path = path
+    def __init__(self, path: Path | None = None):
+        # Читаем константу динамически, чтобы тесты могли её патчить.
+        self._path = path if path is not None else SELECTORS_CACHE_FILE
         self._data: dict[str, str] = {}
         self._load()
 
@@ -452,7 +453,7 @@ def detect_selectors(page: Page, mode: str = "list") -> dict[str, str]:
 class SelectorEngine:
     """Умный движок селекторов с цепочкой: кеш → hardcoded → auto-detect."""
 
-    def __init__(self, cache_path: Path = SELECTORS_CACHE_FILE):
+    def __init__(self, cache_path: Path | None = None):
         self._cache = SelectorCache(cache_path)
         self._active: dict[str, str] = {}
         self._detected = False

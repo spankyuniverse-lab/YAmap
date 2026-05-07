@@ -9,6 +9,12 @@ pip install -r requirements.txt
 playwright install chromium
 ```
 
+Для разработки (тесты):
+
+```bash
+pip install -r requirements-dev.txt
+```
+
 ## Использование
 
 ### По поисковому запросу
@@ -18,6 +24,9 @@ python yandex_parser.py "кофейни Москва"
 python yandex_parser.py "автосервис Казань" -n 200 -o авто.csv
 python yandex_parser.py "аптеки Москва" --api-intercept
 python yandex_parser.py "рестораны СПб" --detail
+
+# Аналогично через модуль
+python -m yamap "кофейни Москва"
 ```
 
 ### По категориям (аналог 2ГИС)
@@ -152,3 +161,46 @@ python yandex_parser.py --reset-selectors
 - **Семантические a[href]**: `tel:` = телефон, внешние ссылки = сайт
 - **Визуальные**: самый крупный текст в карточке = название
 - **Паттерны классов**: удаление обфусцирующих префиксов (`_1a2b3c_`) для матчинга
+
+## Структура пакета
+
+```
+yamap/
+├── __init__.py        # публичный API: Organization, run_parser, …
+├── __main__.py        # python -m yamap
+├── _playwright.py     # patchright/playwright shim
+├── models.py          # Organization, dedup
+├── proxy.py           # ProxyRotator
+├── categories.py      # CATEGORIES + resolve_categories
+├── config.py          # YAML/JSON config loader
+├── captcha.py         # детект + handle CAPTCHA, bezier-мышь
+├── selectors.py       # SelectorEngine + JS auto-detect
+├── throttle.py        # AdaptiveThrottle
+├── browser.py         # persistent context, warmup, type_like_human
+├── scraper.py         # search + scroll + parse + enrich + API
+├── output.py          # save_csv/json/xlsx, print_stats
+├── resume.py          # ResumeManager
+├── runner.py          # run_parser, run_category_parser
+├── cli.py             # argparse + interactive_menu
+├── validators.py      # normalize_phone/website/email
+├── metrics.py         # RunMetrics
+└── logging_utils.py   # setup_logging с ротацией
+
+yandex_parser.py        # шим-точка входа (для python yandex_parser.py …)
+tests/                  # 246 unit-тестов pytest
+```
+
+## Тесты
+
+Полная сюита покрывает чистую логику и парсинг через моки:
+
+```bash
+python -m pytest          # все 246 тестов, ~0.7 сек
+python -m pytest -v       # с именами тестов
+python -m pytest tests/test_validators.py  # один модуль
+```
+
+Покрытие: модели и dedup, валидаторы phone/website/email, ротация прокси,
+адаптивный троттлинг, метрики, логирование с ротацией, save/load
+CSV/JSON/XLSX, ResumeManager, кеш селекторов, парсинг API-ответов,
+извлечение координат из URL, CLI argparse, mock Playwright Page.
