@@ -30,6 +30,7 @@ import argparse
 import csv
 import json
 import logging
+import os
 import random
 import re
 import sys
@@ -2594,22 +2595,46 @@ def _create_browser_context(pw, headless: bool, proxy_url: str | None = None):
         launch_args["proxy"] = rotator.to_playwright_arg(proxy_url)
         log.info("Прокси: %s", proxy_url.split("@")[-1] if "@" in proxy_url else proxy_url)
 
-    # Persistent context: всё состояние браузера сохраняется на диск
-    ctx: BrowserContext = pw.chromium.launch_persistent_context(
-        str(BROWSER_DATA_DIR),
-        **launch_args,
-    )
-    log.info("Браузер: настоящий Chrome + persistent-профиль (%s)", BROWSER_DATA_DIR)
+    # Явный путь к бинарю Chromium/Chrome (для CI/докера/песочниц, где нет
+    # системного Chrome и не скачаны браузеры Playwright). Напр.:
+    #   YAMAP_BROWSER_PATH=/opt/pw-browsers/chromium
+    browser_path = os.environ.get("YAMAP_BROWSER_PATH")
 
-    # С patchright + channel="chrome" stealth-скрипт НЕ НУЖЕН:
-    # - patchright убирает Runtime.enable CDP-утечку
-    # - настоящий Chrome не имеет navigator.webdriver и прочих маркеров
-    # - лишние патчи только палятся (SmartCaptcha проверяет property descriptors)
-    #
-    # Если fallback на обычный playwright — инжектим минимальный stealth
-    if log_lib == "playwright":
-        log.warning("patchright не установлен, используем playwright + stealth JS")
-        ctx.add_init_script(_STEALTH_JS)
+    # Persistent context: всё состояние браузера сохраняется на диск.
+    # Приоритет — настоящий Chrome (channel="chrome"): лучший анти-детект.
+    # Fallback-цепочка, если Chrome не установлен: явный executable_path →
+    # bundled Chromium. На «сыром» Chromium инжектим stealth-JS.
+    need_stealth = (log_lib == "playwright")
+    ctx: BrowserContext
+    if browser_path:
+        launch_args.pop("channel", None)
+        launch_args["executable_path"] = browser_path
+        ctx = pw.chromium.launch_persistent_context(str(BROWSER_DATA_DIR), **launch_args)
+        need_stealth = True
+        log.info("Браузер: Chromium по YAMAP_BROWSER_PATH=%s (persistent %s)",
+                 browser_path, BROWSER_DATA_DIR)
+    else:
+        try:
+            ctx = pw.chromium.launch_persistent_context(str(BROWSER_DATA_DIR), **launch_args)
+            log.info("Браузер: настоящий Chrome + persistent-профиль (%s)", BROWSER_DATA_DIR)
+        except Exception as exc:
+            log.warning("Настоящий Chrome недоступен (%s) — откат на bundled Chromium. "
+                        "Для лучшего обхода анти-фрода установите Google Chrome "
+                        "или задайте YAMAP_BROWSER_PATH.",
+                        str(exc).splitlines()[0] if str(exc) else exc)
+            launch_args.pop("channel", None)   # bundled Chromium вместо channel="chrome"
+            ctx = pw.chromium.launch_persistent_context(str(BROWSER_DATA_DIR), **launch_args)
+            need_stealth = True
+            log.info("Браузер: bundled Chromium + persistent-профиль (%s)", BROWSER_DATA_DIR)
+
+    # С patchright + настоящим Chrome stealth НЕ нужен (нет Runtime.enable-утечки
+    # и navigator.webdriver, лишние патчи только палятся). Но на «сыром» Chromium
+    # или обычном playwright — инжектим минимальный stealth.
+    if need_stealth:
+        try:
+            ctx.add_init_script(_STEALTH_JS)
+        except Exception:
+            pass
 
     return None, ctx
 

@@ -13,7 +13,17 @@
 
 ```bash
 pip install -r requirements.txt
-playwright install chrome    # нужен настоящий Chrome (анти-детект)
+playwright install chrome     # предпочтительно настоящий Chrome (лучший анти-детект)
+# если настоящего Chrome нет — сгодится bundled Chromium:
+playwright install chromium
+```
+
+Если Chrome не установлен, парсер автоматически откатится на bundled Chromium
+(с инъекцией stealth-JS). В окружениях без скачанных браузеров Playwright
+(CI, docker, песочница) можно явно указать бинарь:
+
+```bash
+export YAMAP_BROWSER_PATH=/path/to/chromium   # напр. /opt/pw-browsers/chromium
 ```
 
 ## Использование
