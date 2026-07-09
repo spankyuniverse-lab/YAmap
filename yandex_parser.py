@@ -1,18 +1,27 @@
 """
-Парсер Яндекс.Карт — сбор организаций по поисковому запросу или по категориям.
+Парсер Яндекс.Карт (Казахстан, yandex.kz) — сбор ВСЕХ доступных данных
+об организациях по поисковому запросу или по категориям.
+
+По умолчанию работает с доменом yandex.kz и пинит гео-вьюпорт Казахстана
+(ll=долгота,широта + z + lang=ru_RU), чтобы выдача была казахстанской, а не
+московской. Домен переключается флагом --tld (kz/ru/com/by/uz/tr).
 
 Яндекс.Карты используют динамическую подгрузку результатов (infinite scroll),
-поэтому для парсинга применяется Playwright с эмуляцией прокрутки.
+поэтому применяется Playwright/patchright с эмуляцией прокрутки и обходом
+анти-фрод системы (SmartCaptcha): настоящий Chrome, persistent-профиль,
+человеческая мышь (Безье), прогрев, адаптивный троттлинг, ротация прокси.
 
 Режимы работы:
-  1. По запросу:    python yandex_parser.py "кофейни Москва"
-  2. По категориям: python yandex_parser.py --city Москва --category еда рестораны кафе
-  3. Все категории: python yandex_parser.py --city Москва --all-categories
+  1. По запросу:    python yandex_parser.py "кофейни Алматы"
+  2. По категориям: python yandex_parser.py --city Алматы --category еда рестораны кафе
+  3. Все категории: python yandex_parser.py --city Астана --all-categories
   4. Список категорий: python yandex_parser.py --list-categories
+  5. Список городов KZ: python yandex_parser.py --list-cities
 
 Дополнительно:
-  --api-intercept  — перехват JSON из внутреннего API (надёжнее DOM)
+  --api-intercept  — перехват JSON из внутреннего API (надёжнее DOM, все поля)
   --detail         — открытие карточек для телефона/сайта
+  --ll / --z       — центр карты и зум для гео-привязки
 """
 
 from __future__ import annotations
@@ -68,11 +77,138 @@ logging.basicConfig(
 log = logging.getLogger("yandex_parser")
 
 # ---------------------------------------------------------------------------
+# Домен и гео-конфигурация (по умолчанию — Казахстан, yandex.kz)
+#
+# Все три хоста (yandex.kz / yandex.com / yandex.ru) обслуживают один и тот же
+# SPA Яндекс.Карт и один и тот же бэкенд организаций. Разница — в регионе по
+# умолчанию: yandex.ru без гео-контекста уводит выдачу в Москву (регион 213).
+# Поэтому для KZ мы (1) используем yandex.kz как базу и (2) ВСЕГДА пиним
+# вьюпорт ll=lon,lat + z + lang=ru_RU, чтобы выдача была казахстанской.
+#
+# Карточки организаций канонизируются на yandex.com/maps/org/<slug>/<id>/,
+# поэтому регэкспы/переходы должны принимать и .com, и .kz.
+# ---------------------------------------------------------------------------
+
+# код TLD -> (хост, язык, центр страны "lon,lat", зум по стране)
+DOMAIN_REGISTRY: dict[str, tuple[str, str, str | None, int]] = {
+    "kz": ("yandex.kz", "ru_RU", "66.9237,48.0196", 5),      # Казахстан (регион 159)
+    "ru": ("yandex.ru", "ru_RU", "37.6173,55.7558", 5),      # Россия
+    "com": ("yandex.com", "en_US", None, 5),
+    "by": ("yandex.by", "ru_RU", None, 5),
+    "uz": ("yandex.uz", "ru_RU", None, 5),
+    "tr": ("yandex.com.tr", "tr_TR", None, 5),
+}
+
+# Активная конфигурация домена (переопределяется в main() через --tld/--config).
+DOMAIN = "yandex.kz"   # хост по умолчанию — Казахстан
+LANG = "ru_RU"         # язык выдачи (kk_KZ у Карт нет — используем русский)
+
+# Пресеты городов Казахстана: ll = "lon,lat" (долгота ПЕРВАЯ — как в GeoJSON).
+# Зум по умолчанию z=12 (город); 10 — пригороды, 14 — плотный центр.
+KZ_CITIES: dict[str, str] = {
+    "Алматы": "76.8897,43.2389",
+    "Астана": "71.4491,51.1694",            # не «Нур-Султан»; регион 163
+    "Шымкент": "69.5967,42.3167",           # не «Чимкент»
+    "Караганда": "73.1094,49.8047",
+    "Актобе": "57.1670,50.2839",
+    "Тараз": "71.3667,42.9000",
+    "Павлодар": "76.9674,52.2870",
+    "Усть-Каменогорск": "82.6279,49.9481",  # каз. Өскемен
+    "Семей": "80.2275,50.4111",             # бывш. Семипалатинск
+    "Атырау": "51.9238,47.0945",            # регион 10291
+    "Костанай": "63.6246,53.2144",
+    "Кызылорда": "65.4823,44.8479",
+    "Уральск": "51.3667,51.2333",           # каз. Орал
+    "Петропавловск": "69.1500,54.8667",     # каз. Петропавл
+    "Актау": "51.1408,43.6350",
+    "Темиртау": "72.9644,50.0547",
+    "Туркестан": "68.2517,43.3017",
+    "Кокшетау": "69.3833,53.2833",
+}
+KZ_COUNTRY_LL = "66.9237,48.0196"   # весь Казахстан (регион 159), использовать с z=5
+DEFAULT_CITY_Z = 12                 # зум для сбора по городу
+
+# Таймзона/локаль браузера должны соответствовать домену (анти-фрод консистентность).
+DOMAIN_TZ: dict[str, str] = {
+    "yandex.kz": "Asia/Almaty",
+    "yandex.ru": "Europe/Moscow",
+    "yandex.com": "Europe/Moscow",
+    "yandex.by": "Europe/Minsk",
+    "yandex.uz": "Asia/Tashkent",
+    "yandex.com.tr": "Europe/Istanbul",
+}
+DOMAIN_LOCALE: dict[str, str] = {
+    "yandex.kz": "ru-RU",
+    "yandex.ru": "ru-RU",
+    "yandex.com": "en-US",
+    "yandex.by": "ru-RU",
+    "yandex.uz": "ru-RU",
+    "yandex.com.tr": "tr-TR",
+}
+
+# Активный вьюпорт (устанавливается из --city / --ll в main()).
+MAP_LL: str | None = None
+MAP_Z: int = DEFAULT_CITY_Z
+
+
+def set_domain(code: str | None) -> None:
+    """Установить активный хост/язык по короткому коду TLD (kz/ru/com/…)."""
+    global DOMAIN, LANG
+    host, lang, _, _ = DOMAIN_REGISTRY.get((code or "kz").lower(), DOMAIN_REGISTRY["kz"])
+    DOMAIN, LANG = host, lang
+
+
+def set_viewport(city: str | None = None, ll: str | None = None, z: int | None = None) -> None:
+    """Установить центр карты (ll=lon,lat) и зум для гео-привязки выдачи к KZ."""
+    global MAP_LL, MAP_Z
+    if ll:
+        MAP_LL, MAP_Z = ll, (z or DEFAULT_CITY_Z)
+    elif city and city in KZ_CITIES:
+        MAP_LL, MAP_Z = KZ_CITIES[city], (z or DEFAULT_CITY_Z)
+    else:
+        # Нет города/координат — центрируемся на всей стране домена, если известно.
+        _, _, country_ll, country_z = DOMAIN_REGISTRY.get(
+            _tld_of(DOMAIN), DOMAIN_REGISTRY["kz"]
+        )
+        MAP_LL, MAP_Z = country_ll, (z or country_z)
+
+
+def _tld_of(host: str) -> str:
+    """yandex.kz -> kz, yandex.com.tr -> tr, yandex.com -> com."""
+    for code, (h, *_rest) in DOMAIN_REGISTRY.items():
+        if h == host:
+            return code
+    return "kz"
+
+
+def base_url() -> str:
+    return f"https://{DOMAIN}"
+
+
+def maps_url() -> str:
+    return f"https://{DOMAIN}/maps/"
+
+
+def org_url(seoname: str, org_id: str) -> str:
+    """Ссылка на карточку организации (канонизируется на yandex.com, но любой хост резолвит)."""
+    return f"https://{DOMAIN}/maps/org/{seoname}/{org_id}/"
+
+
+def search_url(query: str, with_viewport: bool = True) -> str:
+    """URL поиска с языком и (опционально) закреплённым вьюпортом для гео-привязки."""
+    u = f"https://{DOMAIN}/maps/?text={urllib.parse.quote(query)}&lang={LANG}"
+    if with_viewport and MAP_LL:
+        u += f"&ll={MAP_LL}&z={MAP_Z}"
+    return u
+
+
+# ---------------------------------------------------------------------------
 # Data model
 # ---------------------------------------------------------------------------
 
 @dataclass
 class Organization:
+    # --- базовые поля (порядок колонок сохраняется, новые поля добавляются в конец) ---
     name: str = ""
     address: str = ""
     phone: str = ""
@@ -87,6 +223,65 @@ class Organization:
     social_links: str = ""
     yandex_url: str = ""
     search_query: str = ""
+    # --- расширенные поля: «снять все данные» с Яндекс.Карт ---
+    # идентификаторы и ссылки
+    org_id: str = ""             # items[].id (стабильный permalink/oid)
+    seoname: str = ""            # items[].seoname (slug рубрики/организации)
+    org_uri: str = ""            # items[].uri (ymapsbm1://org?oid=...)
+    # названия
+    short_name: str = ""         # items[].shortTitle
+    legal_name: str = ""         # items[].name (юр. лицо, если отличается от title)
+    # структурированный адрес
+    full_address: str = ""       # items[].fullAddress (с городом)
+    additional_address: str = "" # items[].additionalAddress (этаж/вход/в ТЦ)
+    postal_code: str = ""        # compositeAddress.postalCode
+    country: str = ""            # items[].country
+    region_name: str = ""        # compositeAddress.region
+    locality: str = ""           # compositeAddress.locality (город)
+    district: str = ""           # compositeAddress.district (район)
+    street: str = ""             # compositeAddress.street
+    house: str = ""              # compositeAddress.house
+    geo_id: str = ""             # items[].geoId (числовой ID региона)
+    display_latitude: str = ""   # displayCoordinates[1] (координата метки)
+    display_longitude: str = ""  # displayCoordinates[0]
+    # контакты
+    websites_all: str = ""       # items[].urls через "; " (website = urls[0])
+    phone_types: str = ""        # phones[].type параллельно phone
+    booking_url: str = ""        # links/businessLinks type=booking
+    # классификация
+    category_classes: str = ""   # categories[].class (стабильные слаги)
+    category_seonames: str = ""  # categories[].seoname
+    rubric_ids: str = ""         # rubricIds
+    chain_id: str = ""           # chain.id
+    chain_name: str = ""         # chain.name (сеть/бренд)
+    # рейтинги (разделены с reviews_count)
+    rating_count: str = ""       # ratingData.ratingCount (кол-во оценок-звёзд)
+    # часы работы / статус
+    is_open_now: str = ""        # currentWorkingStatus.isOpenNow -> да/нет
+    current_status_text: str = "" # currentWorkingStatus.text
+    round_the_clock: str = ""    # круглосуточно (да/"")
+    tz_offset: str = ""          # items[].tzOffset (сек)
+    status: str = ""             # items[].status (open/closed/temporarily_closed)
+    temporarily_closed: str = "" # да, если status == temporarily_closed
+    # атрибуты
+    description: str = ""        # items[].description
+    features: str = ""           # features[] в виде "имя: значение; ..."
+    price_average: str = ""      # средний чек из subtitleItems
+    # медиа
+    photos_count: str = ""       # photos.count
+    photo_url_template: str = "" # photos.urlTemplate (avatars.mds.yandex.net, %s = размер)
+    logo_url: str = ""           # businessImages.logo.urlTemplate
+    panorama_id: str = ""        # panorama.id
+    # транспорт
+    metro: str = ""              # metro[] "имя (расстояние)"
+    stops: str = ""              # stops[] "имя (расстояние)"
+    # реклама / верификация / провенанс
+    is_advert: str = ""          # да, если advert != null (платное размещение)
+    inn_tax_id: str = ""         # advert.ordInfo.client.tin (только у рекламы)
+    awards: str = ""             # awards, напр. "goodPlaceYear:2024"
+    is_verified: str = ""        # да, если владелец подтверждён (sources/businessProperties)
+    # конверт запроса
+    total_result_count: str = "" # data.totalResultCount по запросу
 
 
 FIELDNAMES = [f.name for f in fields(Organization)]
@@ -600,9 +795,9 @@ def list_categories() -> None:
             print(f"    • {item}")
         print()
     print("Использование:")
-    print('  python yandex_parser.py --city Москва --category еда')
-    print('  python yandex_parser.py --city Москва --category еда рестораны кафе')
-    print('  python yandex_parser.py --city Москва --all-categories')
+    print('  python yandex_parser.py --city Алматы --category еда')
+    print('  python yandex_parser.py --city Астана --category еда рестораны кафе')
+    print('  python yandex_parser.py --city Шымкент --all-categories')
 
 
 def resolve_categories(names: list[str]) -> list[str]:
@@ -1489,6 +1684,10 @@ def parse_snippet(page: Page, index: int) -> Organization:
         if link.count() > 0:
             org.yandex_url = link.get_attribute("href") or ""
 
+    # ID/slug организации из URL (/maps/org/<slug>/<id>/)
+    seoname, org_id = _org_ids_from_url(org.yandex_url)
+    org.seoname, org.org_id = seoname, org_id
+
     return org
 
 
@@ -1504,7 +1703,7 @@ def enrich_from_detail(page: Page, org: Organization, _detail_detected: list[boo
     engine = get_selector_engine()
     url = org.yandex_url
     if url.startswith("/"):
-        url = f"https://yandex.ru{url}"
+        url = f"{base_url()}{url}"
 
     try:
         page.goto(url, wait_until="domcontentloaded", timeout=15000)
@@ -1646,6 +1845,22 @@ def enrich_from_detail(page: Page, org: Organization, _detail_detected: list[boo
             if socials:
                 org.social_links = "; ".join(socials)
 
+        # ID/slug организации из финального URL карточки
+        if not org.org_id:
+            seoname, org_id = _org_ids_from_url(page.url)
+            if org_id:
+                org.org_id = org_id
+                org.seoname = org.seoname or seoname
+
+        # Описание — из meta-тегов (og:description / description), если пусто
+        if not org.description:
+            desc = page.evaluate("""() => {
+                const el = document.querySelector('meta[property="og:description"], meta[name="description"]');
+                return el ? (el.getAttribute('content') || '') : '';
+            }""")
+            if desc:
+                org.description = desc.strip()
+
     except Exception as exc:
         log.warning("Не удалось открыть карточку %s: %s", org.name, exc)
 
@@ -1663,6 +1878,23 @@ def _extract_coords_from_url(url: str) -> tuple[str, str] | None:
     return None
 
 
+def _org_ids_from_url(url: str) -> tuple[str, str]:
+    """Извлечь (seoname, org_id) из URL карточки: /maps/org/<slug>/<id>/.
+
+    Работает для yandex.kz / yandex.com / yandex.ru и относительных ссылок.
+    """
+    if not url:
+        return "", ""
+    m = re.search(r'/org/([^/]+)/(\d+)', url)
+    if m:
+        return m.group(1), m.group(2)
+    # Формат без slug: /org/<id>
+    m = re.search(r'/org/(\d+)', url)
+    if m:
+        return "", m.group(1)
+    return "", ""
+
+
 # ---------------------------------------------------------------------------
 # API Intercept mode
 #
@@ -1671,115 +1903,332 @@ def _extract_coords_from_url(url: str) -> tuple[str, str] | None:
 # чем парсить DOM.
 # ---------------------------------------------------------------------------
 
-def _extract_orgs_from_api_response(data: dict) -> list[Organization]:
-    """Извлечь организации из JSON-ответа внутреннего API."""
-    orgs: list[Organization] = []
+def _s(val: Any) -> str:
+    """Безопасно привести значение к строке ('' для None)."""
+    if val is None:
+        return ""
+    if isinstance(val, bool):
+        return "да" if val else "нет"
+    return str(val)
 
-    # Формат ответа может варьироваться; ищем массив с данными организаций
-    features = (
-        data.get("features")
-        or data.get("data", {}).get("features")
-        or data.get("items")
-        or data.get("results")
-        or []
+
+def _join_unique(values) -> str:
+    """Склеить непустые уникальные значения через '; ' (порядок сохраняется)."""
+    seen: dict[str, None] = {}
+    for v in values:
+        v = (v or "").strip() if isinstance(v, str) else _s(v)
+        if v and v not in seen:
+            seen[v] = None
+    return "; ".join(seen)
+
+
+SOCIAL_PATTERNS = (
+    "vk.com", "t.me", "telegram", "wa.me", "whatsapp", "instagram",
+    "facebook", "fb.com", "ok.ru", "youtube", "twitter", "x.com",
+    "tiktok", "viber",
+)
+
+
+def _find_api_items(data: dict) -> list[dict]:
+    """Найти массив организаций в JSON-конверте ответа (все известные формы)."""
+    if not isinstance(data, dict):
+        return []
+    inner = data.get("data") if isinstance(data.get("data"), dict) else {}
+    # 1) прямые массивы на верхнем уровне и в data
+    for holder in (data, inner):
+        for key in ("items", "results", "features"):
+            arr = holder.get(key)
+            if isinstance(arr, list) and arr:
+                return arr
+    # 2) SSR-конверт: stack[0].results.items
+    stack = data.get("stack") or inner.get("stack")
+    if isinstance(stack, list):
+        for frame in stack:
+            if isinstance(frame, dict):
+                res = frame.get("results")
+                if isinstance(res, dict) and isinstance(res.get("items"), list):
+                    return res["items"]
+    return []
+
+
+def _extract_total_count(data: dict) -> str:
+    """Общее число результатов по запросу (для стоп-условия и как поле)."""
+    inner = data.get("data") if isinstance(data.get("data"), dict) else {}
+    for holder in (data, inner):
+        for key in ("totalResultCount", "total", "found", "count"):
+            v = holder.get(key)
+            if isinstance(v, (int, str)) and _s(v):
+                return _s(v)
+    return ""
+
+
+def _org_from_item(feat: dict, total_count: str = "") -> Organization | None:
+    """Собрать Organization из одного элемента API.
+
+    Поддерживает два формата:
+      • внутренний camelCase (yandex.kz/maps/api/search → data.items[])
+      • публичный GeoJSON (search-maps.yandex.ru → features[].properties.CompanyMetaData)
+    Читаем сначала внутренние поля (props), затем — публичные (company) как fallback.
+    """
+    if not isinstance(feat, dict):
+        return None
+    props = feat.get("properties", feat)
+    if not isinstance(props, dict):
+        return None
+    company = props.get("CompanyMetaData") or props.get("companyMetaData") or {}
+
+    # Отсекаем не-организации (топонимы, рубрики, рекламные строки) — только для внутреннего формата
+    itype = props.get("type")
+    if not company and itype and itype != "business":
+        return None
+
+    org = Organization()
+
+    # --- название / короткое / юр.лицо ---
+    title = props.get("title")
+    if title:
+        org.name = title
+        legal = props.get("name", "")
+        if legal and legal != title:
+            org.legal_name = legal
+    else:
+        org.name = company.get("name") or props.get("name", "")
+    org.short_name = props.get("shortTitle", "")
+
+    # --- идентификаторы ---
+    org.org_id = _s(props.get("id") or props.get("oid")
+                    or props.get("businessId") or company.get("id"))
+    org.seoname = props.get("seoname", "")
+    org.org_uri = props.get("uri", "")
+    org.geo_id = _s(props.get("geoId"))
+
+    # --- адрес ---
+    org.address = props.get("address", "") or company.get("address", "")
+    org.full_address = props.get("fullAddress", "") or company.get("address", "")
+    org.additional_address = props.get("additionalAddress", "")
+    org.country = props.get("country", "")
+    ca = props.get("compositeAddress") or {}
+    if isinstance(ca, dict):
+        org.region_name = _s(ca.get("region"))
+        org.locality = _s(ca.get("locality"))
+        org.district = _s(ca.get("district"))
+        org.street = _s(ca.get("street"))
+        org.house = _s(ca.get("house"))
+        org.postal_code = _s(ca.get("postalCode"))
+    # Компоненты адреса из публичного GeoJSON (Address.Components[])
+    addr_meta = company.get("address") if isinstance(company.get("address"), dict) else {}
+    comps = (addr_meta.get("Components") if isinstance(addr_meta, dict) else None) or []
+    for c in comps:
+        if not isinstance(c, dict):
+            continue
+        kinds = c.get("kind") or c.get("kinds") or []
+        kinds = kinds if isinstance(kinds, list) else [kinds]
+        name = c.get("name", "")
+        if "locality" in kinds and not org.locality:
+            org.locality = name
+        elif ("province" in kinds or "area" in kinds) and not org.region_name:
+            org.region_name = name
+        elif "street" in kinds and not org.street:
+            org.street = name
+        elif "house" in kinds and not org.house:
+            org.house = name
+        elif "district" in kinds and not org.district:
+            org.district = name
+
+    # --- координаты: [lon, lat] (порядок GeoJSON) ---
+    coords = props.get("coordinates")
+    if not (isinstance(coords, list) and len(coords) >= 2):
+        coords = (feat.get("geometry") or {}).get("coordinates")
+    if isinstance(coords, list) and len(coords) >= 2:
+        org.longitude, org.latitude = _s(coords[0]), _s(coords[1])
+    dc = props.get("displayCoordinates")
+    if isinstance(dc, list) and len(dc) >= 2:
+        org.display_longitude, org.display_latitude = _s(dc[0]), _s(dc[1])
+
+    # --- телефоны ---
+    phones = props.get("phones") or company.get("Phones") or company.get("phones") or []
+    nums, types = [], []
+    for ph in phones:
+        if not isinstance(ph, dict):
+            continue
+        num = ph.get("number") or ph.get("formatted") or ph.get("value", "")
+        if num:
+            nums.append(num)
+            types.append(ph.get("type", ""))
+    org.phone = _join_unique(nums)
+    org.phone_types = _join_unique(types)
+
+    # --- сайты ---
+    urls = props.get("urls")
+    if isinstance(urls, list) and urls:
+        org.website = urls[0] if isinstance(urls[0], str) else _s(urls[0])
+        org.websites_all = _join_unique(urls)
+    else:
+        url_obj = company.get("url") or company.get("Url") or ""
+        org.website = url_obj if isinstance(url_obj, str) else _s(url_obj.get("value") if isinstance(url_obj, dict) else "")
+
+    # --- типизированные ссылки: email / booking / соцсети ---
+    links = props.get("links") or company.get("Links") or company.get("links") or []
+    emails, booking, socials = [], [], []
+    for lk in links:
+        if isinstance(lk, dict):
+            t = (lk.get("type") or "").lower()
+            href = lk.get("href") or lk.get("aref") or lk.get("url") or ""
+        else:
+            t, href = "", str(lk)
+        if not href:
+            continue
+        if t == "email" or href.startswith("mailto:"):
+            emails.append(href.replace("mailto:", ""))
+        elif t == "booking":
+            booking.append(href)
+        elif any(p in href for p in SOCIAL_PATTERNS):
+            socials.append(href)
+    # Явный блок соцсетей внутреннего формата
+    for s in (props.get("socialLinks") or []):
+        if isinstance(s, dict) and s.get("href"):
+            label = s.get("type", "")
+            socials.append(f"{label}:{s['href']}".strip(":"))
+    # Публичные Emails[]
+    for e in (company.get("Emails") or company.get("emails") or []):
+        emails.append(e.get("value", "") if isinstance(e, dict) else str(e))
+    org.email = _join_unique(emails)
+    org.booking_url = _join_unique(booking)
+    org.social_links = _join_unique(socials)
+
+    # --- категории / рубрики / сеть ---
+    cats = props.get("categories") or company.get("Categories") or company.get("categories") or []
+    org.category = ", ".join(c.get("name", "") for c in cats if isinstance(c, dict) and c.get("name"))
+    org.category_classes = _join_unique(c.get("class", "") for c in cats if isinstance(c, dict))
+    org.category_seonames = _join_unique(c.get("seoname", "") for c in cats if isinstance(c, dict))
+    org.rubric_ids = _join_unique(_s(r) for r in (props.get("rubricIds") or []))
+    chain = props.get("chain") or {}
+    if isinstance(chain, dict):
+        org.chain_id = _s(chain.get("id"))
+        org.chain_name = _s(chain.get("name"))
+
+    # --- рейтинг / отзывы ---
+    rd = props.get("ratingData") or {}
+    if isinstance(rd, dict) and rd:
+        org.rating = _s(rd.get("ratingValue"))
+        org.rating_count = _s(rd.get("ratingCount"))
+        org.reviews_count = _s(rd.get("reviewCount"))
+    if not org.rating:
+        rating_val = company.get("rating") if isinstance(company.get("rating"), dict) else {}
+        if isinstance(rating_val, dict) and rating_val:
+            org.rating = _s(rating_val.get("value") or rating_val.get("score"))
+            org.reviews_count = org.reviews_count or _s(rating_val.get("ratings") or rating_val.get("count"))
+    if not org.rating:
+        for key in ("rating", "Rating", "score"):
+            v = props.get(key) or company.get(key)
+            if v and not isinstance(v, dict):
+                org.rating = _s(v)
+                break
+    if not org.reviews_count:
+        for key in ("reviewCount", "ratingCount", "totalRatings"):
+            v = props.get(key) or company.get(key)
+            if v:
+                org.reviews_count = _s(v)
+                break
+
+    # --- часы работы / статус ---
+    org.working_hours = props.get("workingTimeText", "")
+    if not org.working_hours:
+        hours = company.get("Hours") or company.get("hours") or {}
+        if isinstance(hours, dict):
+            org.working_hours = hours.get("text", "")
+    cws = props.get("currentWorkingStatus") or {}
+    if isinstance(cws, dict):
+        if "isOpenNow" in cws:
+            org.is_open_now = "да" if cws.get("isOpenNow") else "нет"
+        org.current_status_text = _s(cws.get("text"))
+    org.round_the_clock = "да" if "круглосуточно" in org.working_hours.lower() else ""
+    org.tz_offset = _s(props.get("tzOffset"))
+    org.status = _s(props.get("status"))
+    org.temporarily_closed = "да" if props.get("status") == "temporarily_closed" else ""
+
+    # --- описание / особенности / цены ---
+    org.description = props.get("description", "") or company.get("description", "")
+    feats = props.get("features") or company.get("Features") or []
+    parts = []
+    for f in feats:
+        if not isinstance(f, dict):
+            continue
+        n = f.get("name", "")
+        v = f.get("value")
+        if isinstance(v, bool):
+            parts.append(n if v else f"{n}: нет")
+        elif isinstance(v, list):
+            vv = ", ".join(_s(x.get("name") if isinstance(x, dict) else x) for x in v)
+            parts.append(f"{n}: {vv}" if vv else n)
+        elif v not in (None, ""):
+            parts.append(f"{n}: {_s(v)}")
+        elif n:
+            parts.append(n)
+    org.features = _join_unique(parts)
+    for si in (props.get("subtitleItems") or []):
+        if isinstance(si, dict) and si.get("type") in ("goods", "price"):
+            for pr in (si.get("property") or []):
+                if isinstance(pr, dict) and pr.get("key") == "price":
+                    org.price_average = _s(pr.get("value"))
+                    break
+            if org.price_average:
+                break
+
+    # --- медиа ---
+    photos = props.get("photos") or {}
+    if isinstance(photos, dict):
+        org.photos_count = _s(photos.get("count"))
+        org.photo_url_template = _s(photos.get("urlTemplate"))
+    bimg = props.get("businessImages") or {}
+    if isinstance(bimg, dict):
+        logo = bimg.get("logo") or {}
+        org.logo_url = _s(logo.get("urlTemplate")) if isinstance(logo, dict) else ""
+    pano = props.get("panorama") or {}
+    if isinstance(pano, dict):
+        org.panorama_id = _s(pano.get("id"))
+
+    # --- транспорт ---
+    org.metro = _join_unique(
+        f"{m.get('name', '')} ({m.get('distance', '')})".strip()
+        for m in (props.get("metro") or []) if isinstance(m, dict) and m.get("name")
+    )
+    org.stops = _join_unique(
+        f"{s.get('name', '')} ({s.get('distance', '')})".strip()
+        for s in (props.get("stops") or []) if isinstance(s, dict) and s.get("name")
     )
 
-    for feat in features:
-        props = feat.get("properties", feat)
-        company = props.get("CompanyMetaData", props.get("companyMetaData", {}))
-        if not company and "name" not in props:
-            continue
+    # --- реклама / верификация ---
+    advert = props.get("advert")
+    org.is_advert = "да" if advert else ""
+    if isinstance(advert, dict):
+        client = ((advert.get("ordInfo") or {}).get("client")) or {}
+        org.inn_tax_id = _s(client.get("tin"))
+    aw = props.get("awards")
+    if isinstance(aw, dict):
+        org.awards = _join_unique(f"{k}:{_s(v)}" for k, v in aw.items())
+    srcs = props.get("sources") or []
+    owner_src = any(isinstance(s, dict) and s.get("type") == "owner" for s in srcs)
+    org.is_verified = "да" if (owner_src or props.get("businessProperties") or props.get("verified")) else ""
 
-        org = Organization()
-        org.name = company.get("name", props.get("name", ""))
-        org.address = company.get("address", props.get("address", ""))
+    # --- ссылка на карточку + всего найдено ---
+    if org.seoname and org.org_id:
+        org.yandex_url = org_url(org.seoname, org.org_id)
+    else:
+        org.yandex_url = props.get("uri") or props.get("url", "")
+    org.total_result_count = total_count
 
-        # Телефоны — все номера через "; "
-        phones = company.get("Phones", company.get("phones", []))
-        if phones:
-            phone_list = []
-            for ph in phones:
-                num = ph.get("formatted") or ph.get("number") or ph.get("value", "")
-                if num and num not in phone_list:
-                    phone_list.append(num)
-            org.phone = "; ".join(phone_list)
+    return org if org.name else None
 
-        # Сайт
-        url_obj = company.get("url", company.get("Url", ""))
-        if isinstance(url_obj, str):
-            org.website = url_obj
-        elif isinstance(url_obj, dict):
-            org.website = url_obj.get("value", "")
 
-        # Часы работы
-        hours = company.get("Hours", company.get("hours", {}))
-        if isinstance(hours, dict):
-            text = hours.get("text", "")
-            org.working_hours = text
-
-        # Рейтинг и отзывы
-        rating_val = (
-            company.get("rating", {}) if isinstance(company.get("rating"), dict)
-            else props.get("rating", {}) if isinstance(props.get("rating"), dict)
-            else {}
-        )
-        if isinstance(rating_val, dict):
-            org.rating = str(rating_val.get("value", rating_val.get("score", "")))
-            org.reviews_count = str(rating_val.get("ratings", rating_val.get("count", "")))
-        # Fallback: рейтинг как простое число
-        if not org.rating:
-            for key in ("rating", "Rating", "score"):
-                val = company.get(key) or props.get(key)
-                if val and not isinstance(val, dict):
-                    org.rating = str(val)
-                    break
-        # Fallback: кол-во отзывов
-        if not org.reviews_count:
-            for key in ("reviewCount", "ratingCount", "totalRatings"):
-                val = company.get(key) or props.get(key)
-                if val:
-                    org.reviews_count = str(val)
-                    break
-
-        # Категории
-        categories = company.get("Categories", company.get("categories", []))
-        if categories:
-            cat_names = [c.get("name", "") for c in categories if c.get("name")]
-            org.category = ", ".join(cat_names)
-
-        # Координаты (из geometry GeoJSON)
-        geometry = feat.get("geometry", {})
-        coords = geometry.get("coordinates", [])
-        if coords and len(coords) >= 2:
-            org.longitude = str(coords[0])
-            org.latitude = str(coords[1])
-
-        # Email
-        emails = company.get("Emails", company.get("emails", []))
-        if emails:
-            org.email = "; ".join(
-                e.get("value", e) if isinstance(e, dict) else str(e)
-                for e in emails
-            )
-
-        # Соцсети (из Links / links)
-        links = company.get("Links", company.get("links", []))
-        social_patterns = ("vk.com", "t.me", "instagram", "facebook", "fb.com",
-                           "ok.ru", "youtube", "twitter", "x.com", "tiktok")
-        social_urls = []
-        for link_obj in links:
-            href = link_obj.get("href", link_obj.get("url", "")) if isinstance(link_obj, dict) else str(link_obj)
-            if any(p in href for p in social_patterns):
-                social_urls.append(href)
-        if social_urls:
-            org.social_links = "; ".join(social_urls)
-
-        # Ссылка
-        org.yandex_url = props.get("uri", props.get("url", ""))
-
-        if org.name:
+def _extract_orgs_from_api_response(data: dict) -> list[Organization]:
+    """Извлечь организации из JSON-ответа внутреннего/публичного API Яндекс.Карт."""
+    total = _extract_total_count(data)
+    orgs: list[Organization] = []
+    for feat in _find_api_items(data):
+        org = _org_from_item(feat, total)
+        if org is not None:
             orgs.append(org)
-
     return orgs
 
 
@@ -1902,6 +2351,53 @@ HEADERS_RU = {
     "social_links": "Соцсети",
     "search_query": "Поисковый запрос",
     "yandex_url": "Ссылка",
+    # расширенные поля
+    "org_id": "ID организации",
+    "seoname": "Slug",
+    "org_uri": "URI",
+    "short_name": "Короткое название",
+    "legal_name": "Юр. лицо",
+    "full_address": "Полный адрес",
+    "additional_address": "Уточнение адреса",
+    "postal_code": "Индекс",
+    "country": "Страна",
+    "region_name": "Регион",
+    "locality": "Город",
+    "district": "Район",
+    "street": "Улица",
+    "house": "Дом",
+    "geo_id": "Гео ID",
+    "display_latitude": "Широта (метка)",
+    "display_longitude": "Долгота (метка)",
+    "websites_all": "Все сайты",
+    "phone_types": "Типы телефонов",
+    "booking_url": "Бронирование",
+    "category_classes": "Классы рубрик",
+    "category_seonames": "Slug рубрик",
+    "rubric_ids": "ID рубрик",
+    "chain_id": "ID сети",
+    "chain_name": "Сеть",
+    "rating_count": "Оценки (кол-во)",
+    "is_open_now": "Открыто сейчас",
+    "current_status_text": "Статус работы",
+    "round_the_clock": "Круглосуточно",
+    "tz_offset": "Часовой пояс (сек)",
+    "status": "Статус",
+    "temporarily_closed": "Временно закрыто",
+    "description": "Описание",
+    "features": "Особенности",
+    "price_average": "Средний чек",
+    "photos_count": "Фото (кол-во)",
+    "photo_url_template": "Шаблон URL фото",
+    "logo_url": "Логотип",
+    "panorama_id": "Панорама",
+    "metro": "Метро",
+    "stops": "Остановки",
+    "is_advert": "Реклама",
+    "inn_tax_id": "ИНН (реклама)",
+    "awards": "Награды",
+    "is_verified": "Подтверждён владельцем",
+    "total_result_count": "Всего найдено",
 }
 
 
@@ -2085,8 +2581,10 @@ def _create_browser_context(pw, headless: bool, proxy_url: str | None = None):
             "--no-default-browser-check",
             "--disable-infobars",
         ],
-        "locale": "ru-RU",
-        "timezone_id": "Europe/Moscow",
+        # Локаль и таймзона ДОЛЖНЫ соответствовать домену/региону, иначе
+        # рассинхрон (yandex.kz + Europe/Moscow) палит бота. Для KZ — Asia/Almaty.
+        "locale": DOMAIN_LOCALE.get(DOMAIN, "ru-RU"),
+        "timezone_id": DOMAIN_TZ.get(DOMAIN, "Asia/Almaty"),
         "color_scheme": "light",
         # НЕ ставим user_agent — Chrome уже имеет свой настоящий
         # НЕ ставим extra_http_headers — избегаем inconsistency
@@ -2141,19 +2639,21 @@ _warmed_up = False
 def _warmup(page: Page, headless: bool) -> None:
     """Прогрев: зайти на Яндекс как обычный пользователь перед парсингом.
 
-    Стратегия: сначала заходим на yandex.ru (главная), потом переходим
-    на карты — как обычный человек. Яндекс меньше подозревает юзеров
-    с естественной цепочкой переходов и реферером.
+    Стратегия: сначала заходим на главную активного домена (напр. yandex.kz),
+    потом переходим на карты — как обычный человек. Яндекс меньше подозревает
+    юзеров с естественной цепочкой переходов и консистентным реферером.
+    ВАЖНО: оба перехода идут через ОДИН домен — смешанная цепочка .ru→.kz
+    выглядит как бот и повышает риск капчи.
     """
     global _warmed_up
     if _warmed_up:
         return
     _warmed_up = True
 
-    log.info("Прогрев: естественная навигация yandex.ru → карты…")
+    log.info("Прогрев: естественная навигация %s → карты…", DOMAIN)
     try:
         # Шаг 1: заходим на главную Яндекса (как обычный пользователь)
-        page.goto("https://yandex.ru/", wait_until="domcontentloaded", timeout=20000)
+        page.goto(f"{base_url()}/", wait_until="domcontentloaded", timeout=20000)
         page.wait_for_timeout(random.randint(2000, 4000))
 
         # Проверяем капчу на главной
@@ -2168,9 +2668,11 @@ def _warmup(page: Page, headless: bool) -> None:
             )
             page.wait_for_timeout(random.randint(100, 400))
 
-        # Шаг 2: переходим на карты через навигацию (реферер yandex.ru)
+        # Шаг 2: переходим на карты через навигацию (реферер = тот же домен).
+        # Открываем карты сразу с гео-вьюпортом KZ, чтобы регион не «уполз» в Москву.
         page.wait_for_timeout(random.randint(1000, 2500))
-        page.goto("https://yandex.ru/maps/", wait_until="domcontentloaded", timeout=20000)
+        warm_maps = f"{maps_url()}?lang={LANG}" + (f"&ll={MAP_LL}&z={MAP_Z}" if MAP_LL else "")
+        page.goto(warm_maps, wait_until="domcontentloaded", timeout=20000)
         page.wait_for_timeout(random.randint(2000, 4000))
 
         # Проверяем капчу на картах
@@ -2255,11 +2757,11 @@ def _do_search(page: Page, query: str, headless: bool) -> bool:
         except Exception:
             continue
 
-    # Fallback: goto по URL (менее естественно, но работает)
+    # Fallback: goto по URL (менее естественно, но работает).
+    # URL несёт lang=ru_RU и вьюпорт KZ (ll+z), чтобы выдача была казахстанской.
     log.debug("Строка поиска не найдена — используем goto")
-    encoded_query = urllib.parse.quote(query)
     page.goto(
-        f"https://yandex.ru/maps/?text={encoded_query}",
+        search_url(query),
         wait_until="domcontentloaded", timeout=30000,
     )
     return True
@@ -2377,7 +2879,7 @@ def _search_with_retry(
                 page.wait_for_timeout(wait_sec * 1000)
                 # Возвращаемся на карты перед retry
                 try:
-                    page.goto("https://yandex.ru/maps/", wait_until="domcontentloaded", timeout=15000)
+                    page.goto(maps_url(), wait_until="domcontentloaded", timeout=15000)
                     page.wait_for_timeout(random.randint(2000, 4000))
                 except Exception:
                     pass
@@ -2479,7 +2981,18 @@ def print_stats(orgs: list[Organization], label: str = "Результаты") -
     with_email = sum(1 for o in orgs if o.email)
     with_social = sum(1 for o in orgs if o.social_links)
     with_coords = sum(1 for o in orgs if o.latitude)
-    with_rating = [float(o.rating.replace(",", ".")) for o in orgs if o.rating]
+    with_id = sum(1 for o in orgs if o.org_id)
+    with_desc = sum(1 for o in orgs if o.description)
+    with_hours = sum(1 for o in orgs if o.working_hours)
+    with_features = sum(1 for o in orgs if o.features)
+    ads = sum(1 for o in orgs if o.is_advert == "да")
+    rating_vals = []
+    for o in orgs:
+        try:
+            rating_vals.append(float(o.rating.replace(",", ".")))
+        except (ValueError, AttributeError):
+            pass
+    with_rating = rating_vals
     avg_rating = sum(with_rating) / len(with_rating) if with_rating else 0
 
     # Категории (топ-5)
@@ -2495,11 +3008,16 @@ def print_stats(orgs: list[Organization], label: str = "Результаты") -
     print(f"  {label}")
     print(f"{'=' * 50}")
     print(f"  Всего организаций:  {total}")
+    print(f"  С ID организации:   {with_id} ({with_id * 100 // total}%)")
     print(f"  С телефоном:        {with_phone} ({with_phone * 100 // total}%)")
     print(f"  С сайтом:           {with_website} ({with_website * 100 // total}%)")
     print(f"  С email:            {with_email} ({with_email * 100 // total}%)")
     print(f"  С соцсетями:        {with_social} ({with_social * 100 // total}%)")
     print(f"  С координатами:     {with_coords} ({with_coords * 100 // total}%)")
+    print(f"  С часами работы:    {with_hours} ({with_hours * 100 // total}%)")
+    print(f"  С описанием:        {with_desc} ({with_desc * 100 // total}%)")
+    print(f"  С особенностями:    {with_features} ({with_features * 100 // total}%)")
+    print(f"  Рекламных:          {ads} ({ads * 100 // total}%)")
     if with_rating:
         print(f"  Средний рейтинг:    {avg_rating:.1f} (из {len(with_rating)} оценок)")
     if top_cats:
@@ -2705,40 +3223,45 @@ def run_category_parser(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Парсер организаций с Яндекс.Карт — по запросу или по категориям (аналог 2ГИС)",
+        description="Парсер организаций с Яндекс.Карт Казахстана (yandex.kz) — по запросу или по категориям (аналог 2ГИС)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""\
 Примеры:
   # По запросу
-  python yandex_parser.py "кофейни Москва"
-  python yandex_parser.py "автосервис Казань" -n 200 -o авто.xlsx
+  python yandex_parser.py "кофейни Алматы"
+  python yandex_parser.py "автосервис Астана" -n 200 -o авто.xlsx --api-intercept
 
   # По категориям
-  python yandex_parser.py --city Москва --category еда
-  python yandex_parser.py --city СПб --category авто красота -n 100
-  python yandex_parser.py --city Казань --all-categories
+  python yandex_parser.py --city Алматы --category еда
+  python yandex_parser.py --city Шымкент --category авто красота -n 100
+  python yandex_parser.py --city Астана --all-categories --api-intercept
+
+  # Другой домен / явный вьюпорт
+  python yandex_parser.py "аптеки Ташкент" --tld uz
+  python yandex_parser.py "кафе" --ll 76.8897,43.2389 --z 13
 
   # С прокси
-  python yandex_parser.py "аптеки Москва" --proxy http://user:pass@host:port
-  python yandex_parser.py --city Москва --category еда --proxy-file proxies.txt
+  python yandex_parser.py "аптеки Алматы" --proxy http://user:pass@host:port
+  python yandex_parser.py --city Алматы --category еда --proxy-file proxies.txt
 
   # Продолжить прерванный сбор
-  python yandex_parser.py --city Москва --all-categories --resume Москва_categories.xlsx
+  python yandex_parser.py --city Алматы --all-categories --resume Алматы_categories.xlsx
 
   # Экспорт в JSON
-  python yandex_parser.py "рестораны Москва" -o results.json
+  python yandex_parser.py "рестораны Караганда" -o results.json
 
   # С конфиг-файлом
   python yandex_parser.py --config config.yaml
 
-  # Автодетект селекторов / список категорий
-  python yandex_parser.py --detect-selectors --no-headless
+  # Списки и автодетект
   python yandex_parser.py --list-categories
+  python yandex_parser.py --list-cities
+  python yandex_parser.py --detect-selectors --no-headless
 """,
     )
     parser.add_argument(
         "query", nargs="?", default=None,
-        help='Поисковый запрос, напр. "кофейни Москва"',
+        help='Поисковый запрос, напр. "кофейни Алматы"',
     )
     parser.add_argument(
         "--list-categories", action="store_true",
@@ -2809,8 +3332,42 @@ def main() -> None:
         "--reset-selectors", action="store_true",
         help="Удалить кеш селекторов и вернуться к hardcoded",
     )
+    parser.add_argument(
+        "--tld", type=str, default=None, choices=list(DOMAIN_REGISTRY),
+        help="Домен Яндекс.Карт: kz (по умолчанию, Казахстан), ru, com, by, uz, tr",
+    )
+    parser.add_argument(
+        "--ll", type=str, default=None,
+        help="Центр карты 'долгота,широта' для гео-привязки выдачи (переопределяет город)",
+    )
+    parser.add_argument(
+        "--z", type=int, default=None,
+        help="Зум карты (11-13 город, 10 пригороды, 14 центр; по умолчанию 12)",
+    )
+    parser.add_argument(
+        "--list-cities", action="store_true",
+        help="Показать список городов Казахстана с координатами и выйти",
+    )
 
     args = parser.parse_args()
+
+    # Домен/язык — резолвим РАНО (до ветки --detect-selectors, которая уже
+    # строит URL). Приоритет: --tld > config['tld'/'domain'] > 'kz'.
+    tld = args.tld
+    if not tld and args.config:
+        _cfg = load_config(args.config)
+        tld = _cfg.get("tld") or _cfg.get("domain")
+    set_domain(tld)
+    # Ранний вьюпорт (для --detect-selectors и как дефолт): CLI ll/city, иначе центр страны.
+    set_viewport(city=args.city, ll=args.ll, z=args.z)
+
+    # Список городов KZ
+    if args.list_cities:
+        print("\n🇰🇿 Города Казахстана (ll = долгота,широта):\n")
+        for name, ll in KZ_CITIES.items():
+            print(f"  {name:20s} ll={ll}")
+        print(f"\n  Вся страна:          ll={KZ_COUNTRY_LL} (z=5)")
+        return
 
     # Режим: показать текущие селекторы
     if args.show_selectors:
@@ -2850,7 +3407,7 @@ def main() -> None:
 
     # Режим: принудительная детекция селекторов
     if args.detect_selectors:
-        test_query = args.query or "кофейни Москва"
+        test_query = args.query or "кофейни Алматы"
         print(f"\nЗапуск автодетекта селекторов (запрос: «{test_query}»)…\n")
 
         # Удаляем старый кеш для чистого детекта
@@ -2861,9 +3418,8 @@ def main() -> None:
             _, ctx = _create_browser_context(pw, headless=not args.no_headless)
             page = _setup_page(ctx)
 
-            encoded = urllib.parse.quote(test_query)
             page.goto(
-                f"https://yandex.ru/maps/?text={encoded}",
+                search_url(test_query),
                 wait_until="domcontentloaded", timeout=30000,
             )
             page.wait_for_timeout(4000)
@@ -2898,7 +3454,7 @@ def main() -> None:
                     href = link.get_attribute("href") or ""
                 if href:
                     if href.startswith("/"):
-                        href = f"https://yandex.ru{href}"
+                        href = f"{base_url()}{href}"
                     print(f"\n--- Детекция селекторов карточки ({href[:60]}…) ---")
                     page.goto(href, wait_until="domcontentloaded", timeout=15000)
                     page.wait_for_timeout(3000)
@@ -2941,6 +3497,11 @@ def main() -> None:
             arg_key = k.replace("-", "_")
             if hasattr(args, arg_key) and getattr(args, arg_key) is None:
                 setattr(args, arg_key, v)
+
+    # Повторно резолвим вьюпорт после мерджа конфига (city/ll/z могли прийти из конфига).
+    set_viewport(city=args.city, ll=args.ll, z=args.z)
+    log.info("Домен: %s | язык: %s | вьюпорт: ll=%s z=%s",
+             DOMAIN, LANG, MAP_LL or "—", MAP_Z)
 
     # Прокси
     proxy_url = None
@@ -3037,12 +3598,24 @@ def interactive_menu() -> None:
     """Пошаговое интерактивное меню — запускается при старте без аргументов."""
     print()
     print("=" * 55)
-    print("  YAmap — Парсер Яндекс.Карт")
+    print("  YAmap — Парсер Яндекс.Карт (Казахстан)")
     print("=" * 55)
     print()
 
+    # 0. Домен (по умолчанию Казахстан)
+    tld = _input_choice(
+        "Регион/домен [1]:",
+        ["Казахстан (yandex.kz)", "Россия (yandex.ru)", "yandex.com", "yandex.by", "yandex.uz"],
+        allow_empty=True,
+    ) or "Казахстан (yandex.kz)"
+    _tld_map = {
+        "Казахстан (yandex.kz)": "kz", "Россия (yandex.ru)": "ru",
+        "yandex.com": "com", "yandex.by": "by", "yandex.uz": "uz",
+    }
+    set_domain(_tld_map.get(tld, "kz"))
+
     # 1. Режим работы
-    print("Выберите режим:")
+    print("\nВыберите режим:")
     mode = _input_choice(
         "Номер:",
         [
@@ -3071,13 +3644,15 @@ def interactive_menu() -> None:
     categories_input: list[str] = []
 
     if mode == "Поиск по запросу":
-        query = input("\nПоисковый запрос (напр. кофейни Москва): ").strip()
+        query = input("\nПоисковый запрос (напр. кофейни Алматы): ").strip()
         if not query:
             print("Запрос не может быть пустым!")
             return
 
     elif mode in ("Парсинг по категориям (как 2ГИС)", "Все категории города"):
-        city = input("\nГород: ").strip()
+        if DOMAIN == "yandex.kz":
+            print("\nГорода Казахстана: " + ", ".join(list(KZ_CITIES)[:9]) + " …")
+        city = input("\nГород (напр. Алматы): ").strip()
         if not city:
             print("Город не может быть пустым!")
             return
@@ -3198,6 +3773,11 @@ def interactive_menu() -> None:
         return
 
     print()
+
+    # Гео-привязка выдачи к городу (важно для KZ, чтобы регион не «уполз»).
+    set_viewport(city=city)
+    log.info("Домен: %s | язык: %s | вьюпорт: ll=%s z=%s",
+             DOMAIN, LANG, MAP_LL or "—", MAP_Z)
 
     # 9. Запуск
     if query:
