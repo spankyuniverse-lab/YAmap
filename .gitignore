@@ -8,3 +8,6 @@ results/
 .browser_profile/
 .yandex_cookies.json
 selectors_cache.json
+logs/
+reports/
+*.json

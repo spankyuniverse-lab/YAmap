@@ -204,6 +204,128 @@ def search_url(query: str, with_viewport: bool = True) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Постоянные отчёты и логи (сохраняются АВТОМАТИЧЕСКИ при каждом запуске)
+#
+#   logs/yamap_<дата>.log     — полный лог всего происходящего (DEBUG)
+#   reports/<время>_<метка>.json + .md — отчёт по каждому прогону
+#   reports/history.jsonl     — история всех запусков (по строке на прогон)
+# ---------------------------------------------------------------------------
+
+LOGS_DIR = Path("logs")
+REPORTS_DIR = Path("reports")
+_RUN_ERRORS: list[str] = []
+_file_logging_ready = False
+
+
+def setup_file_logging() -> Path:
+    """Включить запись ВСЕХ логов в файл (в дополнение к консоли). Идемпотентно."""
+    global _file_logging_ready
+    LOGS_DIR.mkdir(exist_ok=True)
+    log_path = LOGS_DIR / f"yamap_{time.strftime('%Y-%m-%d')}.log"
+    if _file_logging_ready:
+        return log_path
+    root = logging.getLogger()
+    handler = logging.FileHandler(log_path, encoding="utf-8")
+    handler.setLevel(logging.DEBUG)
+    handler.setFormatter(logging.Formatter(
+        "%(asctime)s  %(levelname)-8s  %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+    root.addHandler(handler)
+    # В файл пишем DEBUG, но консоль оставляем на INFO (не засоряем вывод).
+    root.setLevel(logging.DEBUG)
+    for h in root.handlers:
+        if isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler):
+            h.setLevel(logging.INFO)
+    _file_logging_ready = True
+    log.info("Логи пишутся в файл: %s", log_path)
+    return log_path
+
+
+def record_error(msg: str) -> None:
+    """Зафиксировать ошибку/инцидент для попадания в отчёт."""
+    _RUN_ERRORS.append(f"{time.strftime('%H:%M:%S')}  {msg}")
+
+
+def _report_to_md(r: dict) -> str:
+    """Человекочитаемый Markdown-отчёт."""
+    st = r.get("stats", {})
+    lines = [
+        f"# Отчёт YAmap — {r.get('timestamp', '')}",
+        "",
+        f"- **Режим:** {r.get('mode', '')}",
+        f"- **Метка:** {r.get('label', '')}",
+        f"- **Домен:** {r.get('domain', '')}  | язык: {r.get('lang', '')}",
+        f"- **Вьюпорт:** ll={r.get('viewport_ll', '—')} z={r.get('viewport_z', '')}",
+        f"- **Параметры:** max={r.get('max_results', '')}, api_intercept={r.get('api_intercept', '')}, "
+        f"detail={r.get('detail', '')}, headless={r.get('headless', '')}, proxy={r.get('proxy', '')}",
+        f"- **Длительность:** {r.get('duration_sec', '')} c",
+        f"- **Капч поймано:** {r.get('captchas', 0)}",
+        f"- **Файл результатов:** {r.get('output', '')}",
+        "",
+        "## Итоги сбора",
+        "",
+        f"- Всего организаций: **{st.get('total', 0)}**",
+    ]
+    cov = st.get("coverage", {})
+    if cov:
+        lines.append("- Покрытие полей:")
+        for k, v in cov.items():
+            lines.append(f"    - {k}: {v['count']} ({v['pct']}%)")
+    if st.get("avg_rating"):
+        lines.append(f"- Средний рейтинг: {st['avg_rating']}")
+    if st.get("top_categories"):
+        lines.append("- Топ категории:")
+        for name, cnt in st["top_categories"]:
+            lines.append(f"    - {name}: {cnt}")
+    if r.get("per_query"):
+        lines += ["", "## По запросам/категориям", ""]
+        for q, cnt in r["per_query"].items():
+            lines.append(f"- {q}: {cnt}")
+    if r.get("errors"):
+        lines += ["", "## Инциденты / ошибки", ""]
+        for e in r["errors"]:
+            lines.append(f"- {e}")
+    return "\n".join(lines) + "\n"
+
+
+def save_run_report(meta: dict, stats: dict) -> Path | None:
+    """Сохранить отчёт о прогоне (JSON + Markdown) и дописать history.jsonl.
+
+    Вызывается автоматически в конце каждого прогона (даже при частичном сборе).
+    """
+    try:
+        REPORTS_DIR.mkdir(exist_ok=True)
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        label = re.sub(r"[^\w-]+", "_", str(meta.get("label", "run")))[:40].strip("_") or "run"
+        stem = f"{ts}_{label}"
+        report = {
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            **meta,
+            "stats": stats,
+            "errors": list(_RUN_ERRORS),
+        }
+        (REPORTS_DIR / f"{stem}.json").write_text(
+            json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+        (REPORTS_DIR / f"{stem}.md").write_text(_report_to_md(report), encoding="utf-8")
+        with open(REPORTS_DIR / "history.jsonl", "a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "timestamp": report["timestamp"],
+                "label": meta.get("label"),
+                "mode": meta.get("mode"),
+                "domain": meta.get("domain"),
+                "total": stats.get("total"),
+                "captchas": meta.get("captchas"),
+                "duration_sec": meta.get("duration_sec"),
+                "output": meta.get("output"),
+                "errors": len(_RUN_ERRORS),
+            }, ensure_ascii=False) + "\n")
+        log.info("Отчёт сохранён: reports/%s.json (+ .md), история → reports/history.jsonl", stem)
+        return REPORTS_DIR / f"{stem}.json"
+    except Exception as exc:
+        log.debug("Не удалось сохранить отчёт: %s", exc)
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Data model
 # ---------------------------------------------------------------------------
 
@@ -2994,22 +3116,31 @@ def _save_auto(orgs: list[Organization], out_path: Path) -> None:
         save_xlsx(orgs, out_path)
 
 
-def print_stats(orgs: list[Organization], label: str = "Результаты") -> None:
-    """Напечатать сводную статистику по собранным организациям."""
-    if not orgs:
-        print(f"\n{label}: 0 организаций")
-        return
+_COVERAGE_FIELDS = [
+    ("org_id", "С ID организации"),
+    ("phone", "С телефоном"),
+    ("website", "С сайтом"),
+    ("email", "С email"),
+    ("social_links", "С соцсетями"),
+    ("latitude", "С координатами"),
+    ("working_hours", "С часами работы"),
+    ("description", "С описанием"),
+    ("features", "С особенностями"),
+    ("photo_url_template", "С фото"),
+]
 
+
+def compute_stats(orgs: list[Organization]) -> dict[str, Any]:
+    """Посчитать сводную статистику (для консоли и для отчёта)."""
     total = len(orgs)
-    with_phone = sum(1 for o in orgs if o.phone)
-    with_website = sum(1 for o in orgs if o.website)
-    with_email = sum(1 for o in orgs if o.email)
-    with_social = sum(1 for o in orgs if o.social_links)
-    with_coords = sum(1 for o in orgs if o.latitude)
-    with_id = sum(1 for o in orgs if o.org_id)
-    with_desc = sum(1 for o in orgs if o.description)
-    with_hours = sum(1 for o in orgs if o.working_hours)
-    with_features = sum(1 for o in orgs if o.features)
+    if not total:
+        return {"total": 0, "coverage": {}, "avg_rating": None, "top_categories": [], "ads": 0}
+
+    coverage: dict[str, dict] = {}
+    for field, human in _COVERAGE_FIELDS:
+        cnt = sum(1 for o in orgs if getattr(o, field, ""))
+        coverage[human] = {"count": cnt, "pct": cnt * 100 // total}
+
     ads = sum(1 for o in orgs if o.is_advert == "да")
     rating_vals = []
     for o in orgs:
@@ -3017,10 +3148,8 @@ def print_stats(orgs: list[Organization], label: str = "Результаты") -
             rating_vals.append(float(o.rating.replace(",", ".")))
         except (ValueError, AttributeError):
             pass
-    with_rating = rating_vals
-    avg_rating = sum(with_rating) / len(with_rating) if with_rating else 0
+    avg_rating = round(sum(rating_vals) / len(rating_vals), 2) if rating_vals else None
 
-    # Категории (топ-5)
     cat_counts: dict[str, int] = {}
     for o in orgs:
         for c in (o.category or "").split(","):
@@ -3029,27 +3158,38 @@ def print_stats(orgs: list[Organization], label: str = "Результаты") -
                 cat_counts[c] = cat_counts.get(c, 0) + 1
     top_cats = sorted(cat_counts.items(), key=lambda x: -x[1])[:5]
 
+    return {
+        "total": total,
+        "coverage": coverage,
+        "ads": ads,
+        "avg_rating": avg_rating,
+        "rating_sample": len(rating_vals),
+        "top_categories": top_cats,
+    }
+
+
+def print_stats(orgs: list[Organization], label: str = "Результаты") -> dict[str, Any]:
+    """Напечатать сводную статистику и вернуть её как dict (для отчёта)."""
+    stats = compute_stats(orgs)
+    if not stats["total"]:
+        print(f"\n{label}: 0 организаций")
+        return stats
+
     print(f"\n{'=' * 50}")
     print(f"  {label}")
     print(f"{'=' * 50}")
-    print(f"  Всего организаций:  {total}")
-    print(f"  С ID организации:   {with_id} ({with_id * 100 // total}%)")
-    print(f"  С телефоном:        {with_phone} ({with_phone * 100 // total}%)")
-    print(f"  С сайтом:           {with_website} ({with_website * 100 // total}%)")
-    print(f"  С email:            {with_email} ({with_email * 100 // total}%)")
-    print(f"  С соцсетями:        {with_social} ({with_social * 100 // total}%)")
-    print(f"  С координатами:     {with_coords} ({with_coords * 100 // total}%)")
-    print(f"  С часами работы:    {with_hours} ({with_hours * 100 // total}%)")
-    print(f"  С описанием:        {with_desc} ({with_desc * 100 // total}%)")
-    print(f"  С особенностями:    {with_features} ({with_features * 100 // total}%)")
-    print(f"  Рекламных:          {ads} ({ads * 100 // total}%)")
-    if with_rating:
-        print(f"  Средний рейтинг:    {avg_rating:.1f} (из {len(with_rating)} оценок)")
-    if top_cats:
+    print(f"  Всего организаций:  {stats['total']}")
+    for human, info in stats["coverage"].items():
+        print(f"  {human + ':':20s}{info['count']} ({info['pct']}%)")
+    print(f"  {'Рекламных:':20s}{stats['ads']} ({stats['ads'] * 100 // stats['total']}%)")
+    if stats["avg_rating"] is not None:
+        print(f"  Средний рейтинг:    {stats['avg_rating']:.1f} (из {stats['rating_sample']} оценок)")
+    if stats["top_categories"]:
         print(f"  Топ категории:")
-        for cat, cnt in top_cats:
+        for cat, cnt in stats["top_categories"]:
             print(f"    {cat}: {cnt}")
     print(f"{'=' * 50}\n")
+    return stats
 
 
 def run_parser(
@@ -3068,6 +3208,13 @@ def run_parser(
     _warmed_up = False  # Сброс для нового контекста браузера
     out_path = Path(output)
 
+    # Отчётность: файл-лог + снимок счётчиков для этого прогона
+    setup_file_logging()
+    _RUN_ERRORS.clear()
+    _t_start = time.time()
+    _captchas_before = get_throttle().captcha_count
+    orgs: list[Organization] = []
+
     # Резюме: загружаем уже собранные данные
     resume = ResumeManager(resume_path) if resume_path else None
     if resume and resume.existing_count > 0:
@@ -3076,34 +3223,50 @@ def run_parser(
     # Промежуточное сохранение: каждые 25 организаций сбрасываем в файл
     on_org, incremental_orgs = _make_incremental_saver(out_path, save_every=25)
 
-    with sync_playwright() as pw:
-        _, ctx = _create_browser_context(pw, headless, proxy_url=proxy_url)
-        page = _setup_page(ctx)
+    try:
+        with sync_playwright() as pw:
+            _, ctx = _create_browser_context(pw, headless, proxy_url=proxy_url)
+            page = _setup_page(ctx)
 
-        orgs = _search_with_retry(
-            page, query, max_results, scroll_pause, api_intercept,
-            on_org=on_org, headless=headless,
-        )
+            orgs = _search_with_retry(
+                page, query, max_results, scroll_pause, api_intercept,
+                on_org=on_org, headless=headless,
+            )
 
-        for org in orgs:
-            org.search_query = query
+            for org in orgs:
+                org.search_query = query
 
-        # Фильтруем уже известные (из резюме)
-        if resume:
-            before = len(orgs)
-            orgs = [o for o in orgs if not resume.is_known(o.name, o.address)]
-            if before != len(orgs):
-                log.info("Резюме: пропущено %d уже собранных", before - len(orgs))
-            orgs = resume.existing_orgs() + orgs
+            # Фильтруем уже известные (из резюме)
+            if resume:
+                before = len(orgs)
+                orgs = [o for o in orgs if not resume.is_known(o.name, o.address)]
+                if before != len(orgs):
+                    log.info("Резюме: пропущено %d уже собранных", before - len(orgs))
+                orgs = resume.existing_orgs() + orgs
 
-        if detail:
-            _enrich_orgs(ctx, orgs)
+            if detail:
+                _enrich_orgs(ctx, orgs)
 
-        # Persistent context сохраняет всё автоматически при закрытии
-        ctx.close()
+            # Persistent context сохраняет всё автоматически при закрытии
+            ctx.close()
+    except Exception as exc:
+        record_error(f"Критическая ошибка прогона: {exc}")
+        log.error("Прогон прерван ошибкой: %s", exc)
 
     _save_auto(orgs, out_path)
-    print_stats(orgs)
+    stats = print_stats(orgs)
+    save_run_report({
+        "mode": "search",
+        "label": query,
+        "query": query,
+        "domain": DOMAIN, "lang": LANG,
+        "viewport_ll": MAP_LL, "viewport_z": MAP_Z,
+        "max_results": max_results, "api_intercept": api_intercept,
+        "detail": detail, "headless": headless, "proxy": bool(proxy_url),
+        "output": str(out_path),
+        "duration_sec": round(time.time() - _t_start, 1),
+        "captchas": get_throttle().captcha_count - _captchas_before,
+    }, stats)
     return orgs
 
 
@@ -3130,6 +3293,12 @@ def run_category_parser(
     results: dict[str, list[Organization]] = {}
     seen_global: set[str] = set()
 
+    # Отчётность
+    setup_file_logging()
+    _RUN_ERRORS.clear()
+    _t_start = time.time()
+    _captchas_before = get_throttle().captcha_count
+
     # Резюме
     resume = ResumeManager(resume_path) if resume_path else None
     if resume and resume.existing_count > 0:
@@ -3150,7 +3319,8 @@ def run_category_parser(
     else:
         cat_iter_tqdm = None
 
-    with sync_playwright() as pw:
+    try:
+      with sync_playwright() as pw:
         _, ctx = _create_browser_context(pw, headless, proxy_url=proxy_url)
         page = _setup_page(ctx)
 
@@ -3168,6 +3338,9 @@ def run_category_parser(
                 page, full_query, max_results_per_category,
                 scroll_pause, api_intercept, headless=headless,
             )
+            if not orgs:
+                record_error(f"Пустой результат по запросу «{full_query}» "
+                             f"(возможна капча/блокировка)")
 
             # Дедупликация по имени+адресу
             unique_orgs: list[Organization] = []
@@ -3217,6 +3390,9 @@ def run_category_parser(
 
         # Persistent context сохраняет всё автоматически при закрытии
         ctx.close()
+    except Exception as exc:
+        record_error(f"Критическая ошибка прогона: {exc}")
+        log.error("Прогон прерван ошибкой: %s", exc)
 
     # Финальное сохранение
     all_orgs: list[Organization] = []
@@ -3238,7 +3414,22 @@ def run_category_parser(
 
     total_orgs = len(all_orgs)
     log.info("Всего собрано: %d организаций по %d категориям", total_orgs, total_queries)
-    print_stats(all_orgs, label=f"Статистика: {city}")
+    stats = print_stats(all_orgs, label=f"Статистика: {city}")
+    # Автоматический отчёт о прогоне (+ разбивка по категориям)
+    save_run_report({
+        "mode": "categories",
+        "label": city,
+        "city": city,
+        "categories": categories,
+        "domain": DOMAIN, "lang": LANG,
+        "viewport_ll": MAP_LL, "viewport_z": MAP_Z,
+        "max_results": max_results_per_category, "api_intercept": api_intercept,
+        "detail": detail, "headless": headless, "proxy": bool(proxy_url),
+        "output": str(out_path),
+        "duration_sec": round(time.time() - _t_start, 1),
+        "captchas": get_throttle().captcha_count - _captchas_before,
+        "per_query": {q: len(v) for q, v in results.items()},
+    }, stats)
     return results
 
 
@@ -3385,6 +3576,8 @@ def main() -> None:
     set_domain(tld)
     # Ранний вьюпорт (для --detect-selectors и как дефолт): CLI ll/city, иначе центр страны.
     set_viewport(city=args.city, ll=args.ll, z=args.z)
+    # Логи всего происходящего пишутся в файл автоматически.
+    setup_file_logging()
 
     # Список городов KZ
     if args.list_cities:
