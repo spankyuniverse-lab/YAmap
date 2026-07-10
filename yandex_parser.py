@@ -1689,6 +1689,7 @@ def scroll_and_parse(
 
     orgs: list[Organization] = []
     parsed_indices: set[int] = set()
+    seen_keys: set[str] = set()   # дедуп по содержимому (имя+адрес)
     stale_rounds = 0
     max_stale = 10
 
@@ -1709,13 +1710,19 @@ def scroll_and_parse(
                 break
             try:
                 org = parse_snippet(page, i)
+                # Дедуп по содержимому: селектор карточки может матчить
+                # вложенные обёртки (search-snippet-view__body/__content и т.п.),
+                # из-за чего одна организация парсится 2–3 раза — отсекаем дубли.
                 if org.name:
-                    orgs.append(org)
-                    if on_org:
-                        on_org(org, len(orgs))
-                    new_parsed += 1
-                    if pbar:
-                        pbar.update(1)
+                    key = _dedup_key(org)
+                    if key not in seen_keys:
+                        seen_keys.add(key)
+                        orgs.append(org)
+                        if on_org:
+                            on_org(org, len(orgs))
+                        new_parsed += 1
+                        if pbar:
+                            pbar.update(1)
             except Exception as exc:
                 log.debug("Ошибка парсинга сниппета #%d: %s", i, exc)
             parsed_indices.add(i)
