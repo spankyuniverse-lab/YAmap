@@ -1654,6 +1654,99 @@ def _click_show_more(page: Page) -> bool:
     return False
 
 
+# JS: за ОДИН проход извлекаем все видимые сниппеты (имя/адрес/…/ссылка).
+# Так мы избегаем квадратичной сложности: раньше parse_snippet вызывал
+# page.locator(item).nth(i) + ~7 под-запросов НА КАЖДЫЙ индекс, пере-сканируя
+# растущий DOM — из-за этого скролл замедлялся до десятков секунд на элемент.
+_JS_COLLECT_SNIPPETS = """(sels) => {
+    const q = (el, s) => {
+        if (!s) return "";
+        const n = el.querySelector(s);
+        return n ? (n.textContent || "").trim() : "";
+    };
+    const cards = document.querySelectorAll(sels.item);
+    const seen = new Set();
+    const out = [];
+    for (const card of cards) {
+        const name = q(card, sels.snippet_title);
+        if (!name) continue;  // обёртки/оверлеи без названия пропускаем
+        const address = q(card, sels.snippet_address);
+        const key = name + "|" + address;
+        if (seen.has(key)) continue;  // дедуп вложенных обёрток в пределах прохода
+        seen.add(key);
+        let href = "";
+        if (sels.link) {
+            const a = card.querySelector(sels.link);
+            if (a) href = a.getAttribute("href") || "";
+        }
+        if (!href) {
+            const a = card.querySelector('a[href*="/org/"]');
+            if (a) href = a.getAttribute("href") || "";
+        }
+        out.push({
+            name, address,
+            category: q(card, sels.snippet_category),
+            rating: q(card, sels.snippet_rating),
+            reviews: q(card, sels.snippet_reviews),
+            hours: q(card, sels.snippet_hours),
+            href,
+        });
+    }
+    return out;
+}"""
+
+
+def _collect_visible_snippets(page: Page) -> list[Organization]:
+    """Собрать ВСЕ видимые сниппеты одним JS-проходом (быстро, без O(n²))."""
+    engine = get_selector_engine()
+    sels = {
+        "item": engine.get("item"),
+        "snippet_title": engine.get("snippet_title"),
+        "snippet_address": engine.get("snippet_address"),
+        "snippet_category": engine.get("snippet_category"),
+        "snippet_rating": engine.get("snippet_rating"),
+        "snippet_reviews": engine.get("snippet_reviews"),
+        "snippet_hours": engine.get("snippet_hours"),
+        "link": engine.get("link"),
+    }
+    try:
+        rows = page.evaluate(_JS_COLLECT_SNIPPETS, sels)
+    except Exception as exc:
+        log.debug("JS-сбор сниппетов не удался (%s), fallback на поштучный parse", exc)
+        return _collect_visible_snippets_fallback(page)
+
+    orgs: list[Organization] = []
+    for r in rows:
+        org = Organization()
+        org.name = r.get("name", "")
+        org.address = r.get("address", "")
+        org.category = r.get("category", "")
+        org.rating = r.get("rating", "")
+        raw_reviews = r.get("reviews", "")
+        if raw_reviews:
+            org.reviews_count = re.sub(r"[^\d]", "", raw_reviews)
+        org.working_hours = r.get("hours", "")
+        org.yandex_url = r.get("href", "")
+        org.seoname, org.org_id = _org_ids_from_url(org.yandex_url)
+        orgs.append(org)
+    return orgs
+
+
+def _collect_visible_snippets_fallback(page: Page) -> list[Organization]:
+    """Резервный поштучный сбор (если JS-проход недоступен)."""
+    engine = get_selector_engine()
+    count = page.locator(engine.get("item")).count()
+    orgs: list[Organization] = []
+    for i in range(count):
+        try:
+            org = parse_snippet(page, i)
+            if org.name:
+                orgs.append(org)
+        except Exception:
+            continue
+    return orgs
+
+
 # ---------------------------------------------------------------------------
 # Streaming scroll + parse: скроллим и парсим на лету
 # ---------------------------------------------------------------------------
@@ -1678,8 +1771,6 @@ def scroll_and_parse(
     Returns:
         Список собранных Organization.
     """
-    engine = get_selector_engine()
-    item_sel = engine.get("item")
     container_sel = _find_scroll_container(page)
 
     if container_sel:
@@ -1688,7 +1779,6 @@ def scroll_and_parse(
         log.warning("Скролл-контейнер не найден, используем mouse.wheel")
 
     orgs: list[Organization] = []
-    parsed_indices: set[int] = set()
     seen_keys: set[str] = set()   # дедуп по содержимому (имя+адрес)
     stale_rounds = 0
     max_stale = 10
@@ -1699,33 +1789,24 @@ def scroll_and_parse(
         pbar = tqdm(total=max_results, desc="Сбор организаций", unit="орг")
 
     while True:
-        cur_count = page.locator(item_sel).count()
-
-        # Парсим новые сниппеты, которые появились после скролла
+        # Один быстрый JS-проход по всем видимым сниппетам (без O(n²)).
+        # Дедуп по содержимому: селектор карточки матчит и вложенные обёртки
+        # (search-snippet-view__body/__content), из-за чего одна организация
+        # встречается 2–3 раза — отсекаем по имени+адресу.
         new_parsed = 0
-        for i in range(cur_count):
-            if i in parsed_indices:
-                continue
+        for org in _collect_visible_snippets(page):
             if len(orgs) >= max_results:
                 break
-            try:
-                org = parse_snippet(page, i)
-                # Дедуп по содержимому: селектор карточки может матчить
-                # вложенные обёртки (search-snippet-view__body/__content и т.п.),
-                # из-за чего одна организация парсится 2–3 раза — отсекаем дубли.
-                if org.name:
-                    key = _dedup_key(org)
-                    if key not in seen_keys:
-                        seen_keys.add(key)
-                        orgs.append(org)
-                        if on_org:
-                            on_org(org, len(orgs))
-                        new_parsed += 1
-                        if pbar:
-                            pbar.update(1)
-            except Exception as exc:
-                log.debug("Ошибка парсинга сниппета #%d: %s", i, exc)
-            parsed_indices.add(i)
+            key = _dedup_key(org)
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            orgs.append(org)
+            if on_org:
+                on_org(org, len(orgs))
+            new_parsed += 1
+            if pbar:
+                pbar.update(1)
 
         if new_parsed > 0:
             if not pbar:
@@ -3933,9 +4014,13 @@ def interactive_menu() -> None:
 
     # 5. Полнота данных
     print("\n--- Какие данные собирать? ---")
-    print("  1. Базовые (название, адрес, рейтинг, категория) — быстро")
-    print("  2. Полные (+ телефон, сайт, email, соцсети, координаты) — через карточки, медленнее")
-    print("  3. Полные через API (+ телефон, сайт, координаты) — перехват JSON, надёжнее")
+    print("  1. Базовые (название, адрес, рейтинг, категория) — очень быстро")
+    print("  3. ВСЁ через API (телефон, сайт, email, координаты, часы, метро,")
+    print("     особенности… — все поля) — перехват JSON во время скролла.")
+    print("     ⭐ РЕКОМЕНДУЕТСЯ: полнее и в разы быстрее.")
+    print("  2. Через карточки (--detail): открывает КАЖДУЮ карточку по очереди —")
+    print("     очень медленно (часы на сотни организаций) и рискованно по капче.")
+    print("     Нужен, только если API-перехват что-то не поймал.")
     data_mode = input("\nНомер [3]: ").strip() or "3"
 
     if data_mode == "1":
