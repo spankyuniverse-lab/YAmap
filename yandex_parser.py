@@ -2443,6 +2443,96 @@ def _extract_orgs_from_api_response(data: dict) -> list[Organization]:
     return orgs
 
 
+_API_URL_PATTERNS = (
+    "/maps/api/search", "/maps/api/business", "searchBusinesses",
+    "/api/search", "/search/", "fetchBusinessesInBbox",
+)
+
+
+def _merge_orgs(base: Organization, extra: Organization) -> Organization:
+    """Заполнить пустые поля base значениями из extra (base приоритетнее)."""
+    for f in FIELDNAMES:
+        if not getattr(base, f, "") and getattr(extra, f, ""):
+            setattr(base, f, getattr(extra, f))
+    return base
+
+
+class _ApiCollector:
+    """Фоновый перехватчик внутреннего API Яндекс.Карт.
+
+    Слушает XHR-ответы во время скролла (в ЛЮБОМ режиме) и копит богатые
+    карточки организаций по ключу имя+адрес. Потом ими обогащаем то, что
+    собрал DOM. Так полный набор полей получается даже без --api-intercept.
+    """
+
+    def __init__(self, dump: bool = False):
+        self.by_key: dict[str, Organization] = {}
+        self.matched = 0
+        self.dump = dump
+        self._dumped = 0
+
+    def on_response(self, response: Response) -> None:
+        url = response.url
+        if not any(p in url for p in _API_URL_PATTERNS):
+            return
+        if response.status != 200:
+            return
+        try:
+            body = response.json()
+        except Exception:
+            return
+        self.matched += 1
+        orgs = _extract_orgs_from_api_response(body)
+
+        # Диагностика: ответ пойман, но ничего не извлекли — покажем форму JSON.
+        if not orgs and self.matched <= 6:
+            try:
+                shape = list(body.keys()) if isinstance(body, dict) else type(body).__name__
+                log.warning("API-ответ пойман (%s…), но 0 организаций. Верхние ключи: %s",
+                            url.split("?")[0][-40:], shape)
+            except Exception:
+                pass
+
+        # Дамп сырого ответа для отладки (env YAMAP_DEBUG_API=1).
+        if self.dump and self._dumped < 4:
+            try:
+                REPORTS_DIR.mkdir(exist_ok=True)
+                self._dumped += 1
+                dump_path = REPORTS_DIR / f"api_raw_{self._dumped}.json"
+                dump_path.write_text(
+                    json.dumps(body, ensure_ascii=False, indent=2)[:5_000_000],
+                    encoding="utf-8")
+                log.info("Сырой API-ответ сохранён: %s (для отладки экстрактора)", dump_path)
+            except Exception:
+                pass
+
+        for org in orgs:
+            self.by_key[_dedup_key(org)] = org
+
+    def enrich(self, orgs: list[Organization]) -> list[Organization]:
+        """Слить DOM-организации с перехваченными из API (по имени+адресу)."""
+        if not self.by_key:
+            return orgs
+        result: list[Organization] = []
+        seen: set[str] = set()
+        for o in orgs:
+            k = _dedup_key(o)
+            rich = self.by_key.get(k)
+            if rich is not None:
+                # rich (API) как основа, добираем недостающее из DOM (напр. рейтинг сниппета)
+                merged = _merge_orgs(rich, o)
+                merged.search_query = o.search_query or merged.search_query
+                result.append(merged)
+                seen.add(k)
+            else:
+                result.append(o)
+        # организации, которые API поймал, а DOM пропустил
+        for k, rich in self.by_key.items():
+            if k not in seen:
+                result.append(rich)
+        return result
+
+
 def run_api_intercept(
     page: Page,
     max_results: int,
@@ -3069,15 +3159,35 @@ def _search_and_collect(
     # Запускаем автодетект на живой странице с результатами
     engine.probe_and_detect(page, mode="list")
 
-    if api_intercept:
-        log.info("Режим API-перехвата")
-        orgs = run_api_intercept(page, max_results, scroll_pause)
-    else:
-        # Стриминг: скроллим + парсим на лету
-        orgs = scroll_and_parse(page, max_results, scroll_pause, on_org=on_org)
+    # Фоновый перехват внутреннего API — ВСЕГДА (даже без --api-intercept):
+    # Яндекс сам дёргает API при поиске/скролле, ловим и обогащаем данные.
+    collector = _ApiCollector(dump=bool(os.environ.get("YAMAP_DEBUG_API")))
+    page.on("response", collector.on_response)
+    try:
+        if api_intercept:
+            log.info("Режим API-перехвата (приоритет данных из внутреннего API)")
+            orgs = run_api_intercept(page, max_results, scroll_pause)
+        else:
+            # Стриминг: скроллим + парсим DOM на лету (быстрый прогресс)
+            orgs = scroll_and_parse(page, max_results, scroll_pause, on_org=on_org)
+    finally:
+        page.remove_listener("response", collector.on_response)
+
+    # Обогащаем собранное данными из перехваченного API (телефон/координаты/ID/…)
+    before_rich = sum(1 for o in orgs if o.phone or o.org_id)
+    orgs = collector.enrich(orgs)
+    if collector.by_key:
+        after_rich = sum(1 for o in orgs if o.phone or o.org_id)
+        log.info("API-обогащение: пойман %d ответ(ов), карточек из API %d; "
+                 "организаций с телефоном/ID: %d → %d",
+                 collector.matched, len(collector.by_key), before_rich, after_rich)
+    elif not api_intercept:
+        log.warning("API-ответы не пойманы — данные только из DOM (название/адрес/"
+                    "категория/рейтинг). Запустите с --api-intercept и, при отладке, "
+                    "с переменной YAMAP_DEBUG_API=1, чтобы сохранить сырой ответ API.")
 
     log.info("Извлечено организаций: %d", len(orgs))
-    return orgs
+    return orgs[:max_results] if max_results else orgs
 
 
 def _search_with_retry(
