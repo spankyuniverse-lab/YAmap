@@ -36,7 +36,7 @@ import re
 import sys
 import time
 import urllib.parse
-from dataclasses import asdict, dataclass, field, fields
+from dataclasses import asdict, dataclass, field, fields, replace
 from pathlib import Path
 from typing import Any
 
@@ -459,8 +459,23 @@ def _normalize_for_dedup(text: str) -> str:
 
 
 def _dedup_key(org: Organization) -> str:
-    """Ключ для дедупликации организации."""
-    return f"{_normalize_for_dedup(org.name)}|{_normalize_for_dedup(org.address)}"
+    """Ключ для дедупликации организации.
+
+    Адрес нормализуется БЕЗ префикса города — иначе одна и та же организация
+    из сниппета («Алматы, ул. Абая, 1») и из API («ул. Абая, 1») получит разные
+    ключи и не сольётся/задублируется. Если адрес пуст (Яндекс иногда его не
+    показывает) — различаем точки сети по ID или координатам, чтобы разные
+    филиалы не схлопнулись в одну запись.
+    """
+    name = _normalize_for_dedup(org.name)
+    addr = _loose_addr(org.address)
+    if addr:
+        return f"{name}|{addr}"
+    if org.org_id:
+        return f"{name}|id:{org.org_id}"
+    if org.latitude and org.longitude:
+        return f"{name}|{org.latitude},{org.longitude}"
+    return f"{name}|"
 
 
 def _finalize_orgs(orgs: list["Organization"]) -> list["Organization"]:
@@ -2206,6 +2221,8 @@ def _find_api_items(data: dict) -> list[dict]:
 
 def _extract_total_count(data: dict) -> str:
     """Общее число результатов по запросу (для стоп-условия и как поле)."""
+    if not isinstance(data, dict):
+        return ""
     inner = data.get("data") if isinstance(data.get("data"), dict) else {}
     for holder in (data, inner):
         for key in ("totalResultCount", "total", "found", "count"):
@@ -2256,9 +2273,20 @@ def _org_from_item(feat: dict, total_count: str = "") -> Organization | None:
     org.geo_id = _s(props.get("geoId"))
 
     # --- адрес ---
-    org.address = props.get("address", "") or company.get("address", "")
-    org.full_address = props.get("fullAddress", "") or company.get("address", "")
-    org.additional_address = props.get("additionalAddress", "")
+    # В публичном GeoJSON company["address"] может быть словарём (Address-объект),
+    # а не строкой — берём только строковые значения, иначе адрес «протечёт» dict'ом.
+    company_addr = company.get("address")
+    if isinstance(company_addr, dict):
+        company_addr = company_addr.get("formatted_address") or company_addr.get("formatted") or ""
+    if not isinstance(company_addr, str):
+        company_addr = ""
+    dom_addr = props.get("address")
+    dom_addr = dom_addr if isinstance(dom_addr, str) else ""
+    full_addr = props.get("fullAddress")
+    full_addr = full_addr if isinstance(full_addr, str) else ""
+    org.address = dom_addr or company_addr
+    org.full_address = full_addr or company_addr
+    org.additional_address = props.get("additionalAddress", "") if isinstance(props.get("additionalAddress"), str) else ""
     org.country = props.get("country", "")
     ca = props.get("compositeAddress") or {}
     if isinstance(ca, dict):
@@ -2492,31 +2520,49 @@ _API_URL_PATTERNS = (
 
 
 def _merge_orgs(base: Organization, extra: Organization) -> Organization:
-    """Заполнить пустые поля base значениями из extra (base приоритетнее)."""
+    """Заполнить пустые поля base значениями из extra (base приоритетнее).
+
+    ВАЖНО: base мутируется — передавайте копию (replace(...)), если исходный
+    объект переиспользуется (напр. хранится в индексе коллектора)."""
     for f in FIELDNAMES:
         if not getattr(base, f, "") and getattr(extra, f, ""):
             setattr(base, f, getattr(extra, f))
     return base
 
 
+# Маркеры «это населённый пункт/регион», а не улица/дом — для отсечения
+# ведущего сегмента адреса при нестрогом сопоставлении.
+_LOCALITY_MARKERS = (
+    "область", "обл.", "район", "р-н", "město", "город",
+    "село", "с.", "посёлок", "поселок", "пос.", "аул", "станция",
+    "г.", "г ",
+)
+# Маркеры улицы/дома — такой сегмент НИКОГДА не отсекаем.
+_STREET_MARKERS = (
+    "ул", "улица", "просп", "проспект", "пр-т", "пер", "переулок",
+    "бульвар", "б-р", "шоссе", "ш.", "тракт", "проезд", "наб",
+    "микрорайон", "мкр", "дом", "здание", "квартал", "кв-л",
+)
+_KZ_CITIES_LOWER = {c.lower() for c in KZ_CITIES}
+
+
 def _loose_addr(address: str) -> str:
     """Адрес без ведущих сегментов «город/область/район» — для устойчивого
     сопоставления DOM и API (в сниппете «Алматы, ул. Абая, 1», в API «ул. Абая, 1»)."""
     parts = [p.strip() for p in (address or "").split(",")]
-    while parts and (
-        parts[0] in KZ_CITIES
-        or "область" in parts[0].lower()
-        or "район" in parts[0].lower()
-        or parts[0].lower().startswith("г ")
-        or parts[0].lower().startswith("г.")
-    ):
+    while len(parts) > 1:
+        seg = parts[0].lower()
+        is_street = any(m in seg for m in _STREET_MARKERS)
+        if is_street:
+            break
+        is_locality = (
+            seg in _KZ_CITIES_LOWER
+            or any(m in seg for m in _LOCALITY_MARKERS)
+        )
+        if not is_locality:
+            break
         parts.pop(0)
     return _normalize_for_dedup(", ".join(parts))
-
-
-def _loose_key(org: Organization) -> str:
-    """Нестрогий ключ: имя + адрес без префикса города (для fallback-слияния)."""
-    return f"{_normalize_for_dedup(org.name)}|{_loose_addr(org.address)}"
 
 
 class _ApiCollector:
@@ -2528,8 +2574,9 @@ class _ApiCollector:
     """
 
     def __init__(self, dump: bool = False):
+        # Ключ _dedup_key уже нормализует адрес без города, поэтому одного
+        # индекса достаточно, чтобы сопоставить DOM (с городом) и API (без города).
         self.by_key: dict[str, Organization] = {}
-        self.by_loose: dict[str, Organization] = {}  # fallback: имя+адрес без города
         self.matched = 0
         self.dump = dump
         self._dumped = 0
@@ -2570,15 +2617,10 @@ class _ApiCollector:
                 pass
 
         for org in orgs:
-            self.by_key[_dedup_key(org)] = org
-            self.by_loose.setdefault(_loose_key(org), org)
+            self.by_key.setdefault(_dedup_key(org), org)
 
     def enrich(self, orgs: list[Organization]) -> list[Organization]:
-        """Слить DOM-организации с перехваченными из API (по имени+адресу).
-
-        Сначала точный ключ (имя+адрес), затем нестрогий (адрес без города) —
-        чтобы обогащение срабатывало даже при разном форматировании адреса.
-        """
+        """Слить DOM-организации с перехваченными из API (по имени+адресу без города)."""
         if not self.by_key:
             return orgs
         result: list[Organization] = []
@@ -2586,14 +2628,14 @@ class _ApiCollector:
         for o in orgs:
             k = _dedup_key(o)
             rich = self.by_key.get(k)
-            if rich is None:
-                rich = self.by_loose.get(_loose_key(o))
             if rich is not None:
-                # rich (API) как основа, добираем недостающее из DOM (напр. рейтинг сниппета)
-                merged = _merge_orgs(rich, o)
+                # rich (API) как основа + недостающее из DOM (напр. рейтинг сниппета).
+                # Копируем rich, чтобы не мутировать объект в индексе (иначе повторное
+                # сопоставление другой DOM-записи увидело бы уже слитые данные).
+                merged = _merge_orgs(replace(rich), o)
                 merged.search_query = o.search_query or merged.search_query
                 result.append(merged)
-                used_keys.add(_dedup_key(rich))
+                used_keys.add(k)
             else:
                 result.append(o)
         # организации, которые API поймал, а DOM пропустил
@@ -3184,23 +3226,31 @@ def _search_and_collect(
     pre_pause = throttle.get_pause(base_ms=1000)
     page.wait_for_timeout(pre_pause)
 
-    # Вводим запрос через строку поиска (как человек)
-    _do_search(page, query, headless)
-    page.wait_for_timeout(random.randint(2500, 4500))
+    # ВАЖНО: вешаем перехватчик API ДО отправки поиска — первый (и часто
+    # единственный) ответ /maps/api/search приходит сразу после ввода запроса,
+    # а не при скролле. Если подписаться позже, данные первой страницы теряются.
+    collector = _ApiCollector(dump=bool(os.environ.get("YAMAP_DEBUG_API")))
+    page.on("response", collector.on_response)
+    try:
+        # Вводим запрос через строку поиска (как человек)
+        _do_search(page, query, headless)
+        page.wait_for_timeout(random.randint(2500, 4500))
 
-    # Проверка CAPTCHA
-    if detect_captcha(page):
-        throttle.on_captcha()
-        if not handle_captcha(page, headless):
-            log.error("CAPTCHA не решена, пропускаю запрос: %s", query)
-            return []
-    else:
-        throttle.on_success()
+        # Проверка CAPTCHA
+        if detect_captcha(page):
+            throttle.on_captcha()
+            if not handle_captcha(page, headless):
+                log.error("CAPTCHA не решена, пропускаю запрос: %s", query)
+                return []
+        else:
+            throttle.on_success()
 
-    return _collect_current_results(
-        page, query, max_results, scroll_pause, api_intercept,
-        on_org=on_org, headless=headless,
-    )
+        return _collect_current_results(
+            page, query, max_results, scroll_pause, api_intercept,
+            on_org=on_org, headless=headless, collector=collector,
+        )
+    finally:
+        page.remove_listener("response", collector.on_response)
 
 
 def _collect_current_results(
@@ -3211,50 +3261,52 @@ def _collect_current_results(
     api_intercept: bool,
     on_org: Any = None,
     headless: bool = True,
+    collector: "_ApiCollector | None" = None,
 ) -> list[Organization]:
     """Дождаться результатов на уже открытой странице и собрать их.
 
-    Отделено от навигации, чтобы переиспользовать в grid-свипе (несколько
-    вьюпортов на один запрос).
+    Отделено от навигации, чтобы переиспользовать в grid-свипе. Если collector
+    передан (уже подписан ДО поиска — так ловится первая страница), используем
+    его; иначе создаём и подписываем свой.
     """
     engine = get_selector_engine()
+    owns_collector = collector is None
+    if owns_collector:
+        collector = _ApiCollector(dump=bool(os.environ.get("YAMAP_DEBUG_API")))
+        page.on("response", collector.on_response)
 
-    # Ждём появления результатов, пробуем несколько селекторов
-    item_sel = engine.get("item")
-    found = False
-    for sel_candidate in [item_sel, ITEM_SEL, "[class*='search-snippet']", "[class*='serp-item']"]:
-        if not sel_candidate:
-            continue
-        try:
-            page.wait_for_selector(sel_candidate, timeout=5000)
-            found = True
-            break
-        except Exception:
-            continue
-
-    if not found:
-        # Может быть CAPTCHA появилась после загрузки
-        if detect_captcha(page):
-            if not handle_captcha(page, headless):
-                return []
-            try:
-                page.wait_for_selector(item_sel or ITEM_SEL, timeout=10000)
-                found = True
-            except Exception:
-                pass
-
-    if not found:
-        log.warning("Результаты не найдены для запроса: %s", query)
-        return []
-
-    # Запускаем автодетект на живой странице с результатами
-    engine.probe_and_detect(page, mode="list")
-
-    # Фоновый перехват внутреннего API — ВСЕГДА (даже без --api-intercept):
-    # Яндекс сам дёргает API при поиске/скролле, ловим и обогащаем данные.
-    collector = _ApiCollector(dump=bool(os.environ.get("YAMAP_DEBUG_API")))
-    page.on("response", collector.on_response)
     try:
+        # Ждём появления результатов, пробуем несколько селекторов
+        item_sel = engine.get("item")
+        found = False
+        for sel_candidate in [item_sel, ITEM_SEL, "[class*='search-snippet']", "[class*='serp-item']"]:
+            if not sel_candidate:
+                continue
+            try:
+                page.wait_for_selector(sel_candidate, timeout=5000)
+                found = True
+                break
+            except Exception:
+                continue
+
+        if not found:
+            # Может быть CAPTCHA появилась после загрузки
+            if detect_captcha(page):
+                if not handle_captcha(page, headless):
+                    return []
+                try:
+                    page.wait_for_selector(item_sel or ITEM_SEL, timeout=10000)
+                    found = True
+                except Exception:
+                    pass
+
+        if not found:
+            log.warning("Результаты не найдены для запроса: %s", query)
+            return []
+
+        # Запускаем автодетект на живой странице с результатами
+        engine.probe_and_detect(page, mode="list")
+
         if api_intercept:
             log.info("Режим API-перехвата (приоритет данных из внутреннего API)")
             orgs = run_api_intercept(page, max_results, scroll_pause)
@@ -3262,7 +3314,8 @@ def _collect_current_results(
             # Стриминг: скроллим + парсим DOM на лету (быстрый прогресс)
             orgs = scroll_and_parse(page, max_results, scroll_pause, on_org=on_org)
     finally:
-        page.remove_listener("response", collector.on_response)
+        if owns_collector:
+            page.remove_listener("response", collector.on_response)
 
     # Обогащаем собранное данными из перехваченного API (телефон/координаты/ID/…)
     before_rich = sum(1 for o in orgs if o.phone or o.org_id)
@@ -3306,27 +3359,35 @@ def _grid_search(
         MAP_LL, MAP_Z = ll, GRID_TILE_Z
         log.info("Grid [%d/%d] вьюпорт ll=%s z=%d", idx, len(tiles), ll, GRID_TILE_Z)
         page.wait_for_timeout(throttle.get_pause(base_ms=1000))
+
+        # Подписываем перехватчик API ДО goto — ответ первой страницы тайла
+        # приходит сразу при загрузке, а не при скролле.
+        collector = _ApiCollector(dump=bool(os.environ.get("YAMAP_DEBUG_API")))
+        page.on("response", collector.on_response)
         try:
-            page.goto(search_url(query), wait_until="domcontentloaded", timeout=30000)
-        except Exception as exc:
-            log.warning("Grid: не удалось открыть тайл %s: %s", ll, exc)
-            record_error(f"Grid-тайл {ll} не открылся: {exc}")
-            continue
-        page.wait_for_timeout(random.randint(2000, 3500))
-
-        if detect_captcha(page):
-            throttle.on_captcha()
-            if not handle_captcha(page, headless):
-                record_error(f"Grid-тайл {ll}: капча не решена")
+            try:
+                page.goto(search_url(query), wait_until="domcontentloaded", timeout=30000)
+            except Exception as exc:
+                log.warning("Grid: не удалось открыть тайл %s: %s", ll, exc)
+                record_error(f"Grid-тайл {ll} не открылся: {exc}")
                 continue
-        else:
-            throttle.on_success()
+            page.wait_for_timeout(random.randint(2000, 3500))
 
-        remaining = max_results - len(all_orgs) if max_results else 0
-        tile_orgs = _collect_current_results(
-            page, query, remaining or max_results, scroll_pause, api_intercept,
-            on_org=None, headless=headless,
-        )
+            if detect_captcha(page):
+                throttle.on_captcha()
+                if not handle_captcha(page, headless):
+                    record_error(f"Grid-тайл {ll}: капча не решена")
+                    continue
+            else:
+                throttle.on_success()
+
+            remaining = max_results - len(all_orgs) if max_results else 0
+            tile_orgs = _collect_current_results(
+                page, query, remaining or max_results, scroll_pause, api_intercept,
+                on_org=None, headless=headless, collector=collector,
+            )
+        finally:
+            page.remove_listener("response", collector.on_response)
         added = 0
         for o in tile_orgs:
             k = _dedup_key(o)
@@ -3455,10 +3516,9 @@ def _make_incremental_saver(out_path: Path, save_every: int = 25):
         all_orgs.append(org)
         if index % save_every == 0:
             try:
-                if out_path.suffix == ".csv":
-                    save_csv(list(all_orgs), out_path)
-                else:
-                    save_xlsx(list(all_orgs), out_path)
+                # Учитываем формат по расширению (.csv/.json/.xlsx),
+                # иначе в .json-файл писались бы XLSX-байты.
+                _save_auto(list(all_orgs), out_path)
                 log.info("Промежуточное сохранение: %d записей → %s", len(all_orgs), out_path)
             except Exception as exc:
                 log.debug("Ошибка промежуточного сохранения: %s", exc)
