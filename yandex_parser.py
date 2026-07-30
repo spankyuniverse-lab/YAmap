@@ -436,6 +436,21 @@ def _dedup_key(org: Organization) -> str:
     return f"{_normalize_for_dedup(org.name)}|{_normalize_for_dedup(org.address)}"
 
 
+def _finalize_orgs(orgs: list["Organization"]) -> list["Organization"]:
+    """Финальная подчистка перед сохранением: убрать записи без названия и дубли."""
+    out: list[Organization] = []
+    seen: set[str] = set()
+    for o in orgs:
+        if not (o.name or "").strip():
+            continue
+        k = _dedup_key(o)
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(o)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Proxy rotation
 # ---------------------------------------------------------------------------
@@ -2457,6 +2472,26 @@ def _merge_orgs(base: Organization, extra: Organization) -> Organization:
     return base
 
 
+def _loose_addr(address: str) -> str:
+    """Адрес без ведущих сегментов «город/область/район» — для устойчивого
+    сопоставления DOM и API (в сниппете «Алматы, ул. Абая, 1», в API «ул. Абая, 1»)."""
+    parts = [p.strip() for p in (address or "").split(",")]
+    while parts and (
+        parts[0] in KZ_CITIES
+        or "область" in parts[0].lower()
+        or "район" in parts[0].lower()
+        or parts[0].lower().startswith("г ")
+        or parts[0].lower().startswith("г.")
+    ):
+        parts.pop(0)
+    return _normalize_for_dedup(", ".join(parts))
+
+
+def _loose_key(org: Organization) -> str:
+    """Нестрогий ключ: имя + адрес без префикса города (для fallback-слияния)."""
+    return f"{_normalize_for_dedup(org.name)}|{_loose_addr(org.address)}"
+
+
 class _ApiCollector:
     """Фоновый перехватчик внутреннего API Яндекс.Карт.
 
@@ -2467,6 +2502,7 @@ class _ApiCollector:
 
     def __init__(self, dump: bool = False):
         self.by_key: dict[str, Organization] = {}
+        self.by_loose: dict[str, Organization] = {}  # fallback: имя+адрес без города
         self.matched = 0
         self.dump = dump
         self._dumped = 0
@@ -2508,27 +2544,34 @@ class _ApiCollector:
 
         for org in orgs:
             self.by_key[_dedup_key(org)] = org
+            self.by_loose.setdefault(_loose_key(org), org)
 
     def enrich(self, orgs: list[Organization]) -> list[Organization]:
-        """Слить DOM-организации с перехваченными из API (по имени+адресу)."""
+        """Слить DOM-организации с перехваченными из API (по имени+адресу).
+
+        Сначала точный ключ (имя+адрес), затем нестрогий (адрес без города) —
+        чтобы обогащение срабатывало даже при разном форматировании адреса.
+        """
         if not self.by_key:
             return orgs
         result: list[Organization] = []
-        seen: set[str] = set()
+        used_keys: set[str] = set()
         for o in orgs:
             k = _dedup_key(o)
             rich = self.by_key.get(k)
+            if rich is None:
+                rich = self.by_loose.get(_loose_key(o))
             if rich is not None:
                 # rich (API) как основа, добираем недостающее из DOM (напр. рейтинг сниппета)
                 merged = _merge_orgs(rich, o)
                 merged.search_query = o.search_query or merged.search_query
                 result.append(merged)
-                seen.add(k)
+                used_keys.add(_dedup_key(rich))
             else:
                 result.append(o)
         # организации, которые API поймал, а DOM пропустил
         for k, rich in self.by_key.items():
-            if k not in seen:
+            if k not in used_keys:
                 result.append(rich)
         return result
 
@@ -3451,6 +3494,13 @@ def run_parser(
         record_error(f"Критическая ошибка прогона: {exc}")
         log.error("Прогон прерван ошибкой: %s", exc)
 
+    # Финальная подчистка: дубли + пустые названия
+    before_fin = len(orgs)
+    orgs = _finalize_orgs(orgs)
+    if before_fin != len(orgs):
+        log.info("Финальная подчистка: %d → %d (убрано дублей/пустых: %d)",
+                 before_fin, len(orgs), before_fin - len(orgs))
+
     _save_auto(orgs, out_path)
     stats = print_stats(orgs)
     save_run_report({
@@ -3483,6 +3533,8 @@ def run_category_parser(
     api_intercept: bool = False,
     proxy_url: str | None = None,
     resume_path: Path | None = None,
+    cooldown_every: int = 0,
+    cooldown_sec: int = 90,
 ) -> dict[str, list[Organization]]:
     """Парсер по категориям: для каждой категории запускает поиск «категория город»."""
     global _warmed_up
@@ -3568,6 +3620,13 @@ def run_category_parser(
             except Exception as exc:
                 log.debug("Ошибка промежуточного сохранения: %s", exc)
 
+            # Профилактический cooldown каждые N категорий — снижает риск бана
+            # на объёме (даёт анти-фроду «остыть»).
+            if cooldown_every and q_idx < total_queries and q_idx % cooldown_every == 0:
+                log.info("Cooldown: пауза %d сек после %d категорий (профилактика капчи)…",
+                         cooldown_sec, q_idx)
+                page.wait_for_timeout(cooldown_sec * 1000)
+
             # Адаптивная пауза между категориями (увеличивается при капчах)
             if q_idx < total_queries:
                 throttle = get_throttle()
@@ -3601,6 +3660,8 @@ def run_category_parser(
     if resume:
         existing = resume.existing_orgs()
         all_orgs = existing + all_orgs
+
+    all_orgs = _finalize_orgs(all_orgs)
 
     suffix = out_path.suffix.lower()
     if suffix == ".json":
@@ -3712,6 +3773,14 @@ def main() -> None:
     parser.add_argument(
         "--scroll-pause", type=float, default=1.0,
         help="Пауза между прокрутками в секундах (по умолчанию 1.0)",
+    )
+    parser.add_argument(
+        "--cooldown-every", type=int, default=0,
+        help="Профилактическая пауза каждые N категорий (0 = выкл; помогает против капчи на объёме)",
+    )
+    parser.add_argument(
+        "--cooldown-sec", type=int, default=90,
+        help="Длительность cooldown-паузы в секундах (по умолчанию 90)",
     )
     parser.add_argument(
         "--api-intercept", action="store_true",
@@ -3951,6 +4020,8 @@ def main() -> None:
             api_intercept=args.api_intercept,
             proxy_url=proxy_url,
             resume_path=resume_path,
+            cooldown_every=args.cooldown_every,
+            cooldown_sec=args.cooldown_sec,
         )
 
         total = sum(len(v) for v in results.values())
