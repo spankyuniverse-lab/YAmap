@@ -245,25 +245,34 @@ _file_logging_ready = False
 
 
 def setup_file_logging() -> Path:
-    """Включить запись ВСЕХ логов в файл (в дополнение к консоли). Идемпотентно."""
+    """Включить запись ВСЕХ логов в файл (в дополнение к консоли). Идемпотентно.
+
+    Никогда не роняет запуск: при ошибке (нет прав, read-only ФС) молча
+    остаёмся на консольном логировании.
+    """
     global _file_logging_ready
-    LOGS_DIR.mkdir(exist_ok=True)
     log_path = LOGS_DIR / f"yamap_{time.strftime('%Y-%m-%d')}.log"
     if _file_logging_ready:
         return log_path
-    root = logging.getLogger()
-    handler = logging.FileHandler(log_path, encoding="utf-8")
-    handler.setLevel(logging.DEBUG)
-    handler.setFormatter(logging.Formatter(
-        "%(asctime)s  %(levelname)-8s  %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
-    root.addHandler(handler)
-    # В файл пишем DEBUG, но консоль оставляем на INFO (не засоряем вывод).
-    root.setLevel(logging.DEBUG)
-    for h in root.handlers:
-        if isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler):
-            h.setLevel(logging.INFO)
-    _file_logging_ready = True
-    log.info("Логи пишутся в файл: %s", log_path)
+    try:
+        LOGS_DIR.mkdir(exist_ok=True)
+        root = logging.getLogger()
+        handler = logging.FileHandler(log_path, encoding="utf-8")
+        handler.setLevel(logging.DEBUG)
+        handler.setFormatter(logging.Formatter(
+            "%(asctime)s  %(levelname)-8s  %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+        root.addHandler(handler)
+        # В файл пишем DEBUG, но консоль оставляем на INFO (не засоряем вывод).
+        root.setLevel(logging.DEBUG)
+        for h in root.handlers:
+            if isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler):
+                h.setLevel(logging.INFO)
+        _file_logging_ready = True
+        log.info("Логи пишутся в файл: %s", log_path)
+    except Exception as exc:
+        # Не критично — продолжаем с консольным логом.
+        _file_logging_ready = True
+        log.warning("Не удалось включить файловое логирование (%s) — только консоль", exc)
     return log_path
 
 
@@ -1839,10 +1848,11 @@ def scroll_and_parse(
     seen_keys: set[str] = set()   # дедуп по содержимому (имя+адрес)
     stale_rounds = 0
     max_stale = 10
+    unlimited = max_results <= 0   # max_results<=0 → без лимита
 
     # Прогресс-бар (если tqdm установлен)
     pbar = None
-    if HAS_TQDM:
+    if HAS_TQDM and not unlimited:
         pbar = tqdm(total=max_results, desc="Сбор организаций", unit="орг")
 
     while True:
@@ -1852,7 +1862,7 @@ def scroll_and_parse(
         # встречается 2–3 раза — отсекаем по имени+адресу.
         new_parsed = 0
         for org in _collect_visible_snippets(page):
-            if len(orgs) >= max_results:
+            if not unlimited and len(orgs) >= max_results:
                 break
             key = _dedup_key(org)
             if key in seen_keys:
@@ -1870,14 +1880,15 @@ def scroll_and_parse(
                 log.info("Собрано: %d организаций (новых: +%d)", len(orgs), new_parsed)
             stale_rounds = 0
         else:
-            # Новых сниппетов нет — пробуем «Показать ещё»
-            if not _click_show_more(page):
-                stale_rounds += 1
-            else:
-                stale_rounds = 0
+            # Новых сниппетов нет — пробуем «Показать ещё» (best-effort).
+            # НЕ сбрасываем stale_rounds по факту клика: реальный прогресс
+            # проверится в следующем проходе (new_parsed>0). Иначе кнопка,
+            # которая ничего не подгружает, зациклила бы сбор навсегда.
+            _click_show_more(page)
+            stale_rounds += 1
 
         # Проверяем лимиты
-        if len(orgs) >= max_results:
+        if not unlimited and len(orgs) >= max_results:
             log.info("Достигнут лимит: %d / %d", len(orgs), max_results)
             break
 
@@ -2413,11 +2424,13 @@ def _org_from_item(feat: dict, total_count: str = "") -> Organization | None:
                 break
 
     # --- часы работы / статус ---
-    org.working_hours = props.get("workingTimeText", "")
+    org.working_hours = props.get("workingTimeText") or ""
     if not org.working_hours:
         hours = company.get("Hours") or company.get("hours") or {}
         if isinstance(hours, dict):
-            org.working_hours = hours.get("text", "")
+            org.working_hours = hours.get("text") or ""
+    if not isinstance(org.working_hours, str):
+        org.working_hours = _s(org.working_hours)
     cws = props.get("currentWorkingStatus") or {}
     if isinstance(cws, dict):
         if "isOpenNow" in cws:
@@ -2689,37 +2702,43 @@ def run_api_intercept(
 
     container_sel = _find_scroll_container(page)
     stale_rounds = 0
+    unlimited = max_results <= 0
 
     pbar = None
-    if HAS_TQDM:
+    if HAS_TQDM and not unlimited:
         pbar = tqdm(total=max_results, desc="API-перехват", unit="орг")
 
-    while len(all_orgs) < max_results:
-        prev = len(all_orgs)
-        _human_scroll(page, container_sel)
-        _click_show_more(page)
+    try:
+        while unlimited or len(all_orgs) < max_results:
+            prev = len(all_orgs)
+            _human_scroll(page, container_sel)
+            _click_show_more(page)
 
-        # Рандомизированная пауза
-        jitter = scroll_pause * random.uniform(0.7, 1.3)
-        page.wait_for_timeout(int(jitter * 1000))
+            # Рандомизированная пауза
+            jitter = scroll_pause * random.uniform(0.7, 1.3)
+            page.wait_for_timeout(int(jitter * 1000))
 
-        new_count = len(all_orgs) - prev
-        if new_count > 0:
-            stale_rounds = 0
-            if pbar:
-                pbar.update(new_count)
-        else:
-            stale_rounds += 1
+            new_count = len(all_orgs) - prev
+            if new_count > 0:
+                stale_rounds = 0
+                if pbar:
+                    pbar.update(new_count)
+            else:
+                stale_rounds += 1
 
-        if stale_rounds >= 12:
-            log.info("API: новые данные не поступают, завершаем (всего %d)", len(all_orgs))
-            break
+            if stale_rounds >= 12:
+                log.info("API: новые данные не поступают, завершаем (всего %d)", len(all_orgs))
+                break
+    finally:
+        # Слушатель и прогресс-бар снимаем всегда, даже при исключении/капче.
+        if pbar:
+            pbar.close()
+        try:
+            page.remove_listener("response", on_response)
+        except Exception:
+            pass
 
-    if pbar:
-        pbar.close()
-
-    page.remove_listener("response", on_response)
-    return all_orgs[:max_results]
+    return all_orgs[:max_results] if not unlimited else all_orgs
 
 
 # ---------------------------------------------------------------------------
@@ -2814,6 +2833,15 @@ HEADERS_RU = {
 }
 
 
+_ILLEGAL_XLSX_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+
+
+def _clean_cell(value: Any) -> str:
+    """Убрать control-символы, недопустимые в XML/XLSX (иначе openpyxl падает)."""
+    s = value if isinstance(value, str) else _s(value)
+    return _ILLEGAL_XLSX_RE.sub("", s)
+
+
 def _write_sheet(ws, orgs: list[Organization]) -> None:
     """Записать организации на один лист Excel."""
     from openpyxl.styles import Font
@@ -2827,7 +2855,7 @@ def _write_sheet(ws, orgs: list[Organization]) -> None:
     for row_idx, org in enumerate(orgs, 2):
         d = asdict(org)
         for col_idx, field in enumerate(cols, 1):
-            ws.cell(row=row_idx, column=col_idx, value=d.get(field, ""))
+            ws.cell(row=row_idx, column=col_idx, value=_clean_cell(d.get(field, "")))
 
     for col in ws.columns:
         max_len = max((len(str(c.value or "")) for c in col), default=10)
@@ -2843,12 +2871,17 @@ def save_xlsx(orgs: list[Organization], path: Path) -> None:
         return
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Яндекс.Карты"
-    _write_sheet(ws, orgs)
-    wb.save(path)
-    log.info("XLSX сохранён: %s (%d записей)", path, len(orgs))
+    try:
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Яндекс.Карты"
+        _write_sheet(ws, orgs)
+        wb.save(path)
+        log.info("XLSX сохранён: %s (%d записей)", path, len(orgs))
+    except Exception as exc:
+        # Не теряем данные из-за ошибки openpyxl — падаем в CSV.
+        log.warning("Ошибка сохранения XLSX (%s) — сохраняю CSV", exc)
+        save_csv(orgs, path.with_suffix(".csv"))
 
 
 def save_xlsx_by_categories(
@@ -2867,31 +2900,41 @@ def save_xlsx_by_categories(
         return
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    wb = Workbook()
-
-    # Сводный лист со всеми результатами
-    ws_all = wb.active
-    ws_all.title = "Все результаты"
     all_orgs: list[Organization] = []
     for orgs in results.values():
         all_orgs.extend(orgs)
-    _write_sheet(ws_all, all_orgs)
+    try:
+        wb = Workbook()
 
-    # Отдельный лист на каждую категорию
-    for query, orgs in results.items():
-        if not orgs:
-            continue
-        # Имя листа Excel ≤ 31 символ, без спецсимволов
-        sheet_name = re.sub(r'[\\/*?\[\]:]', '', query)[:31]
-        ws = wb.create_sheet(title=sheet_name)
-        _write_sheet(ws, orgs)
+        # Сводный лист со всеми результатами
+        ws_all = wb.active
+        ws_all.title = "Все результаты"
+        _write_sheet(ws_all, all_orgs)
 
-    wb.save(path)
-    total = sum(len(v) for v in results.values())
-    log.info(
-        "XLSX сохранён: %s (%d записей, %d листов)",
-        path, total, len(wb.sheetnames),
-    )
+        # Отдельный лист на каждую категорию
+        used_names: set[str] = {"Все результаты"}
+        for query, orgs in results.items():
+            if not orgs:
+                continue
+            # Имя листа Excel ≤ 31 символ, без спецсимволов, уникальное
+            base = re.sub(r'[\\/*?\[\]:]', '', query)[:31] or "лист"
+            sheet_name = base
+            n = 2
+            while sheet_name in used_names:
+                sheet_name = f"{base[:28]}_{n}"
+                n += 1
+            used_names.add(sheet_name)
+            ws = wb.create_sheet(title=sheet_name)
+            _write_sheet(ws, orgs)
+
+        wb.save(path)
+        log.info(
+            "XLSX сохранён: %s (%d записей, %d листов)",
+            path, len(all_orgs), len(wb.sheetnames),
+        )
+    except Exception as exc:
+        log.warning("Ошибка сохранения XLSX (%s) — сохраняю сводный CSV", exc)
+        save_csv(all_orgs, path.with_suffix(".csv"))
 
 
 # ---------------------------------------------------------------------------
@@ -3857,7 +3900,12 @@ def run_category_parser(
     elif suffix == ".csv":
         save_csv(all_orgs, out_path)
     else:
-        save_xlsx_by_categories(results, out_path)
+        # Группируем ФИНАЛИЗИРОВАННЫЕ all_orgs (включая resume) по запросу,
+        # иначе XLSX терял бы ранее собранные организации из resume-файла.
+        grouped: dict[str, list[Organization]] = {}
+        for o in all_orgs:
+            grouped.setdefault(o.search_query or "Прочее", []).append(o)
+        save_xlsx_by_categories(grouped, out_path)
 
     total_orgs = len(all_orgs)
     log.info("Всего собрано: %d организаций по %d категориям", total_orgs, total_queries)
