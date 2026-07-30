@@ -2615,6 +2615,74 @@ def _extract_orgs_from_api_response(data: dict) -> list[Organization]:
     return orgs
 
 
+def _loads_loose(text: str) -> Any:
+    """Разобрать JSON из inline-скрипта (в т.ч. вида `var x = {...};`)."""
+    text = (text or "").strip()
+    if not text:
+        return None
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+    # Пробуем вырезать самый внешний {...} (жадно) и распарсить.
+    first = text.find("{")
+    last = text.rfind("}")
+    if 0 <= first < last:
+        try:
+            return json.loads(text[first:last + 1])
+        except Exception:
+            pass
+    return None
+
+
+_JS_GRAB_STATE_SCRIPTS = """() => {
+    const out = [];
+    // 1) Явные JSON-контейнеры Яндекс.Карт (SSR-состояние).
+    const sel = 'script[type="application/json"], script.config-view, ' +
+                'script.state-view, script[type="application/ld+json"]';
+    for (const s of document.querySelectorAll(sel)) {
+        const t = (s.textContent || '').trim();
+        if (t.length > 80) out.push(t);
+    }
+    // 2) Любые крупные скрипты с бизнес-маркерами (на случай var config=…).
+    for (const s of document.querySelectorAll('script')) {
+        const t = (s.textContent || '').trim();
+        if (t.length > 300 && (t.indexOf('CompanyMetaData') >= 0 ||
+            t.indexOf('"seoname"') >= 0 || t.indexOf('"coordinates"') >= 0 ||
+            t.indexOf('businessOid') >= 0)) {
+            out.push(t);
+        }
+    }
+    return out.slice(0, 12);
+}"""
+
+
+def _extract_orgs_from_page(page: Page) -> list[Organization]:
+    """Извлечь организации из inline-конфига страницы (SSR).
+
+    Яндекс встраивает полные карточки организаций в JSON внутри <script> на
+    самой странице (первый XHR /maps/api/search — лишь бутстрап). Отсюда
+    берём телефон/координаты/часы/рубрики надёжнее, чем из перехвата XHR.
+    """
+    try:
+        blobs = page.evaluate(_JS_GRAB_STATE_SCRIPTS)
+    except Exception as exc:
+        log.debug("SSR: не удалось получить скрипты страницы: %s", exc)
+        return []
+    orgs: list[Organization] = []
+    seen: set[str] = set()
+    for blob in blobs or []:
+        data = _loads_loose(blob)
+        if data is None:
+            continue
+        for o in _extract_orgs_from_api_response(data):
+            k = _dedup_key(o)
+            if k not in seen:
+                seen.add(k)
+                orgs.append(o)
+    return orgs
+
+
 _API_URL_PATTERNS = (
     "/maps/api/search", "/maps/api/business", "searchBusinesses",
     "/api/search", "/search/", "fetchBusinessesInBbox",
@@ -3453,6 +3521,20 @@ def _collect_current_results(
         # (флаг --api-intercept оставлен для совместимости; перехват API идёт
         #  фоном в любом режиме через collector.)
         orgs = scroll_and_parse(page, max_results, scroll_pause, on_org=on_org)
+
+        # SSR-обогащение: полные карточки Яндекс встраивает в inline-конфиг
+        # страницы (телефон/координаты/часы/рубрики) — кладём их в индекс
+        # коллектора, чтобы обогатить собранное из DOM.
+        try:
+            ssr_orgs = _extract_orgs_from_page(page)
+            if ssr_orgs:
+                for o in ssr_orgs:
+                    collector.by_key.setdefault(_dedup_key(o), o)
+                log.info("SSR: из inline-конфига страницы извлечено %d организаций",
+                         len(ssr_orgs))
+        except Exception as exc:
+            log.debug("SSR-извлечение не удалось: %s", exc)
+
         if api_intercept:
             # Доп. проход API-скролла — вдруг подтянет ещё страниц с богатыми данными.
             extra = run_api_intercept(page, max_results, scroll_pause)
