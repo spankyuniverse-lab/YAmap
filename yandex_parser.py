@@ -2207,19 +2207,79 @@ SOCIAL_PATTERNS = (
     "tiktok", "viber",
 )
 
+# Типы элементов выдачи, которые НЕ являются организациями — их отсекаем.
+_NON_BUSINESS_TYPES = {
+    "toponym", "route", "transit", "masstransit", "street", "metro_station",
+    "station", "stop", "district", "locality", "suggest", "adjust", "ad",
+}
+
+
+def _is_business_item(d: dict) -> bool:
+    """Похоже ли на карточку организации (по набору полей).
+
+    Требуем не просто имя+id (иначе ловятся значения фильтров вроде «АИ-92»),
+    а СИЛЬНЫЙ гео/бизнес-маркер: координаты/адрес/телефоны/CompanyMetaData/uri…
+    """
+    if not isinstance(d, dict):
+        return False
+    props = d.get("properties") if isinstance(d.get("properties"), dict) else d
+    has_name = bool(props.get("title") or props.get("name")
+                    or props.get("CompanyMetaData") or props.get("companyMetaData"))
+    if not has_name:
+        return False
+    # ВНИМАНИЕ: seoname/class/pluralName есть и у рубрик — их в маркеры НЕ берём.
+    strong = any(props.get(k) for k in (
+        "coordinates", "fullAddress", "CompanyMetaData", "companyMetaData",
+        "phones", "ratingData", "uri", "displayCoordinates", "compositeAddress",
+    ))
+    if not strong and d.get("geometry"):
+        strong = True
+    if not strong:
+        a = props.get("address")
+        strong = isinstance(a, str) and bool(a.strip())
+    return strong
+
+
+def _deep_find_business_list(node: Any, depth: int = 0) -> list[dict] | None:
+    """Рекурсивно найти самый крупный список dict'ов, похожих на организации.
+
+    Внутренний формат Яндекса меняется/варьируется — вместо жёсткого пути ищем
+    список карточек по признакам (имя + координаты/адрес/id/рубрики)."""
+    if depth > 9:
+        return None
+    best: list[dict] | None = None
+    if isinstance(node, list):
+        dicts = [x for x in node if isinstance(x, dict)]
+        if dicts:
+            sample = dicts[: min(12, len(dicts))]
+            hits = sum(1 for d in sample if _is_business_item(d))
+            if hits and hits >= max(1, len(sample) // 2):
+                best = dicts
+        for x in node:
+            cand = _deep_find_business_list(x, depth + 1)
+            if cand and (best is None or len(cand) > len(best)):
+                best = cand
+    elif isinstance(node, dict):
+        for v in node.values():
+            cand = _deep_find_business_list(v, depth + 1)
+            if cand and (best is None or len(cand) > len(best)):
+                best = cand
+    return best
+
 
 def _find_api_items(data: dict) -> list[dict]:
     """Найти массив организаций в JSON-конверте ответа (все известные формы)."""
     if not isinstance(data, dict):
         return []
     inner = data.get("data") if isinstance(data.get("data"), dict) else {}
-    # 1) прямые массивы на верхнем уровне и в data
+    # 1) прямые массивы на верхнем уровне и в data (быстрый путь)
     for holder in (data, inner):
-        for key in ("items", "results", "features"):
+        for key in ("items", "results", "features", "entities", "geoObjects",
+                    "searchResults", "orgs", "organizations"):
             arr = holder.get(key)
-            if isinstance(arr, list) and arr:
+            if isinstance(arr, list) and arr and any(_is_business_item(x) for x in arr[:12]):
                 return arr
-    # 2) SSR-конверт: stack[0].results.items
+    # 2) SSR-конверт: stack[*].results.items
     stack = data.get("stack") or inner.get("stack")
     if isinstance(stack, list):
         for frame in stack:
@@ -2227,6 +2287,11 @@ def _find_api_items(data: dict) -> list[dict]:
                 res = frame.get("results")
                 if isinstance(res, dict) and isinstance(res.get("items"), list):
                     return res["items"]
+    # 3) Универсальный fallback: рекурсивно ищем список карточек где угодно.
+    found = _deep_find_business_list(data)
+    if found:
+        log.debug("API items найдены рекурсивным поиском: %d шт.", len(found))
+        return found
     return []
 
 
@@ -2258,9 +2323,11 @@ def _org_from_item(feat: dict, total_count: str = "") -> Organization | None:
         return None
     company = props.get("CompanyMetaData") or props.get("companyMetaData") or {}
 
-    # Отсекаем не-организации (топонимы, рубрики, рекламные строки) — только для внутреннего формата
-    itype = props.get("type")
-    if not company and itype and itype != "business":
+    # Отсекаем только ЯВНЫЕ не-организации (топонимы/маршруты/остановки/станции).
+    # Раньше требовали type=='business', но реальный внутренний ответ может
+    # использовать другие значения type — тогда организации терялись целиком.
+    itype = (props.get("type") or "").lower()
+    if not company and itype in _NON_BUSINESS_TYPES:
         return None
 
     org = Organization()
@@ -2531,6 +2598,9 @@ _API_URL_PATTERNS = (
     "/api/search", "/search/", "fetchBusinessesInBbox",
 )
 
+# Глобальный счётчик дампов сырых API-ответов (для YAMAP_DEBUG_API).
+_API_DUMP_COUNTER = 0
+
 
 def _merge_orgs(base: Organization, extra: Organization) -> Organization:
     """Заполнить пустые поля base значениями из extra (base приоритетнее).
@@ -2617,15 +2687,19 @@ class _ApiCollector:
                 pass
 
         # Дамп сырого ответа для отладки (env YAMAP_DEBUG_API=1).
-        if self.dump and self._dumped < 4:
+        # Глобальный счётчик — чтобы поймать РАЗНЫЕ ответы (бутстрап И item-ответ),
+        # а не перезаписывать один файл на каждом тайле.
+        global _API_DUMP_COUNTER
+        if self.dump and _API_DUMP_COUNTER < 12:
             try:
                 REPORTS_DIR.mkdir(exist_ok=True)
-                self._dumped += 1
-                dump_path = REPORTS_DIR / f"api_raw_{self._dumped}.json"
+                _API_DUMP_COUNTER += 1
+                n_items = len(_find_api_items(body))
+                dump_path = REPORTS_DIR / f"api_raw_{_API_DUMP_COUNTER:02d}_{n_items}orgs.json"
                 dump_path.write_text(
                     json.dumps(body, ensure_ascii=False, indent=2)[:5_000_000],
                     encoding="utf-8")
-                log.info("Сырой API-ответ сохранён: %s (для отладки экстрактора)", dump_path)
+                log.info("Сырой API-ответ сохранён: %s (items=%d)", dump_path, n_items)
             except Exception:
                 pass
 
@@ -3350,12 +3424,22 @@ def _collect_current_results(
         # Запускаем автодетект на живой странице с результатами
         engine.probe_and_detect(page, mode="list")
 
+        # ВСЕГДА собираем через DOM-скролл — карточки надёжно рендерятся в DOM,
+        # тогда как первый /maps/api/search отдаёт лишь бутстрап (items:[]), а
+        # сами организации приходят следующими запросами. Скролл и подгружает
+        # их, и триггерит те самые API-ответы, которыми потом обогащаем данные.
+        # (флаг --api-intercept оставлен для совместимости; перехват API идёт
+        #  фоном в любом режиме через collector.)
+        orgs = scroll_and_parse(page, max_results, scroll_pause, on_org=on_org)
         if api_intercept:
-            log.info("Режим API-перехвата (приоритет данных из внутреннего API)")
-            orgs = run_api_intercept(page, max_results, scroll_pause)
-        else:
-            # Стриминг: скроллим + парсим DOM на лету (быстрый прогресс)
-            orgs = scroll_and_parse(page, max_results, scroll_pause, on_org=on_org)
+            # Доп. проход API-скролла — вдруг подтянет ещё страниц с богатыми данными.
+            extra = run_api_intercept(page, max_results, scroll_pause)
+            if extra:
+                merged_keys = {_dedup_key(o) for o in orgs}
+                for e in extra:
+                    if _dedup_key(e) not in merged_keys:
+                        orgs.append(e)
+                        merged_keys.add(_dedup_key(e))
     finally:
         if owns_collector:
             page.remove_listener("response", collector.on_response)
@@ -3368,13 +3452,13 @@ def _collect_current_results(
         log.info("API-обогащение: пойман %d ответ(ов), карточек из API %d; "
                  "организаций с телефоном/ID: %d → %d",
                  collector.matched, len(collector.by_key), before_rich, after_rich)
-    elif not api_intercept:
-        log.warning("API-ответы не пойманы — данные только из DOM (название/адрес/"
-                    "категория/рейтинг). Запустите с --api-intercept и, при отладке, "
-                    "с переменной YAMAP_DEBUG_API=1, чтобы сохранить сырой ответ API.")
+    else:
+        log.info("Организаций из API не извлечено (бутстрап/др. формат) — данные "
+                 "из DOM (название/адрес/категория/рейтинг). Для отладки экстрактора "
+                 "запустите с YAMAP_DEBUG_API=1 и пришлите reports/api_raw_*.json.")
 
     log.info("Извлечено организаций: %d", len(orgs))
-    return orgs[:max_results] if max_results else orgs
+    return orgs[:max_results] if (max_results and max_results > 0) else orgs
 
 
 def _grid_search(
