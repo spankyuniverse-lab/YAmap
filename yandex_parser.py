@@ -129,6 +129,33 @@ KZ_CITIES: dict[str, str] = {
 KZ_COUNTRY_LL = "66.9237,48.0196"   # весь Казахстан (регион 159), использовать с z=5
 DEFAULT_CITY_Z = 12                 # зум для сбора по городу
 
+# Grid-свип: Яндекс отдаёт ограниченное число результатов на один вьюпорт.
+# Чтобы собрать БОЛЬШЕ, проходим сеткой вьюпортов по площади города.
+GRID_SPAN_LON = 0.34   # ширина охвата города по долготе (°) ≈ 25 км
+GRID_SPAN_LAT = 0.22   # высота охвата по широте (°)
+GRID_TILE_Z = 14       # зум для отдельного тайла (плотнее = больше на тайл)
+
+
+def viewport_grid(center_ll: str, n: int,
+                  span_lon: float = GRID_SPAN_LON,
+                  span_lat: float = GRID_SPAN_LAT) -> list[str]:
+    """Сетка n×n центров вьюпортов вокруг center_ll ('lon,lat')."""
+    try:
+        lon0, lat0 = (float(x) for x in center_ll.split(","))
+    except (ValueError, AttributeError):
+        return [center_ll]
+    if n <= 1:
+        return [center_ll]
+    tiles: list[str] = []
+    for iy in range(n):
+        for ix in range(n):
+            fx = ix / (n - 1) - 0.5
+            fy = iy / (n - 1) - 0.5
+            lon = lon0 + fx * span_lon
+            lat = lat0 + fy * span_lat
+            tiles.append(f"{lon:.4f},{lat:.4f}")
+    return tiles
+
 # Таймзона/локаль браузера должны соответствовать домену (анти-фрод консистентность).
 DOMAIN_TZ: dict[str, str] = {
     "yandex.kz": "Asia/Almaty",
@@ -3170,6 +3197,28 @@ def _search_and_collect(
     else:
         throttle.on_success()
 
+    return _collect_current_results(
+        page, query, max_results, scroll_pause, api_intercept,
+        on_org=on_org, headless=headless,
+    )
+
+
+def _collect_current_results(
+    page: Page,
+    query: str,
+    max_results: int,
+    scroll_pause: float,
+    api_intercept: bool,
+    on_org: Any = None,
+    headless: bool = True,
+) -> list[Organization]:
+    """Дождаться результатов на уже открытой странице и собрать их.
+
+    Отделено от навигации, чтобы переиспользовать в grid-свипе (несколько
+    вьюпортов на один запрос).
+    """
+    engine = get_selector_engine()
+
     # Ждём появления результатов, пробуем несколько селекторов
     item_sel = engine.get("item")
     found = False
@@ -3188,7 +3237,6 @@ def _search_and_collect(
         if detect_captcha(page):
             if not handle_captcha(page, headless):
                 return []
-            # Пробуем ещё раз найти результаты
             try:
                 page.wait_for_selector(item_sel or ITEM_SEL, timeout=10000)
                 found = True
@@ -3233,6 +3281,69 @@ def _search_and_collect(
     return orgs[:max_results] if max_results else orgs
 
 
+def _grid_search(
+    page: Page,
+    query: str,
+    max_results: int,
+    scroll_pause: float,
+    api_intercept: bool,
+    tiles: list[str],
+    on_org: Any = None,
+    headless: bool = True,
+) -> list[Organization]:
+    """Собрать запрос по сетке вьюпортов (больше результатов, чем один вьюпорт).
+
+    Для каждого тайла переходим на его вьюпорт (goto с ll+z), собираем и
+    глобально дедуплицируем. Так обходим лимит выдачи Яндекса на один вид карты.
+    """
+    global MAP_LL, MAP_Z
+    _warmup(page, headless)
+    throttle = get_throttle()
+    all_orgs: list[Organization] = []
+    seen: set[str] = set()
+
+    for idx, ll in enumerate(tiles, 1):
+        MAP_LL, MAP_Z = ll, GRID_TILE_Z
+        log.info("Grid [%d/%d] вьюпорт ll=%s z=%d", idx, len(tiles), ll, GRID_TILE_Z)
+        page.wait_for_timeout(throttle.get_pause(base_ms=1000))
+        try:
+            page.goto(search_url(query), wait_until="domcontentloaded", timeout=30000)
+        except Exception as exc:
+            log.warning("Grid: не удалось открыть тайл %s: %s", ll, exc)
+            record_error(f"Grid-тайл {ll} не открылся: {exc}")
+            continue
+        page.wait_for_timeout(random.randint(2000, 3500))
+
+        if detect_captcha(page):
+            throttle.on_captcha()
+            if not handle_captcha(page, headless):
+                record_error(f"Grid-тайл {ll}: капча не решена")
+                continue
+        else:
+            throttle.on_success()
+
+        remaining = max_results - len(all_orgs) if max_results else 0
+        tile_orgs = _collect_current_results(
+            page, query, remaining or max_results, scroll_pause, api_intercept,
+            on_org=None, headless=headless,
+        )
+        added = 0
+        for o in tile_orgs:
+            k = _dedup_key(o)
+            if k in seen:
+                continue
+            seen.add(k)
+            all_orgs.append(o)
+            added += 1
+            if on_org:
+                on_org(o, len(all_orgs))
+        log.info("Grid [%d/%d]: +%d новых (всего %d)", idx, len(tiles), added, len(all_orgs))
+        if max_results and len(all_orgs) >= max_results:
+            break
+
+    return all_orgs[:max_results] if max_results else all_orgs
+
+
 def _search_with_retry(
     page: Page,
     query: str,
@@ -3242,8 +3353,17 @@ def _search_with_retry(
     on_org: Any = None,
     headless: bool = True,
     max_retries: int = 3,
+    tiles: list[str] | None = None,
 ) -> list[Organization]:
-    """Обёртка над _search_and_collect с retry при ошибках."""
+    """Обёртка над _search_and_collect с retry при ошибках.
+
+    Если задан tiles (grid-свип) — собираем по сетке вьюпортов (без retry-цикла,
+    т.к. свип сам устойчив к пропускам отдельных тайлов)."""
+    if tiles and len(tiles) > 1:
+        return _grid_search(
+            page, query, max_results, scroll_pause, api_intercept,
+            tiles, on_org=on_org, headless=headless,
+        )
     for attempt in range(1, max_retries + 1):
         try:
             orgs = _search_and_collect(
@@ -3443,11 +3563,15 @@ def run_parser(
     api_intercept: bool = False,
     proxy_url: str | None = None,
     resume_path: Path | None = None,
+    grid: int = 1,
 ) -> list[Organization]:
     """Парсер по одному поисковому запросу."""
     global _warmed_up
     _warmed_up = False  # Сброс для нового контекста браузера
     out_path = Path(output)
+    tiles = viewport_grid(MAP_LL, grid) if (grid > 1 and MAP_LL) else None
+    if tiles:
+        log.info("Grid-свип: %d вьюпортов (%dx%d) вокруг ll=%s", len(tiles), grid, grid, MAP_LL)
 
     # Отчётность: файл-лог + снимок счётчиков для этого прогона
     setup_file_logging()
@@ -3471,7 +3595,7 @@ def run_parser(
 
             orgs = _search_with_retry(
                 page, query, max_results, scroll_pause, api_intercept,
-                on_org=on_org, headless=headless,
+                on_org=on_org, headless=headless, tiles=tiles,
             )
 
             for org in orgs:
@@ -3535,10 +3659,14 @@ def run_category_parser(
     resume_path: Path | None = None,
     cooldown_every: int = 0,
     cooldown_sec: int = 90,
+    grid: int = 1,
 ) -> dict[str, list[Organization]]:
     """Парсер по категориям: для каждой категории запускает поиск «категория город»."""
     global _warmed_up
     _warmed_up = False  # Сброс для нового контекста браузера
+    tiles = viewport_grid(MAP_LL, grid) if (grid > 1 and MAP_LL) else None
+    if tiles:
+        log.info("Grid-свип: %d вьюпортов (%dx%d) на каждую категорию", len(tiles), grid, grid)
     out_path = Path(output)
     results: dict[str, list[Organization]] = {}
     seen_global: set[str] = set()
@@ -3586,7 +3714,7 @@ def run_category_parser(
 
             orgs = _search_with_retry(
                 page, full_query, max_results_per_category,
-                scroll_pause, api_intercept, headless=headless,
+                scroll_pause, api_intercept, headless=headless, tiles=tiles,
             )
             if not orgs:
                 record_error(f"Пустой результат по запросу «{full_query}» "
@@ -3781,6 +3909,11 @@ def main() -> None:
     parser.add_argument(
         "--cooldown-sec", type=int, default=90,
         help="Длительность cooldown-паузы в секундах (по умолчанию 90)",
+    )
+    parser.add_argument(
+        "--grid", type=int, default=1,
+        help="Grid-свип N×N вьюпортов по площади города — СИЛЬНО больше "
+             "результатов (напр. --grid 3 = 9 вьюпортов). По умолчанию 1 (выкл).",
     )
     parser.add_argument(
         "--api-intercept", action="store_true",
@@ -4022,6 +4155,7 @@ def main() -> None:
             resume_path=resume_path,
             cooldown_every=args.cooldown_every,
             cooldown_sec=args.cooldown_sec,
+            grid=args.grid,
         )
 
         total = sum(len(v) for v in results.values())
@@ -4045,6 +4179,7 @@ def main() -> None:
         api_intercept=args.api_intercept,
         proxy_url=proxy_url,
         resume_path=resume_path,
+        grid=args.grid,
     )
 
     print(f"\nГотово! Собрано {len(orgs)} организаций -> {output}")
