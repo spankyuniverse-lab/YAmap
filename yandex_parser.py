@@ -156,6 +156,28 @@ def viewport_grid(center_ll: str, n: int,
             tiles.append(f"{lon:.4f},{lat:.4f}")
     return tiles
 
+
+# Bounding box Казахстана (весь: запад Каспий → восток Алтай, юг → север).
+KZ_BBOX = (46.4, 40.5, 87.4, 55.5)   # (lon_min, lat_min, lon_max, lat_max)
+COUNTRY_STEP_DEG = 0.25              # шаг сетки по стране (°) ≈ 20 км (баланс охват/время)
+COUNTRY_TILE_Z = 12                  # зум тайла национального свипа
+
+
+def country_grid(step_deg: float = COUNTRY_STEP_DEG,
+                 bbox: tuple[float, float, float, float] = KZ_BBOX) -> list[str]:
+    """Полная сетка вьюпортов по всей территории страны (для сплошного сбора)."""
+    lon_min, lat_min, lon_max, lat_max = bbox
+    step = max(0.03, float(step_deg))   # защита от слишком мелкого шага
+    tiles: list[str] = []
+    lat = lat_min
+    while lat <= lat_max + 1e-9:
+        lon = lon_min
+        while lon <= lon_max + 1e-9:
+            tiles.append(f"{lon:.4f},{lat:.4f}")
+            lon += step
+        lat += step
+    return tiles
+
 # Таймзона/локаль браузера должны соответствовать домену (анти-фрод консистентность).
 DOMAIN_TZ: dict[str, str] = {
     "yandex.kz": "Asia/Almaty",
@@ -3393,18 +3415,18 @@ def _collect_current_results(
         page.on("response", collector.on_response)
 
     try:
-        # Ждём появления результатов, пробуем несколько селекторов
+        # Ждём появления результатов ОДНИМ объединённым ожиданием (быстрее:
+        # пустые тайлы национального свипа не тратят 4×5с на пустые ожидания).
         item_sel = engine.get("item")
+        candidates = [s for s in (item_sel, ITEM_SEL, "[class*='search-snippet']",
+                                  "[class*='serp-item']") if s]
+        combined = ", ".join(dict.fromkeys(candidates))
         found = False
-        for sel_candidate in [item_sel, ITEM_SEL, "[class*='search-snippet']", "[class*='serp-item']"]:
-            if not sel_candidate:
-                continue
-            try:
-                page.wait_for_selector(sel_candidate, timeout=5000)
-                found = True
-                break
-            except Exception:
-                continue
+        try:
+            page.wait_for_selector(combined, timeout=7000)
+            found = True
+        except Exception:
+            found = False
 
         if not found:
             # Может быть CAPTCHA появилась после загрузки
@@ -4013,6 +4035,181 @@ def run_category_parser(
 
 
 # ---------------------------------------------------------------------------
+# Национальный свип — сплошной сбор по ВСЕЙ территории страны сеткой вьюпортов
+# (города, посёлки, трассы). Устойчив к перезапуску: прогресс по тайлам и уже
+# собранные организации сохраняются, при повторном запуске сбор продолжается.
+# ---------------------------------------------------------------------------
+
+def _load_existing_orgs(out_path: Path) -> list[Organization]:
+    """Прочитать уже собранные организации из файла результатов (для resume)."""
+    try:
+        rm = ResumeManager(out_path)
+        return rm.existing_orgs()
+    except Exception:
+        return []
+
+
+def run_country_sweep(
+    queries: list[str],
+    output: str = "kz_azs.xlsx",
+    max_per_tile: int = 250,
+    step_deg: float = COUNTRY_STEP_DEG,
+    tile_z: int = COUNTRY_TILE_Z,
+    scroll_pause: float = 1.0,
+    headless: bool = True,
+    proxy_url: str | None = None,
+    api_intercept: bool = True,
+    cooldown_every: int = 40,
+    cooldown_sec: int = 60,
+    save_every_tiles: int = 8,
+) -> list[Organization]:
+    """Сплошной сбор по всей стране: сетка вьюпортов × запросы, глобальный дедуп.
+
+    Прогресс (готовые тайлы) и результаты пишутся на диск постоянно — прогон
+    можно прерывать и продолжать (Ctrl+C, капча, обрыв): при повторном запуске
+    с тем же -o уже собранное подхватывается, готовые тайлы пропускаются.
+    """
+    global _warmed_up, MAP_LL, MAP_Z
+    _warmed_up = False
+    setup_file_logging()
+    _RUN_ERRORS.clear()
+    _t_start = time.time()
+    _captchas_before = get_throttle().captcha_count
+
+    out_path = Path(output)
+    progress_path = out_path.with_name(out_path.name + ".progress.json")
+
+    tiles = country_grid(step_deg)
+    total_units = len(tiles) * len(queries)
+    log.info("НАЦИОНАЛЬНЫЙ СВИП: %d тайлов × %d запрос(ов) = %d единиц; шаг %.2f° z=%d",
+             len(tiles), len(queries), total_units, step_deg, tile_z)
+
+    # Resume: готовые (тайл|запрос) и уже собранные организации
+    done: set[str] = set()
+    if progress_path.exists():
+        try:
+            done = set(json.loads(progress_path.read_text(encoding="utf-8")))
+            log.info("Resume: пропускаю %d уже обработанных единиц", len(done))
+        except Exception:
+            done = set()
+
+    all_orgs: list[Organization] = _load_existing_orgs(out_path)
+    seen: set[str] = {_dedup_key(o) for o in all_orgs}
+    if all_orgs:
+        log.info("Resume: подхвачено %d ранее собранных организаций", len(all_orgs))
+
+    def _save_progress() -> None:
+        try:
+            progress_path.write_text(json.dumps(sorted(done), ensure_ascii=False),
+                                     encoding="utf-8")
+        except Exception as exc:
+            log.debug("Не удалось сохранить прогресс: %s", exc)
+
+    processed_since_save = 0
+    unit_idx = 0
+    try:
+        with sync_playwright() as pw:
+            _, ctx = _create_browser_context(pw, headless, proxy_url=proxy_url)
+            page = _setup_page(ctx)
+            _warmup(page, headless)
+
+            for q in queries:
+                for ll in tiles:
+                    unit_idx += 1
+                    unit_key = f"{ll}|{q}"
+                    if unit_key in done:
+                        continue
+
+                    MAP_LL, MAP_Z = ll, tile_z
+                    collector = _ApiCollector(dump=bool(os.environ.get("YAMAP_DEBUG_API")))
+                    page.on("response", collector.on_response)
+                    tile_orgs: list[Organization] = []
+                    try:
+                        page.goto(search_url(q), wait_until="domcontentloaded", timeout=30000)
+                        page.wait_for_timeout(random.randint(1500, 3000))
+                        throttle = get_throttle()
+                        if detect_captcha(page):
+                            throttle.on_captcha()
+                            if not handle_captcha(page, headless):
+                                record_error(f"Тайл {ll} ({q}): капча не решена")
+                                page.remove_listener("response", collector.on_response)
+                                continue
+                        else:
+                            throttle.on_success()
+                        tile_orgs = _collect_current_results(
+                            page, q, max_per_tile, scroll_pause, api_intercept,
+                            on_org=None, headless=headless, collector=collector,
+                        )
+                    except Exception as exc:
+                        record_error(f"Тайл {ll} ({q}): {exc}")
+                        log.warning("Тайл %s (%s) — ошибка: %s", ll, q, exc)
+                    finally:
+                        try:
+                            page.remove_listener("response", collector.on_response)
+                        except Exception:
+                            pass
+
+                    added = 0
+                    for o in tile_orgs:
+                        if not o.search_query:
+                            o.search_query = q
+                        k = _dedup_key(o)
+                        if k in seen:
+                            continue
+                        seen.add(k)
+                        all_orgs.append(o)
+                        added += 1
+
+                    done.add(unit_key)
+                    processed_since_save += 1
+                    if added or unit_idx % 20 == 0:
+                        log.info("Свип %d/%d (тайл %s, «%s»): +%d | всего %d",
+                                 unit_idx, total_units, ll, q, added, len(all_orgs))
+
+                    # Инкрементальное сохранение результата + прогресса
+                    if processed_since_save >= save_every_tiles:
+                        _save_auto(_finalize_orgs(all_orgs), out_path)
+                        _save_progress()
+                        processed_since_save = 0
+
+                    # Cooldown + адаптивная пауза
+                    if cooldown_every and unit_idx % cooldown_every == 0:
+                        log.info("Cooldown %d сек (обработано %d/%d)…",
+                                 cooldown_sec, unit_idx, total_units)
+                        page.wait_for_timeout(cooldown_sec * 1000)
+                    else:
+                        page.wait_for_timeout(get_throttle().get_pause(base_ms=random.randint(1200, 2600)))
+
+            ctx.close()
+    except KeyboardInterrupt:
+        log.warning("Прервано пользователем — сохраняю собранное (%d) для докачки", len(all_orgs))
+    except Exception as exc:
+        record_error(f"Критическая ошибка свипа: {exc}")
+        log.error("Свип прерван: %s", exc)
+
+    all_orgs = _finalize_orgs(all_orgs)
+    _save_auto(all_orgs, out_path)
+    _save_progress()
+    stats = print_stats(all_orgs, label="Казахстан — сплошной сбор")
+    save_run_report({
+        "mode": "country_sweep",
+        "label": "Казахстан",
+        "queries": queries,
+        "domain": DOMAIN, "lang": LANG,
+        "tiles": len(tiles), "step_deg": step_deg, "tile_z": tile_z,
+        "max_per_tile": max_per_tile, "api_intercept": api_intercept,
+        "headless": headless, "proxy": bool(proxy_url),
+        "output": str(out_path),
+        "duration_sec": round(time.time() - _t_start, 1),
+        "captchas": get_throttle().captcha_count - _captchas_before,
+        "units_done": len(done), "units_total": total_units,
+    }, stats)
+    log.info("СВИП завершён/приостановлен: %d организаций → %s (прогресс: %s)",
+             len(all_orgs), out_path, progress_path)
+    return all_orgs
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -4106,6 +4303,21 @@ def main() -> None:
         "--grid", type=int, default=1,
         help="Grid-свип N×N вьюпортов по площади города — СИЛЬНО больше "
              "результатов (напр. --grid 3 = 9 вьюпортов). По умолчанию 1 (выкл).",
+    )
+    parser.add_argument(
+        "--country", action="store_true",
+        help="СПЛОШНОЙ сбор по ВСЕЙ территории Казахстана сеткой вьюпортов "
+             "(города, посёлки, трассы). Устойчив к перезапуску (resume). "
+             "Запрос из позиционного аргумента или --category (напр. \"АЗС\" --country).",
+    )
+    parser.add_argument(
+        "--step", type=float, default=COUNTRY_STEP_DEG,
+        help=f"Шаг национальной сетки в градусах (по умолч. {COUNTRY_STEP_DEG}; "
+             "меньше = плотнее и дольше, напр. 0.15 — очень плотно, 0.3 — быстрее).",
+    )
+    parser.add_argument(
+        "--tile-z", type=int, default=COUNTRY_TILE_Z,
+        help=f"Зум тайла национального свипа (по умолч. {COUNTRY_TILE_Z}).",
     )
     parser.add_argument(
         "--api-intercept", action="store_true",
@@ -4324,6 +4536,41 @@ def main() -> None:
 
     # Резюме
     resume_path = Path(args.resume) if args.resume else None
+
+    # Режим: СПЛОШНОЙ национальный свип (вся страна)
+    if args.country:
+        # Запросы: позиционный аргумент, или категории, или дефолт «АЗС»
+        if args.query:
+            queries = [args.query]
+        elif args.category or args.all_categories:
+            cats = list(CATEGORIES.keys()) if args.all_categories else args.category
+            queries = resolve_categories(cats)
+        else:
+            queries = ["АЗС"]
+        output = args.output or "kz_" + re.sub(r"[^\w]+", "_", queries[0])[:20] + ".xlsx"
+        n_tiles = len(country_grid(args.step))
+        print(f"\n🇰🇿 СПЛОШНОЙ СБОР ПО КАЗАХСТАНУ")
+        print(f"   Запросы:   {', '.join(queries)}")
+        print(f"   Сетка:     {n_tiles} тайлов (шаг {args.step}°, z={args.tile_z})")
+        print(f"   Единиц:    {n_tiles * len(queries)}  (тайлов × запросов)")
+        print(f"   Файл:      {output}  (+ {output}.progress.json для докачки)")
+        print(f"   ⚠️  Это ДОЛГО (часы). Прогресс сохраняется — можно прерывать (Ctrl+C)")
+        print(f"       и продолжать повторным запуском той же команды.\n")
+        orgs = run_country_sweep(
+            queries=queries,
+            output=output,
+            max_per_tile=args.max_results if args.max_results and args.max_results > 0 else 250,
+            step_deg=args.step,
+            tile_z=args.tile_z,
+            scroll_pause=args.scroll_pause,
+            headless=headless,
+            proxy_url=proxy_url,
+            api_intercept=args.api_intercept,
+            cooldown_every=args.cooldown_every or 40,
+            cooldown_sec=args.cooldown_sec,
+        )
+        print(f"\nГотово (или приостановлено)! Собрано {len(orgs)} организаций -> {output}")
+        return
 
     # Режим: парсинг по категориям
     if args.city and (args.category or args.all_categories):
