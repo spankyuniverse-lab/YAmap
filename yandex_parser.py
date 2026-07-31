@@ -30,6 +30,7 @@ import argparse
 import csv
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -162,6 +163,20 @@ def viewport_grid(center_ll: str, n: int,
 KZ_BBOX = (46.4, 40.5, 87.4, 55.5)   # (lon_min, lat_min, lon_max, lat_max)
 COUNTRY_STEP_DEG = 0.25              # шаг сетки по стране (°) ≈ 20 км (баланс охват/время)
 COUNTRY_TILE_Z = 12                  # зум тайла национального свипа
+
+
+def _zoom_for_span(span_deg: float, overlap: float = 1.35) -> int:
+    """Подобрать зум карты так, чтобы видимое окно (bbox) ≈ размеру тайла.
+
+    Выдача Яндекса ограничена тем, что попало в видимый bbox — значит зум и
+    размер тайла должны быть согласованы: span(z) ≈ step (× запас на перекрытие,
+    чтобы не было дыр между тайлами). Калибровка span(z) ≈ 1500/2^z° взята из
+    реального URL Яндекс.Карт (z=5.57 → sspn≈31.7°). Смещаем в сторону БОльшего
+    окна (floor) — перекрытие безопасно (дедуп уберёт), дыры недопустимы.
+    """
+    target = max(0.01, span_deg * overlap)
+    z = int(math.floor(math.log2(1500.0 / target)))
+    return max(4, min(17, z))
 
 
 def country_grid(step_deg: float = COUNTRY_STEP_DEG,
@@ -4179,10 +4194,13 @@ def run_country_sweep(
     out_path = Path(output)
     progress_path = out_path.with_name(out_path.name + ".progress.json")
 
+    # Зум базового тайла: авто по шагу (span окна ≈ размер тайла), либо явный --tile-z.
+    base_z = tile_z if tile_z and tile_z > 0 else _zoom_for_span(step_deg)
+
     base_tiles = country_grid(step_deg)
     log.info("НАЦИОНАЛЬНЫЙ СВИП (адаптивный=%s): база %d тайлов × %d запрос(ов); "
-             "шаг %.2f° z=%d, деление до %.3f°",
-             adaptive, len(base_tiles), len(queries), step_deg, tile_z, min_span)
+             "шаг %.2f° z=%d (авто под размер тайла), деление до %.3f°",
+             adaptive, len(base_tiles), len(queries), step_deg, base_z, min_span)
 
     # Resume: готовые единицы + недоделанная очередь под-тайлов + собранные орги
     done: set[str] = set()
@@ -4219,7 +4237,7 @@ def run_country_sweep(
                 lon, lat = (float(x) for x in ll.split(","))
             except ValueError:
                 continue
-            queue.append((lon, lat, step_deg, tile_z, q))
+            queue.append((lon, lat, step_deg, base_z, q))
 
     def _save_progress() -> None:
         try:
@@ -4303,12 +4321,13 @@ def run_country_sweep(
                 )
                 if saturated:
                     subdivided += 1
+                    sub_span = span / 2.0
+                    sub_z = _zoom_for_span(sub_span)   # зум под меньший тайл
                     for slon, slat in _subtile_centers(lon, lat, span):
-                        su = (slon, slat, span / 2.0, z + 1, q)
-                        if _unit_key(slon, slat, z + 1, q) not in done:
-                            queue.append(su)
+                        if _unit_key(slon, slat, sub_z, q) not in done:
+                            queue.append((slon, slat, sub_span, sub_z, q))
                     log.info("Тайл %s плотный (собрано %d, насчитано %d) → делю на 4 "
-                             "(глубже z=%d)", MAP_LL, len(tile_orgs), reported, z + 1)
+                             "(глубже z=%d)", MAP_LL, len(tile_orgs), reported, sub_z)
 
                 done.add(uk)
                 processed_since_save += 1
@@ -4468,8 +4487,9 @@ def main() -> None:
              "меньше = плотнее и дольше, напр. 0.15 — очень плотно, 0.3 — быстрее).",
     )
     parser.add_argument(
-        "--tile-z", type=int, default=COUNTRY_TILE_Z,
-        help=f"Зум тайла национального свипа (по умолч. {COUNTRY_TILE_Z}).",
+        "--tile-z", type=int, default=0,
+        help="Зум тайла национального свипа (0 = авто по --step: окно карты "
+             "подгоняется под размер тайла, как того требует лимит выдачи Яндекса).",
     )
     parser.add_argument(
         "--api-intercept", action="store_true",
@@ -4701,11 +4721,13 @@ def main() -> None:
             queries = ["АЗС"]
         output = args.output or "kz_" + re.sub(r"[^\w]+", "_", queries[0])[:20] + ".xlsx"
         n_tiles = len(country_grid(args.step))
+        auto_z = args.tile_z if args.tile_z and args.tile_z > 0 else _zoom_for_span(args.step)
         print(f"\n🇰🇿 СПЛОШНОЙ СБОР ПО КАЗАХСТАНУ (адаптивный quadtree)")
         print(f"   Запросы:   {', '.join(queries)}")
-        print(f"   База:      {n_tiles} тайлов (шаг {args.step}°, z={args.tile_z})")
-        print(f"   Адаптив:   плотные тайлы (города) авто-делятся на под-тайлы,")
-        print(f"              пока не выберут ВСЁ; степь проходится быстро")
+        print(f"   База:      {n_tiles} тайлов (шаг {args.step}°, зум z={auto_z} авто)")
+        print(f"   Адаптив:   тайл, где Яндекс упёрся в лимит выдачи (город),")
+        print(f"              авто-делится на под-тайлы глубже по зуму, пока не")
+        print(f"              выберет ВСЁ; пустая степь проходится быстро")
         print(f"   Файл:      {output}  (+ {output}.progress.json для докачки)")
         print(f"   ⚠️  Это ДОЛГО (часы/сутки). Прогресс сохраняется — можно прерывать")
         print(f"       (Ctrl+C) и продолжать повторным запуском той же команды.\n")
