@@ -3,6 +3,35 @@
 Гайд для запуска сплошного сбора АЗС (`--country`) на Linux-сервере (VPS),
 чтобы не держать процесс на ноутбуке 2–3 суток.
 
+## ⚠️ Главное №0: headless палится — нужен Xvfb + настоящий Chrome + WebGL
+
+Яндекс блокирует не по одному флагу, а по **противоречиям сигналов**. На сервере
+провальны сразу три вещи, и лечить надо все:
+
+1. **headless** (особенно `chromium-headless-shell`) — палится мгновенно (UA
+   `HeadlessChrome`, нет `window.chrome`/plugins). → Запускать **headful под
+   Xvfb** настоящим `google-chrome` (не chromium). Парсер это делает
+   автоматически: на headless-Linux он сам поднимает Xvfb (если стоит `xvfb` +
+   `pyvirtualdisplay`) и идёт headful. Либо запускай через `xvfb-run`.
+2. **WebGL software-renderer** — GPU-less сервер отдаёт `SwiftShader`, это
+   мгновенный флаг. → Ставим **mesa (llvmpipe)** и парсер добавляет
+   `--use-angle=gl` — рендерер становится правдоподобнее. (JS-спуф под patchright
+   не работает — он изолирован; чиним на уровне браузера.)
+3. **Датацентр-IP** — пенализируется. → У тебя **мобильный/резидентский KZ-IP**
+   (напр. через Jusan Mobile) — это самый доверенный сигнал, он закрывает вопрос.
+
+Ставим mesa (для WebGL) заранее:
+```bash
+sudo apt install -y xvfb mesa-utils libgl1-mesa-dri
+pip install pyvirtualdisplay
+```
+
+Дальше — либо парсер сам поднимет Xvfb, либо запускай так:
+```bash
+xvfb-run -a --server-args='-screen 0 1920x1080x24' \
+  python yandex_parser.py "АЗС" --country --step 0.15 --no-headless -o kz_azs.xlsx
+```
+
 ## ⚠️ Главное: капча на сервере
 
 Сервер обычно = **датацентр-IP** + **headless** (без экрана). Яндекс банит

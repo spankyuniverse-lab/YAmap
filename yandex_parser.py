@@ -3121,14 +3121,60 @@ def save_xlsx_by_categories(
 # Main parser flow
 # ---------------------------------------------------------------------------
 
-# Минимальный stealth JS — используется ТОЛЬКО как fallback для обычного Playwright.
-# С patchright + channel="chrome" этот скрипт НЕ инжектится.
-_STEALTH_JS = """
-() => {
-    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-    window.chrome = { runtime: {}, loadTimes: function(){}, csi: function(){} };
-}
-"""
+# Самокорректирующийся hardening-скрипт. Инжектится ВСЕГДА, но каждый патч
+# срабатывает ТОЛЬКО если признак «плохой» (софт-рендер/пустые поля) — на
+# десктопе с настоящим GPU это no-op (ничего не патчит, значит не палится),
+# а на GPU-less СЕРВЕРЕ маскирует SwiftShader/llvmpipe в WebGL (Rank-2 сигнал,
+# который patchright НЕ чинит — это железный, а не JS-маркер).
+# IIFE — предыдущая версия была `() => {}` (не вызывалась и ничего не делала).
+_STEALTH_JS = r"""(() => {
+  // --- navigator: патчим ТОЛЬКО если значение «ботское» (на десктопе — no-op) ---
+  try { if (navigator.webdriver) Object.defineProperty(navigator, 'webdriver', { get: () => undefined }); } catch (e) {}
+  try {
+    if (!navigator.languages || navigator.languages.length < 2)
+      Object.defineProperty(navigator, 'languages', { get: () => ['ru-RU','ru','en-US','en'] });
+  } catch (e) {}
+  try { if (!navigator.hardwareConcurrency || navigator.hardwareConcurrency < 2)
+      Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 }); } catch (e) {}
+  try { if (!('deviceMemory' in navigator))
+      Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 }); } catch (e) {}
+  try { if (!window.chrome) window.chrome = { runtime: {} }; } catch (e) {}
+  try {
+    if (navigator.plugins && navigator.plugins.length === 0) {
+      const fake = [{name:'PDF Viewer'},{name:'Chrome PDF Viewer'},{name:'Chromium PDF Viewer'},
+                    {name:'Microsoft Edge PDF Viewer'},{name:'WebKit built-in PDF'}];
+      Object.defineProperty(navigator, 'plugins', { get: () => fake });
+    }
+  } catch (e) {}
+})();"""
+
+
+# WebGL-спуф для СЕРВЕРА (GPU-less). Решение о подмене принимается в момент
+# ВЫЗОВА getParameter (GL уже готов), а не при инжекте: оборачиваем getParameter,
+# зовём оригинал, и подменяем ТОЛЬКО если реальный рендерер — софтовый
+# (SwiftShader/llvmpipe). Маскируем под реальный Linux-GPU (согласованно с
+# Linux-UA сервера). toString остаётся «native». Инжектится только в _SERVER_MODE.
+_WEBGL_SPOOF_JS = r"""(() => {
+  const nt = (fn, n) => { try { Object.defineProperty(fn, 'toString',
+    { value: () => 'function ' + n + '() { [native code] }', configurable: true, writable: true }); } catch (e) {} };
+  const soft = /swiftshader|llvmpipe|software|subzero|mesa\s+offscreen|\(google/i;
+  const RENDERER = 'ANGLE (Intel, Mesa Intel(R) UHD Graphics 630 (CFL GT2), OpenGL 4.6)';
+  const VENDOR = 'Google Inc. (Intel)';
+  const patch = (proto) => {
+    if (!proto || !proto.getParameter) return;
+    const orig = proto.getParameter;
+    const fn = function (p) {
+      const v = orig.call(this, p);
+      if (p === 37446 && soft.test(String(v || ''))) return RENDERER;  // UNMASKED_RENDERER_WEBGL
+      if (p === 37445 && soft.test(String(v || ''))) return VENDOR;    // UNMASKED_VENDOR_WEBGL
+      return v;
+    };
+    nt(fn, 'getParameter');
+    proto.getParameter = fn;
+  };
+  try { if (window.WebGLRenderingContext) patch(WebGLRenderingContext.prototype); } catch (e) {}
+  try { if (window.WebGL2RenderingContext) patch(WebGL2RenderingContext.prototype); } catch (e) {}
+})();"""
 
 
 BROWSER_DATA_DIR = Path(".browser_profile")
@@ -3191,32 +3237,85 @@ def get_throttle() -> AdaptiveThrottle:
 
 
 
+_virtual_display = None
+_SERVER_MODE = False
+
+
+def _resolve_display(headless: bool) -> bool:
+    """На headless Linux — поднять Xvfb и идти HEADFUL (настоящий Chrome вместо
+    палевного headless-shell). Возвращает итоговый флаг headless для запуска.
+
+    Яндекс палит headless силуэтом сигналов; headful-Chrome под виртуальным
+    дисплеем практически неотличим от десктопного. Управление: если DISPLAY уже
+    есть (запущен Xvfb/xvfb-run вручную) — просто идём headful. Если нет —
+    пытаемся поднять Xvfb через pyvirtualdisplay; не вышло — честный warning.
+    """
+    global _virtual_display, _SERVER_MODE
+    if not sys.platform.startswith("linux"):
+        return headless
+    force = os.environ.get("YAMAP_XVFB", "").lower() in ("1", "true", "yes")
+    has_display = bool(os.environ.get("DISPLAY"))
+    # Серверный сценарий: Linux и (просили headless / нет дисплея / форс).
+    if not (headless or not has_display or force):
+        # Есть дисплей и headful не форсим — обычный десктоп-Linux.
+        return headless
+    _SERVER_MODE = True
+    if has_display:
+        # Дисплей уже поднят (xvfb-run / ручной Xvfb) — идём headful на нём.
+        log.info("Обнаружен DISPLAY=%s — запускаю Chrome HEADFUL (анти-детект)",
+                 os.environ.get("DISPLAY"))
+        return False
+    if _virtual_display is not None:
+        return False
+    try:
+        from pyvirtualdisplay import Display
+        _virtual_display = Display(visible=0, size=(1920, 1080), color_depth=24)
+        _virtual_display.start()
+        log.info("Xvfb поднят автоматически (DISPLAY=%s) — Chrome HEADFUL вместо "
+                 "headless-shell (обход детекта Яндекса)", os.environ.get("DISPLAY"))
+        return False
+    except Exception as exc:
+        log.warning("Не удалось поднять Xvfb автоматически (%s). Headless палится "
+                    "Яндексом! Поставь: apt install -y xvfb && pip install pyvirtualdisplay, "
+                    "или запускай через: xvfb-run -a python yandex_parser.py … --no-headless",
+                    exc)
+        return headless
+
+
 def _create_browser_context(pw, headless: bool, proxy_url: str | None = None):
     """Создать persistent browser context с настоящим Chrome.
 
     Ключевые принципы (почему не ловим капчу):
     1. channel="chrome" — настоящий Chrome, не Playwright Chromium
-       (другой TLS-fingerprint, нет автоматизационных маркеров)
-    2. Persistent context — cookies/localStorage/кеш между запусками
-       (Яндекс видит «знакомого» пользователя)
-    3. НЕ подменяем User-Agent/headers — Chrome уже имеет правильные
-    4. НЕ инжектим stealth JS — с patchright + real Chrome не нужно,
-       а лишние патчи ПАЛЯТСЯ через getOwnPropertyDescriptor
+    2. На headless-Linux — авто-Xvfb + headful (headless палится Яндексом)
+    3. Persistent context — cookies/localStorage между запусками
+    4. WebGL-спуф на GPU-less сервере (SwiftShader/llvmpipe → реальный GPU)
     5. НЕ блокируем Яндекс.Метрику — её отсутствие = флаг «бот»
     """
+    # На сервере без дисплея — поднимаем Xvfb и идём headful.
+    headless = _resolve_display(headless)
+
     # Создаём директорию для профиля если нет
     BROWSER_DATA_DIR.mkdir(exist_ok=True)
+
+    args = [
+        "--disable-blink-features=AutomationControlled",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--disable-infobars",
+        # Chrome ≥128 иначе выключает WebGL на софт-рендере — держим его живым.
+        "--enable-unsafe-swiftshader",
+    ]
+    if _SERVER_MODE:
+        # GPU-less сервер: ANGLE поверх GL (llvmpipe, если стоит mesa) — быстрее и
+        # правдоподобнее SwiftShader; окно МЕНЬШЕ экрана Xvfb (иначе палево).
+        args += ["--use-angle=gl", "--window-size=1536,864"]
 
     launch_args: dict[str, Any] = {
         "channel": "chrome",           # НАСТОЯЩИЙ Chrome, не Chromium
         "headless": headless,
         "no_viewport": True,            # Естественный размер окна Chrome
-        "args": [
-            "--disable-blink-features=AutomationControlled",
-            "--no-first-run",
-            "--no-default-browser-check",
-            "--disable-infobars",
-        ],
+        "args": args,
         # Локаль и таймзона ДОЛЖНЫ соответствовать домену/региону, иначе
         # рассинхрон (yandex.kz + Europe/Moscow) палит бота. Для KZ — Asia/Almaty.
         "locale": DOMAIN_LOCALE.get(DOMAIN, "ru-RU"),
@@ -3253,21 +3352,29 @@ def _create_browser_context(pw, headless: bool, proxy_url: str | None = None):
             ctx = pw.chromium.launch_persistent_context(str(BROWSER_DATA_DIR), **launch_args)
             log.info("Браузер: настоящий Chrome + persistent-профиль (%s)", BROWSER_DATA_DIR)
         except Exception as exc:
-            log.warning("Настоящий Chrome недоступен (%s) — откат на bundled Chromium. "
-                        "Для лучшего обхода анти-фрода установите Google Chrome "
-                        "или задайте YAMAP_BROWSER_PATH.",
+            log.warning("Настоящий Chrome недоступен (%s) — откат на bundled Chromium.",
                         str(exc).splitlines()[0] if str(exc) else exc)
+            if _SERVER_MODE:
+                log.warning("⚠️  ВНИМАНИЕ: bundled Chromium/headless-shell СИЛЬНО палится "
+                            "Яндексом (UA HeadlessChrome, нет window.chrome/plugins). "
+                            "Поставь настоящий Chrome: sudo apt install -y google-chrome-stable "
+                            "(или ./google-chrome-stable_current_amd64.deb).")
             launch_args.pop("channel", None)   # bundled Chromium вместо channel="chrome"
             ctx = pw.chromium.launch_persistent_context(str(BROWSER_DATA_DIR), **launch_args)
             need_stealth = True
             log.info("Браузер: bundled Chromium + persistent-профиль (%s)", BROWSER_DATA_DIR)
 
-    # С patchright + настоящим Chrome stealth НЕ нужен (нет Runtime.enable-утечки
-    # и navigator.webdriver, лишние патчи только палятся). Но на «сыром» Chromium
-    # или обычном playwright — инжектим минимальный stealth.
-    if need_stealth:
+    # navigator-hardening — всегда (самокорректирующийся, на десктопе no-op).
+    try:
+        ctx.add_init_script(_STEALTH_JS)
+    except Exception:
+        pass
+    # WebGL-спуф — только на сервере (маскирует SwiftShader/llvmpipe, чего
+    # patchright не чинит; на десктопе с GPU прототип не оборачиваем).
+    if _SERVER_MODE:
         try:
-            ctx.add_init_script(_STEALTH_JS)
+            ctx.add_init_script(_WEBGL_SPOOF_JS)
+            log.info("WebGL-спуф активен (маскировка софт-рендера под Intel GPU)")
         except Exception:
             pass
 
