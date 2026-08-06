@@ -3267,19 +3267,36 @@ def _resolve_display(headless: bool) -> bool:
         return False
     if _virtual_display is not None:
         return False
-    try:
-        from pyvirtualdisplay import Display
-        _virtual_display = Display(visible=0, size=(1920, 1080), color_depth=24)
-        _virtual_display.start()
-        log.info("Xvfb поднят автоматически (DISPLAY=%s) — Chrome HEADFUL вместо "
-                 "headless-shell (обход детекта Яндекса)", os.environ.get("DISPLAY"))
-        return False
-    except Exception as exc:
-        log.warning("Не удалось поднять Xvfb автоматически (%s). Headless палится "
-                    "Яндексом! Поставь: apt install -y xvfb && pip install pyvirtualdisplay, "
-                    "или запускай через: xvfb-run -a python yandex_parser.py … --no-headless",
-                    exc)
+    # Поднимаем Xvfb сами на СВОБОДНОМ дисплее (:99+, не :0 — тот конфликтует).
+    import shutil
+    import subprocess
+    if not shutil.which("Xvfb"):
+        log.warning("Xvfb не установлен — headless палится Яндексом! Поставь: "
+                    "sudo apt install -y xvfb, или запускай через "
+                    "xvfb-run -a python yandex_parser.py … --no-headless")
         return headless
+    for disp in range(99, 140):
+        if os.path.exists(f"/tmp/.X{disp}-lock"):
+            continue
+        try:
+            proc = subprocess.Popen(
+                ["Xvfb", f":{disp}", "-screen", "0", "1920x1080x24", "-nolisten", "tcp"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            time.sleep(1.5)
+            if proc.poll() is not None:      # Xvfb сразу умер — дисплей занят
+                continue
+            os.environ["DISPLAY"] = f":{disp}"
+            _virtual_display = proc
+            log.info("Xvfb поднят на DISPLAY=:%d — Chrome HEADFUL вместо headless-shell "
+                     "(обход детекта Яндекса)", disp)
+            return False
+        except Exception as exc:
+            log.debug("Xvfb :%d не стартовал: %s", disp, exc)
+            continue
+    log.warning("Не удалось поднять Xvfb — остаёмся headless (палится!). "
+                "Запусти через: xvfb-run -a python yandex_parser.py … --no-headless")
+    return headless
 
 
 def _create_browser_context(pw, headless: bool, proxy_url: str | None = None):
@@ -3292,8 +3309,16 @@ def _create_browser_context(pw, headless: bool, proxy_url: str | None = None):
     4. WebGL-спуф на GPU-less сервере (SwiftShader/llvmpipe → реальный GPU)
     5. НЕ блокируем Яндекс.Метрику — её отсутствие = флаг «бот»
     """
-    # На сервере без дисплея — поднимаем Xvfb и идём headful.
-    headless = _resolve_display(headless)
+    # Xvfb поднимается в main() ДО sync_playwright (иначе драйвер patchright уже
+    # без DISPLAY). Здесь только потребляем готовый дисплей: если он есть на
+    # Linux — идём HEADFUL (обход детекта Яндекса) и включаем серверный режим.
+    global _SERVER_MODE
+    if sys.platform.startswith("linux"):
+        if os.environ.get("DISPLAY"):
+            headless = False
+            _SERVER_MODE = True
+        elif headless:
+            _SERVER_MODE = True   # headless без дисплея — серверные флаги всё равно
 
     # Создаём директорию для профиля если нет
     BROWSER_DATA_DIR.mkdir(exist_ok=True)
@@ -4790,6 +4815,10 @@ def main() -> None:
 
     # Общие параметры
     headless = not args.no_headless
+
+    # Дисплей/Xvfb поднимаем ЗДЕСЬ — ДО sync_playwright. Иначе драйвер patchright
+    # (Node) стартует без DISPLAY, и Chrome не находит X-сервер ("Missing X server").
+    headless = _resolve_display(headless)
 
     # Конфиг-файл (перезаписывает дефолты, CLI-аргументы приоритетнее)
     if args.config:
