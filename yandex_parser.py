@@ -4533,6 +4533,11 @@ def run_cities_parser(
 #: гарантированно приводят к капче на всех сразу.
 MAX_WORKERS = 8
 
+#: Сколько раз родитель поднимает упавшего воркера. Падение — это обычно
+#: смерть Chrome или обрыв сети, и после рестарта воркер продолжает с места
+#: обрыва (свой файл идёт ему как resume), а не начинает заново.
+MAX_RESTARTS = 5
+
 
 def _split_round_robin(items: list[Any], n: int) -> list[list[Any]]:
     """Раздать элементы по n воркерам вперемешку (1,2,3,1,2,3,…).
@@ -4545,6 +4550,83 @@ def _split_round_robin(items: list[Any], n: int) -> list[list[Any]]:
     for i, item in enumerate(items):
         buckets[i % n].append(item)
     return [b for b in buckets if b]
+
+
+def run_doctor() -> None:
+    """Диагностика: собрать состояние прогона в один экран для пересылки.
+
+    Смысл — чтобы не пересылать мегабайты логов: тут окружение, что собралось,
+    сколько капч и последние настоящие ошибки.
+    """
+    print("=" * 60)
+    print("  YAMAP — ДИАГНОСТИКА")
+    print("=" * 60)
+    print(f"  Python:       {sys.version.split()[0]} ({sys.platform})")
+    print(f"  Библиотека:   {log_lib}")
+    print(f"  Домен:        {DOMAIN}")
+    print(f"  Папка:        {Path.cwd()}")
+
+    chrome = "не найден"
+    for cand in (
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        os.path.expandvars(r"%LocalAppData%\Google\Chrome\Application\chrome.exe"),
+        "/usr/bin/google-chrome", "/usr/bin/chromium",
+    ):
+        if cand and Path(cand).exists():
+            chrome = cand
+            break
+    print(f"  Chrome:       {chrome}")
+
+    profiles = sorted(Path(".").glob(".browser_profile*"))
+    print(f"  Профили:      {', '.join(p.name for p in profiles) or 'нет'}")
+
+    print("\n  РЕЗУЛЬТАТЫ:")
+    files = sorted(list(Path(".").glob("*.xlsx")) + list(Path(".").glob("*.csv")))
+    if not files:
+        print("    (файлов результатов нет)")
+    for f in files:
+        try:
+            cnt = len(_load_existing_orgs(f))
+            age = (time.time() - f.stat().st_mtime) / 60
+            print(f"    {f.name:36s} {cnt:>7} записей, обновлён {age:.0f} мин назад")
+        except Exception as exc:
+            print(f"    {f.name:36s} прочитать не смог: {exc}")
+
+    print("\n  ПРОГРЕСС (докачка):")
+    prog = sorted(list(Path(".").glob("*.cities.json")) + list(Path(".").glob("*.progress.json")))
+    if not prog:
+        print("    (нет — либо не запускалось, либо всё доделано)")
+    for p in prog:
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                print(f"    {p.name:36s} пройдено {len(data)}: {', '.join(map(str, data[:8]))}")
+            elif isinstance(data, dict):
+                print(f"    {p.name:36s} готово {len(data.get('done', []))}, "
+                      f"в очереди {len(data.get('queue', []))}")
+        except Exception as exc:
+            print(f"    {p.name:36s} прочитать не смог: {exc}")
+
+    caps = _count_captchas()
+    print(f"\n  КАПЧИ: {caps}" + ("   ← много, уменьши --workers" if caps > 3 else ""))
+
+    print("\n  ПОСЛЕДНИЕ ОШИБКИ:")
+    lines: list[str] = []
+    for lf in sorted(LOGS_DIR.glob("*.log")) if LOGS_DIR.exists() else []:
+        try:
+            for line in lf.read_text(encoding="utf-8", errors="replace").splitlines():
+                if "ERROR" in line or "Traceback" in line or "WARNING" in line:
+                    lines.append(f"    {lf.name}: {line.strip()[:150]}")
+        except Exception:
+            continue
+    if not lines:
+        print("    (чисто)")
+    for line in lines[-15:]:
+        print(line)
+    print("=" * 60)
+    print("  Скопируй ЭТОТ вывод целиком и пришли — по нему видно всё.")
+    print("=" * 60)
 
 
 def _parse_shard(raw: str | None) -> tuple[int, int] | None:
@@ -4596,11 +4678,14 @@ def _merge_parts(parts: list[Path], out_path: Path) -> list[Organization]:
     return merged
 
 
-def run_parallel(base_argv: list[str], shards: list[list[str]], output: str) -> int:
-    """Запустить N воркеров-процессов и слить результаты.
+def run_parallel(base_argv: list[str], shards: list[list[str]], output: str,
+                 finalize=None) -> int:
+    """Запустить N воркеров-процессов, присмотреть за ними и слить результаты.
 
     base_argv — общие аргументы командной строки, shards[i] — аргументы,
     уникальные для i-го воркера (свой список городов / свой шард тайлов).
+    finalize(parts) — необязательный добор: вызывается после слияния и должен
+    доделать то, что воркеры не осилили (напр. города умершего воркера).
     Возвращает число собранных организаций.
     """
     import subprocess
@@ -4624,39 +4709,75 @@ def run_parallel(base_argv: list[str], shards: list[list[str]], output: str) -> 
     parts = [_part_path(out_path, i + 1) for i in range(n)]
     LOGS_DIR.mkdir(exist_ok=True)
 
-    procs: list[subprocess.Popen] = []
-    log_files = []
+    procs: list[subprocess.Popen | None] = [None] * n
+    log_files: list[Any] = [None] * n
+    restarts = [0] * n
+    stopped = False
     print(f"\n🧵 ПАРАЛЛЕЛЬНЫЙ РЕЖИМ: {n} браузер(ов) одновременно")
     print(f"   Итоговый файл: {output} (сливается из частей .w1…{'.w%d' % n})")
     print(f"   Логи воркеров: logs/worker1.log … logs/worker{n}.log")
+    print(f"   Присмотр:      упавший воркер поднимается сам (до {MAX_RESTARTS} раз)")
+    print(f"                  и продолжает с места обрыва, не с нуля")
     print(f"   ⚠️  Все воркеры идут с ОДНОГО IP. Если посыпалась капча —")
     print(f"       уменьши число браузеров, это единственное лечение.\n")
 
+    def _launch(idx: int) -> None:
+        """Запустить (или перезапустить) воркера idx (0-based)."""
+        part = parts[idx]
+        argv = [sys.executable, os.path.abspath(__file__), *base_argv, *shards[idx],
+                "-o", str(part),
+                # Свой файл как resume: перезапущенный воркер поднимает уже
+                # собранное и не переспрашивает Яндекс о том же самом.
+                "--resume", str(part)]
+        env = dict(os.environ)
+        # Свой профиль Chrome и свой лог-файл на воркера — иначе второй
+        # Chrome не стартует на занятом профиле.
+        env["YAMAP_PROFILE_DIR"] = f".browser_profile_w{idx + 1}"
+        env["YAMAP_WORKER"] = str(idx + 1)
+        mode = "a" if restarts[idx] else "w"     # при рестарте лог дописываем
+        lf = open(LOGS_DIR / f"worker{idx + 1}.log", mode, encoding="utf-8",
+                  errors="replace")
+        log_files[idx] = lf
+        procs[idx] = subprocess.Popen(argv, env=env, stdout=lf,
+                                      stderr=subprocess.STDOUT)
+        log.info("Воркер %d/%d %s (pid %s): %s", idx + 1, n,
+                 f"перезапущен #{restarts[idx]}" if restarts[idx] else "запущен",
+                 procs[idx].pid, " ".join(shards[idx]) or "—")
+
     try:
-        for i, extra in enumerate(shards, 1):
-            argv = [sys.executable, os.path.abspath(__file__), *base_argv, *extra,
-                    "-o", str(_part_path(out_path, i))]
-            env = dict(os.environ)
-            # Свой профиль Chrome и свой лог-файл на воркера — иначе второй
-            # Chrome не стартует на занятом профиле.
-            env["YAMAP_PROFILE_DIR"] = f".browser_profile_w{i}"
-            env["YAMAP_WORKER"] = str(i)
-            lf = open(LOGS_DIR / f"worker{i}.log", "w", encoding="utf-8", errors="replace")
-            log_files.append(lf)
-            procs.append(subprocess.Popen(argv, env=env, stdout=lf,
-                                          stderr=subprocess.STDOUT))
-            log.info("Воркер %d/%d запущен (pid %s): %s", i, n, procs[-1].pid,
-                     " ".join(extra) or "—")
+        for i in range(n):
+            _launch(i)
             # Разносим старты: N одинаковых сессий, стартующих в одну секунду,
             # выглядят как бот-ферма даже с одного нормального IP.
-            if i < n:
+            if i < n - 1:
                 time.sleep(random.uniform(4.0, 9.0))
 
-        # Ждём воркеров, периодически показывая живой прогресс по их файлам.
         last_report = 0.0
         seen_counts = [0] * n
-        while any(p.poll() is None for p in procs):
+        while any(p is not None and p.poll() is None for p in procs):
             time.sleep(3)
+
+            # --- присмотр: поднимаем упавших ---
+            for i, p in enumerate(procs):
+                if p is None or p.poll() is None or p.returncode == 0:
+                    continue
+                if restarts[i] >= MAX_RESTARTS:
+                    continue
+                restarts[i] += 1
+                try:
+                    log_files[i].close()
+                except Exception:
+                    pass
+                delay = min(30 * restarts[i], 120)   # backoff: 30с, 60с, 90с…
+                log.warning("Воркер %d упал (код %s) — поднимаю через %d сек "
+                            "(попытка %d/%d)", i + 1, p.returncode, delay,
+                            restarts[i], MAX_RESTARTS)
+                time.sleep(delay)
+                try:
+                    _launch(i)
+                except Exception as exc:
+                    log.error("Не смог перезапустить воркера %d: %s", i + 1, exc)
+
             if time.time() - last_report < 30:
                 continue
             last_report = time.time()
@@ -4668,45 +4789,109 @@ def run_parallel(base_argv: list[str], shards: list[list[str]], output: str) -> 
                 if cnt == 0 and seen_counts[i - 1]:
                     cnt = seen_counts[i - 1]
                 seen_counts[i - 1] = cnt
-                alive = "" if procs[i - 1].poll() is None else " ✓"
-                counts.append(f"w{i}: {cnt}{alive}")
+                p = procs[i - 1]
+                mark = "" if (p is not None and p.poll() is None) else " ✓"
+                if restarts[i - 1]:
+                    mark += f" ⟳{restarts[i - 1]}"
+                counts.append(f"w{i}: {cnt}{mark}")
                 total += cnt
-            print(f"   [{time.strftime('%H:%M:%S')}] {' | '.join(counts)}  →  всего ~{total}")
+            caps = _count_captchas()
+            cap_note = f"  ⚠ капч: {caps}" if caps else ""
+            print(f"   [{time.strftime('%H:%M:%S')}] {' | '.join(counts)}  "
+                  f"→  всего ~{total}{cap_note}")
     except KeyboardInterrupt:
+        stopped = True
         print("\n⏹  Останавливаю воркеров (их прогресс сохранён)…")
         for p in procs:
-            if p.poll() is None:
+            if p is not None and p.poll() is None:
                 try:
                     p.terminate()
                 except Exception:
                     pass
         for p in procs:
+            if p is None:
+                continue
             try:
                 p.wait(timeout=30)
             except Exception:
                 pass
     finally:
         for p in procs:
-            if p.poll() is None:
+            if p is not None and p.poll() is None:
                 try:
                     p.kill()
                 except Exception:
                     pass
         for lf in log_files:
             try:
-                lf.close()
+                if lf is not None:
+                    lf.close()
             except Exception:
                 pass
 
-    failed = [i + 1 for i, p in enumerate(procs) if p.returncode not in (0, None)]
-    if failed:
-        log.warning("Воркеры с ошибкой: %s — смотри logs/worker<N>.log",
+    failed = [i + 1 for i, p in enumerate(procs)
+              if p is not None and p.returncode not in (0, None)]
+    if failed and not stopped:
+        log.warning("Воркеры, не поднявшиеся после %d попыток: %s — "
+                    "смотри logs/worker<N>.log", MAX_RESTARTS,
                     ", ".join(map(str, failed)))
 
     merged = _merge_parts(parts, out_path)
     print(f"\n✅ Слито из {n} воркеров: {len(merged)} организаций → {output}")
+
+    # Добор: если воркер умер насовсем, его часть работы осталась несделанной.
+    # Родитель доделывает её сам одним браузером — иначе в выгрузке молча
+    # зияла бы дыра, и об этом никто бы не узнал.
+    if finalize and not stopped:
+        try:
+            extra = finalize(parts)
+            if extra:
+                merged = _merge_parts(parts, out_path)
+                print(f"✅ После добора: {len(merged)} организаций → {output}")
+        except KeyboardInterrupt:
+            print("\n⏹  Добор прерван — собранное сохранено")
+        except Exception as exc:
+            log.error("Добор не удался: %s", exc)
+
     print_stats(merged, label="Статистика (все воркеры)")
+    _print_health(parts)
     return len(merged)
+
+
+def _count_captchas() -> int:
+    """Сколько капч суммарно словили воркеры (по их логам)."""
+    total = 0
+    for lf in sorted(LOGS_DIR.glob("worker*.log")) if LOGS_DIR.exists() else []:
+        try:
+            text = lf.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        total += text.lower().count("капча обнаружена") + text.count("CAPTCHA обнаружена")
+    return total
+
+
+def _print_health(parts: list[Path]) -> None:
+    """Короткая сводка здоровья прогона: что собралось, что болело."""
+    caps = _count_captchas()
+    errors: list[str] = []
+    for lf in sorted(LOGS_DIR.glob("worker*.log")) if LOGS_DIR.exists() else []:
+        try:
+            for line in lf.read_text(encoding="utf-8", errors="replace").splitlines():
+                if "ERROR" in line or "Traceback" in line:
+                    errors.append(f"{lf.name}: {line.strip()[:160]}")
+        except Exception:
+            continue
+    print("\n" + "=" * 50)
+    print("  ЗДОРОВЬЕ ПРОГОНА")
+    print("=" * 50)
+    print(f"  Капч поймано:     {caps}" + ("  (стоит уменьшить --workers)" if caps > 3 else ""))
+    print(f"  Ошибок в логах:   {len(errors)}")
+    for line in errors[:5]:
+        print(f"    • {line}")
+    if len(errors) > 5:
+        print(f"    … ещё {len(errors) - 5}, целиком — в logs/worker*.log")
+    print(f"  Диагностика:      python yandex_parser.py --doctor")
+    print("=" * 50)
 
 
 # ---------------------------------------------------------------------------
@@ -5092,6 +5277,11 @@ def main() -> None:
              "(напр. 0/3). Проставляется автоматически при --workers.",
     )
     parser.add_argument(
+        "--doctor", action="store_true",
+        help="Диагностика одним экраном: окружение, что собралось, капчи, "
+             "последние ошибки. Вывод можно целиком переслать в поддержку.",
+    )
+    parser.add_argument(
         "--step", type=float, default=COUNTRY_STEP_DEG,
         help=f"Шаг национальной сетки в градусах (по умолч. {COUNTRY_STEP_DEG}; "
              "меньше = плотнее и дольше, напр. 0.15 — очень плотно, 0.3 — быстрее).",
@@ -5202,6 +5392,11 @@ def main() -> None:
             print("Кеш селекторов удалён. Будут использоваться hardcoded-селекторы.")
         else:
             print("Кеш селекторов не найден.")
+        return
+
+    # Режим: диагностика
+    if args.doctor:
+        run_doctor()
         return
 
     # Режим: показать каталог категорий
@@ -5483,6 +5678,8 @@ def _dispatch_parallel(args, workers: int, headless: bool) -> int | None:
     Аргументы воркерам передаём той же командной строкой, что пришла родителю,
     минус то, что уникально для каждого (-o, --workers, --cities, --shard).
     """
+    max_results = args.max_results if args.max_results is not None else DEFAULT_MAX_RESULTS
+
     # Общая часть командной строки для всех воркеров.
     base: list[str] = []
     # ВНИМАНИЕ: у большинства флагов default=None — класть их в argv без
@@ -5539,6 +5736,7 @@ def _dispatch_parallel(args, workers: int, headless: bool) -> int | None:
             log.warning("Городов меньше двух — параллелить нечего, иду в один браузер")
             return None
         workers = min(workers, len(cities))
+        cats = list(CATEGORIES.keys()) if args.all_categories else (args.category or ["gt"])
         base.append("--all-cities")
         if args.all_categories:
             base.append("--all-categories")
@@ -5546,7 +5744,41 @@ def _dispatch_parallel(args, workers: int, headless: bool) -> int | None:
             base += ["--category", *args.category]
         shards = [["--cities", ",".join(chunk)]
                   for chunk in _split_round_robin(cities, workers)]
-        run_parallel(base, shards, output)
+
+        def _finish_missing(parts: list[Path]) -> int:
+            """Доделать города, до которых воркеры не добрались (умерли/капча).
+
+            Каждый воркер отмечает пройденные города в своём .cities.json —
+            складываем их и смотрим, чего в сумме не хватает до полного списка.
+            """
+            done: set[str] = set()
+            for part in parts:
+                cj = part.with_name(part.stem + ".cities.json")
+                if not cj.exists():
+                    continue
+                try:
+                    done |= set(json.loads(cj.read_text(encoding="utf-8")))
+                except Exception:
+                    continue
+            missing = [c for c in cities if c not in done]
+            if not missing:
+                return 0
+            print(f"\n🩹 Добор: {len(missing)} город(ов) остались несобранными "
+                  f"({', '.join(missing[:6])}{'…' if len(missing) > 6 else ''}) — "
+                  f"доделываю одним браузером")
+            fin_out = Path(output).with_name(Path(output).stem + ".finish"
+                                             + Path(output).suffix)
+            res = run_cities_parser(
+                cities=missing, categories=cats, output=str(fin_out),
+                max_results_per_category=max_results, headless=headless,
+                detail=args.detail, scroll_pause=args.scroll_pause,
+                api_intercept=args.api_intercept, grid=args.grid,
+                cooldown_every=args.cooldown_every, cooldown_sec=args.cooldown_sec,
+            )
+            parts.append(fin_out)
+            return sum(len(v) for v in res.values())
+
+        run_parallel(base, shards, output, finalize=_finish_missing)
         return 0
 
     # --- один город: режем по категориям ---
