@@ -4605,6 +4605,20 @@ def run_parallel(base_argv: list[str], shards: list[list[str]], output: str) -> 
     """
     import subprocess
 
+    # Страховка: любой None/число в argv роняет Popen ДО старта воркеров, то
+    # есть длинный прогон падает на ровном месте из-за одного забытого флага.
+    def _argv_clean(items: list[Any], where: str) -> list[str]:
+        out = []
+        for it in items:
+            if it is None:
+                log.warning("Пропускаю пустой аргумент в %s — проверь вызов", where)
+                continue
+            out.append(it if isinstance(it, str) else str(it))
+        return out
+
+    base_argv = _argv_clean(base_argv, "общих аргументах")
+    shards = [_argv_clean(s, f"аргументах воркера {i}") for i, s in enumerate(shards, 1)]
+
     out_path = Path(output)
     n = len(shards)
     parts = [_part_path(out_path, i + 1) for i in range(n)]
@@ -4640,6 +4654,7 @@ def run_parallel(base_argv: list[str], shards: list[list[str]], output: str) -> 
 
         # Ждём воркеров, периодически показывая живой прогресс по их файлам.
         last_report = 0.0
+        seen_counts = [0] * n
         while any(p.poll() is None for p in procs):
             time.sleep(3)
             if time.time() - last_report < 30:
@@ -4648,6 +4663,11 @@ def run_parallel(base_argv: list[str], shards: list[list[str]], output: str) -> 
             counts, total = [], 0
             for i, part in enumerate(parts, 1):
                 cnt = len(_load_existing_orgs(part)) if part.exists() else 0
+                # Воркер может как раз перезаписывать файл — чтение упадёт и
+                # вернёт 0. Не пугаем цифрой «0», показываем последнее живое.
+                if cnt == 0 and seen_counts[i - 1]:
+                    cnt = seen_counts[i - 1]
+                seen_counts[i - 1] = cnt
                 alive = "" if procs[i - 1].poll() is None else " ✓"
                 counts.append(f"w{i}: {cnt}{alive}")
                 total += cnt
@@ -5464,7 +5484,15 @@ def _dispatch_parallel(args, workers: int, headless: bool) -> int | None:
     минус то, что уникально для каждого (-o, --workers, --cities, --shard).
     """
     # Общая часть командной строки для всех воркеров.
-    base: list[str] = ["--tld", args.tld]
+    base: list[str] = []
+    # ВНИМАНИЕ: у большинства флагов default=None — класть их в argv без
+    # проверки нельзя, subprocess.Popen падает на None ещё до старта воркеров.
+    if args.tld:
+        base += ["--tld", args.tld]
+    if args.ll:
+        base += ["--ll", args.ll]
+    if args.z:
+        base += ["--z", str(args.z)]
     if args.api_intercept:
         base.append("--api-intercept")
     if args.detail:
