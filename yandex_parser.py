@@ -147,6 +147,108 @@ KZ_CITIES: dict[str, str] = {
     "Туркестан": "68.2517,43.3017",
     "Кокшетау": "69.3833,53.2833",
 }
+
+# Остальные города и крупные посёлки Казахстана — вторая волна охвата.
+# Координаты приблизительные (центр населённого пункта); точность тут не
+# критична: вьюпорт z=12 накрывает ~0.35°, а название города всё равно уходит
+# в текст запроса («АЗС Кентау»), так что Яндекс доводит выдачу сам.
+KZ_CITIES_EXTRA: dict[str, str] = {
+    # Карагандинская / Улытау
+    "Жезказган": "67.7144,47.7833",
+    "Сатпаев": "67.5433,47.8975",
+    "Балхаш": "74.9833,46.8481",
+    "Шахтинск": "72.5875,49.7089",
+    "Сарань": "72.8667,49.8000",
+    "Абай": "72.8667,49.6333",
+    "Приозёрск": "73.7000,46.0333",
+    "Каражал": "70.8000,48.0333",
+    "Каркаралинск": "75.4667,49.4000",
+    "Атасу": "71.6500,48.6833",
+    # Павлодарская
+    "Экибастуз": "75.3167,51.7244",
+    "Аксу": "76.9167,52.0333",
+    # Костанайская
+    "Рудный": "63.1167,52.9667",
+    "Лисаковск": "62.5000,52.5333",
+    "Аркалык": "66.9167,50.2500",
+    "Житикара": "61.2000,52.1833",
+    "Тобыл": "63.5500,53.1500",
+    # Акмолинская
+    "Степногорск": "71.8833,52.3500",
+    "Щучинск": "70.2000,52.9333",
+    "Атбасар": "68.3667,51.8000",
+    "Есиль": "66.4000,51.9500",
+    "Макинск": "70.4167,52.6333",
+    "Акколь": "70.9500,51.9833",
+    "Ерейментау": "73.1000,51.6167",
+    "Державинск": "66.3167,51.1000",
+    "Степняк": "70.7833,52.8333",
+    "Косшы": "71.4833,51.0333",
+    # Северо-Казахстанская
+    "Тайынша": "69.7667,53.8500",
+    "Булаево": "70.4333,54.9000",
+    "Мамлютка": "68.5833,54.8667",
+    "Сергеевка": "67.4000,53.8833",
+    # Жетысу / Алматинская
+    "Талдыкорган": "78.3733,45.0156",
+    "Конаев": "77.0667,43.8667",          # бывш. Капшагай
+    "Каскелен": "76.6333,43.2000",
+    "Талгар": "77.2333,43.3000",
+    "Есик": "77.4667,43.3556",
+    "Узынагаш": "76.3167,43.2000",
+    "Шелек": "78.2500,43.6000",
+    "Текели": "78.8167,44.8333",
+    "Ушарал": "80.9833,46.1667",
+    "Сарканд": "79.9167,45.4167",
+    "Жаркент": "80.0000,44.1667",
+    "Отеген батыр": "76.9833,43.4167",
+    # Восточно-Казахстанская / Абай
+    "Риддер": "83.5111,50.3439",
+    "Алтай": "84.2667,49.7167",           # бывш. Зыряновск
+    "Шемонаиха": "81.9167,50.6333",
+    "Серебрянск": "83.2833,49.6833",
+    "Зайсан": "84.8667,47.4667",
+    "Урджар": "81.6167,47.1000",
+    "Курчатов": "78.5417,50.7500",
+    "Аягоз": "80.4353,47.9639",
+    "Шар": "81.0500,49.5833",
+    # Туркестанская
+    "Кентау": "68.5069,43.5169",
+    "Арыс": "68.8000,42.4333",
+    "Ленгер": "69.8833,42.1833",
+    "Сарыагаш": "69.1667,41.4667",
+    "Шардара": "67.9667,41.2500",
+    # Жамбылская
+    "Каратау": "70.4667,43.1667",
+    "Жанатас": "69.7333,43.5667",
+    "Шу": "73.7667,43.6000",
+    "Мерке": "73.1833,42.8667",
+    "Кордай": "74.7000,43.0833",
+    # Кызылординская
+    "Аральск": "61.6667,46.8000",
+    "Казалинск": "62.1000,45.7667",
+    "Байконур": "63.3167,45.6167",
+    "Шиели": "66.7500,44.1833",
+    "Жанакорган": "67.2500,43.9000",
+    # Актюбинская
+    "Хромтау": "58.4333,50.2500",
+    "Кандыагаш": "57.4167,49.4667",
+    "Алга": "57.3333,49.9000",
+    "Эмба": "58.1500,48.8333",
+    "Шалкар": "59.6000,47.8333",
+    # Атырауская / Мангистауская
+    "Кульсары": "54.0167,46.9667",
+    "Макат": "53.3333,47.6500",
+    "Жанаозен": "52.8600,43.3417",
+    "Бейнеу": "55.2000,45.3167",
+    "Форт-Шевченко": "50.2667,44.5167",
+    # Западно-Казахстанская
+    "Аксай": "48.2833,51.1667",
+}
+
+#: Полный список для --all-cities: областные центры + остальные города.
+KZ_CITIES_ALL: dict[str, str] = {**KZ_CITIES, **KZ_CITIES_EXTRA}
+
 KZ_COUNTRY_LL = "66.9237,48.0196"   # весь Казахстан (регион 159), использовать с z=5
 DEFAULT_CITY_Z = 12                 # зум для сбора по городу
 
@@ -248,8 +350,8 @@ def set_viewport(city: str | None = None, ll: str | None = None, z: int | None =
     global MAP_LL, MAP_Z
     if ll:
         MAP_LL, MAP_Z = ll, (z or DEFAULT_CITY_Z)
-    elif city and city in KZ_CITIES:
-        MAP_LL, MAP_Z = KZ_CITIES[city], (z or DEFAULT_CITY_Z)
+    elif city and city in KZ_CITIES_ALL:
+        MAP_LL, MAP_Z = KZ_CITIES_ALL[city], (z or DEFAULT_CITY_Z)
     else:
         # Нет города/координат — центрируемся на всей стране домена, если известно.
         _, _, country_ll, country_z = DOMAIN_REGISTRY.get(
@@ -2878,7 +2980,7 @@ _STREET_MARKERS = (
     "бульвар", "б-р", "шоссе", "ш.", "тракт", "проезд", "наб",
     "микрорайон", "мкр", "дом", "здание", "квартал", "кв-л",
 )
-_KZ_CITIES_LOWER = {c.lower() for c in KZ_CITIES}
+_KZ_CITIES_LOWER = {c.lower() for c in KZ_CITIES_ALL}
 
 
 def _loose_addr(address: str) -> str:
@@ -4587,7 +4689,7 @@ def run_doctor() -> None:
         print("    (файлов результатов нет)")
     for f in files:
         try:
-            cnt = len(_load_existing_orgs(f))
+            cnt = len(_load_existing_orgs(f, quiet=True))
             age = (time.time() - f.stat().st_mtime) / 60
             print(f"    {f.name:36s} {cnt:>7} записей, обновлён {age:.0f} мин назад")
         except Exception as exc:
@@ -4627,6 +4729,26 @@ def run_doctor() -> None:
     print("=" * 60)
     print("  Скопируй ЭТОТ вывод целиком и пришли — по нему видно всё.")
     print("=" * 60)
+
+
+def _done_cities(out_path: Path) -> set[str]:
+    """Города, уже пройденные любым прошлым прогоном с этим же файлом.
+
+    Собираем со ВСЕХ частей (out.w1.cities.json, out.w2…, out.finish…), потому
+    что при следующем запуске нарезка по воркерам будет другой: расширили
+    список городов — и город, который в прошлый раз собирал w1, теперь достался
+    бы w2 и был бы собран повторно.
+    """
+    done: set[str] = set()
+    stem = out_path.stem
+    for cj in out_path.parent.glob(f"{stem}*.cities.json"):
+        try:
+            data = json.loads(cj.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                done |= {str(c) for c in data}
+        except Exception:
+            continue
+    return done
 
 
 def _parse_shard(raw: str | None) -> tuple[int, int] | None:
@@ -4783,7 +4905,7 @@ def run_parallel(base_argv: list[str], shards: list[list[str]], output: str,
             last_report = time.time()
             counts, total = [], 0
             for i, part in enumerate(parts, 1):
-                cnt = len(_load_existing_orgs(part)) if part.exists() else 0
+                cnt = len(_load_existing_orgs(part, quiet=True)) if part.exists() else 0
                 # Воркер может как раз перезаписывать файл — чтение упадёт и
                 # вернёт 0. Не пугаем цифрой «0», показываем последнее живое.
                 if cnt == 0 and seen_counts[i - 1]:
@@ -4900,13 +5022,25 @@ def _print_health(parts: list[Path]) -> None:
 # собранные организации сохраняются, при повторном запуске сбор продолжается.
 # ---------------------------------------------------------------------------
 
-def _load_existing_orgs(out_path: Path) -> list[Organization]:
-    """Прочитать уже собранные организации из файла результатов (для resume)."""
+def _load_existing_orgs(out_path: Path, quiet: bool = False) -> list[Organization]:
+    """Прочитать уже собранные организации из файла результатов (для resume).
+
+    quiet=True — для опроса чужих файлов на лету (родитель считает, сколько
+    набрали воркеры). Воркер в этот момент может как раз перезаписывать xlsx,
+    и чтение законно падает («File is not a zip file») — засорять этим лог
+    незачем, счётчик просто покажет прошлое значение.
+    """
+    prev = log.level
+    if quiet:
+        log.setLevel(logging.ERROR)
     try:
         rm = ResumeManager(out_path)
         return rm.existing_orgs()
     except Exception:
         return []
+    finally:
+        if quiet:
+            log.setLevel(prev)
 
 
 def _unit_key(lon: float, lat: float, z: int, q: str) -> str:
@@ -5357,10 +5491,14 @@ def main() -> None:
 
     # Список городов KZ
     if args.list_cities:
-        print("\n🇰🇿 Города Казахстана (ll = долгота,широта):\n")
+        print("\n🇰🇿 Областные центры и крупнейшие города:\n")
         for name, ll in KZ_CITIES.items():
             print(f"  {name:20s} ll={ll}")
-        print(f"\n  Вся страна:          ll={KZ_COUNTRY_LL} (z=5)")
+        print(f"\n🏙  Остальные города и крупные посёлки ({len(KZ_CITIES_EXTRA)}):\n")
+        for name, ll in KZ_CITIES_EXTRA.items():
+            print(f"  {name:20s} ll={ll}")
+        print(f"\n  ИТОГО {len(KZ_CITIES_ALL)} — столько обходит --all-cities")
+        print(f"  Вся страна:          ll={KZ_COUNTRY_LL} (z=5)")
         return
 
     # Режим: показать текущие селекторы
@@ -5592,7 +5730,7 @@ def main() -> None:
         else:
             cats = ["gt"]
         cities = ([c.strip() for c in args.cities.split(",") if c.strip()]
-                  if args.cities else list(KZ_CITIES.keys()))
+                  if args.cities else list(KZ_CITIES_ALL.keys()))
         queries = resolve_categories(cats)
         output = args.output or "kz_cities.xlsx"
         print(f"\n🇰🇿 СБОР ПО ВСЕМ ГОРОДАМ КАЗАХСТАНА")
@@ -5731,7 +5869,18 @@ def _dispatch_parallel(args, workers: int, headless: bool) -> int | None:
     if args.all_cities:
         output = args.output or "kz_cities.xlsx"
         cities = ([c.strip() for c in args.cities.split(",") if c.strip()]
-                  if args.cities else list(KZ_CITIES.keys()))
+                  if args.cities else list(KZ_CITIES_ALL.keys()))
+        # Что уже собрано прошлыми прогонами — заново не трогаем. Это делает
+        # расширение списка городов дешёвым: доберутся только новые.
+        already = _done_cities(Path(output))
+        todo = [c for c in cities if c not in already]
+        if already:
+            log.info("Уже собрано ранее: %d город(ов) — пропускаю их", len(already))
+        if not todo:
+            print(f"\n✅ Все {len(cities)} город(ов) уже собраны в {output} — работы нет.")
+            print("   Хочешь пересобрать заново — удали *.cities.json рядом с файлом.")
+            return 0
+        cities = todo
         if len(cities) < 2:
             log.warning("Городов меньше двух — параллелить нечего, иду в один браузер")
             return None
@@ -5751,7 +5900,7 @@ def _dispatch_parallel(args, workers: int, headless: bool) -> int | None:
             Каждый воркер отмечает пройденные города в своём .cities.json —
             складываем их и смотрим, чего в сумме не хватает до полного списка.
             """
-            done: set[str] = set()
+            done: set[str] = set(already)
             for part in parts:
                 cj = part.with_name(part.stem + ".cities.json")
                 if not cj.exists():
