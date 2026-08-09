@@ -72,6 +72,16 @@ except ImportError:
     )
     log_lib = "playwright"
 
+# Windows: консоль по умолчанию cp866/cp1251 — любой эмодзи в логе (📂, ✅, ⚠️)
+# роняет процесс UnicodeEncodeError. Переводим потоки в UTF-8 до настройки
+# логгера (StreamHandler захватывает sys.stderr при создании).
+if sys.platform == "win32":
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s  %(message)s",
@@ -1013,6 +1023,39 @@ CATEGORIES: dict[str, list[str]] = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Пресеты сегментов рынка
+#
+# Отдельно от CATEGORIES: пресеты пересекаются с группами каталога
+# («АЗС» есть и в «авто»), поэтому в --all-categories они не попадают,
+# иначе одни и те же запросы прогонялись бы дважды.
+# ---------------------------------------------------------------------------
+
+#: GT (General Trade) — традиционная розница: АЗС + продуктовые точки.
+GT_FUEL: list[str] = [
+    "АЗС",
+    "АГЗС",
+    "газовая заправка",
+]
+
+GT_GROCERY: list[str] = [
+    "продуктовый магазин",
+    "супермаркет",
+    "минимаркет",
+    "гипермаркет",
+    "магазин у дома",
+    "продуктовый рынок",
+]
+
+PRESETS: dict[str, list[str]] = {
+    "gt": GT_FUEL + GT_GROCERY,
+    "gt-азс": GT_FUEL,
+    "gt-fuel": GT_FUEL,
+    "gt-магазины": GT_GROCERY,
+    "gt-grocery": GT_GROCERY,
+}
+
+
 def list_categories() -> None:
     """Вывести каталог категорий в консоль."""
     print("\n📂 Каталог категорий (аналог 2ГИС):\n")
@@ -1021,26 +1064,49 @@ def list_categories() -> None:
         for item in items:
             print(f"    • {item}")
         print()
+    print("🏪 Пресеты сегментов:\n")
+    for preset, items in PRESETS.items():
+        print(f"  [{preset}]")
+        print(f"    {', '.join(items)}")
+    print()
     print("Использование:")
     print('  python yandex_parser.py --city Алматы --category еда')
     print('  python yandex_parser.py --city Астана --category еда рестораны кафе')
     print('  python yandex_parser.py --city Шымкент --all-categories')
+    print('  python yandex_parser.py --country --category gt -o kz_gt.xlsx')
 
 
 def resolve_categories(names: list[str]) -> list[str]:
     """Преобразовать названия групп/категорий в список поисковых запросов.
 
-    Принимает как названия групп (еда, авто), так и конкретные запросы
-    (рестораны, кафе). Если имя совпадает с группой — разворачивает все
-    подкатегории. Иначе трактует как прямой поисковый запрос.
+    Принимает названия групп каталога (еда, авто), пресеты сегментов
+    (gt, gt-азс) и конкретные запросы (рестораны, кафе). Группа/пресет
+    разворачивается в список подзапросов, всё остальное трактуется как
+    прямой поисковый запрос. Дубликаты убираются с сохранением порядка.
     """
     queries: list[str] = []
+    seen: set[str] = set()
+
+    def _add(item: str) -> None:
+        item = item.strip()
+        if not item:
+            return
+        key = item.casefold()
+        if key in seen:
+            return
+        seen.add(key)
+        queries.append(item)
+
     for name in names:
         key = name.lower().strip()
         if key in CATEGORIES:
-            queries.extend(CATEGORIES[key])
+            for item in CATEGORIES[key]:
+                _add(item)
+        elif key in PRESETS:
+            for item in PRESETS[key]:
+                _add(item)
         else:
-            queries.append(name.strip())
+            _add(name)
     return queries
 
 
@@ -3252,6 +3318,15 @@ def _resolve_display(headless: bool) -> bool:
     """
     global _virtual_display, _SERVER_MODE
     if not sys.platform.startswith("linux"):
+        # Windows/macOS — есть настоящий рабочий стол и настоящая видеокарта.
+        # Headless тут — чистая потеря: Яндекс палит его по силуэту сигналов,
+        # а выигрыша нет (окно всё равно рисует локальный GPU). Поэтому по
+        # умолчанию идём HEADFUL; принудительный headless — YAMAP_HEADLESS=1.
+        if headless and os.environ.get("YAMAP_HEADLESS", "").lower() not in ("1", "true", "yes"):
+            log.info("%s: запускаю Chrome ВИДИМЫМ окном (headless палится Яндексом). "
+                     "Принудительный headless: YAMAP_HEADLESS=1",
+                     "Windows" if sys.platform == "win32" else "macOS")
+            return False
         return headless
     force = os.environ.get("YAMAP_XVFB", "").lower() in ("1", "true", "yes")
     has_display = bool(os.environ.get("DISPLAY"))
@@ -4264,6 +4339,100 @@ def run_category_parser(
     return results
 
 
+def _safe_name(text: str) -> str:
+    """Имя города → безопасное имя файла (Windows не любит \\ / : * ? " < > |)."""
+    cleaned = re.sub(r'[\\/:*?"<>|]+', "_", text).strip(" .")
+    return cleaned[:60] or "city"
+
+
+def run_cities_parser(
+    cities: list[str],
+    categories: list[str],
+    output: str = "kz_cities.xlsx",
+    **kwargs: Any,
+) -> dict[str, list[Organization]]:
+    """Прогнать набор категорий по СПИСКУ городов и слить всё в один файл.
+
+    Отличие от --country: не сплошная сетка по территории (степь, трассы), а
+    только города — быстрее в разы, покрытие «вся розница городов КЗ».
+
+    Каждый город собирается отдельным прогоном (свой вьюпорт ll/z), результаты
+    сливаются с кросс-городской дедупликацией и после КАЖДОГО города
+    перезаписываются в общий файл — прогон можно прерывать без потери данных.
+    """
+    out_path = Path(output)
+    parts_dir = out_path.parent / (out_path.stem + "_parts")
+    merged: dict[str, list[Organization]] = {}
+    seen: set[str] = set()
+    done_file = out_path.parent / (out_path.stem + ".cities.json")
+
+    # Резюме: города, уже пройденные в прошлом запуске той же команды.
+    done: set[str] = set()
+    if done_file.exists():
+        try:
+            done = set(json.loads(done_file.read_text(encoding="utf-8")))
+        except Exception:
+            done = set()
+    # Подхватываем уже собранное из частичных файлов (в т.ч. из прошлого запуска).
+    for city in list(done):
+        for o in _load_existing_orgs(parts_dir / f"{_safe_name(city)}.xlsx"):
+            key = _dedup_key(o)
+            if key not in seen:
+                seen.add(key)
+                merged.setdefault(o.search_query or "Прочее", []).append(o)
+    if done:
+        log.info("Резюме: %d городов уже пройдено, %d организаций поднято из частей",
+                 len(done), len(seen))
+
+    todo = [c for c in cities if c not in done]
+    log.info("Города: %d к сбору (всего %d) | категорий: %d",
+             len(todo), len(cities), len(resolve_categories(categories)))
+
+    for idx, city in enumerate(todo, 1):
+        log.info("═══ Город %d/%d: %s ═══", idx, len(todo), city)
+        set_viewport(city=city)
+        part = parts_dir / f"{_safe_name(city)}.xlsx"
+        try:
+            per_city = run_category_parser(
+                city=city,
+                categories=categories,
+                output=str(part),
+                # Часть города как resume-файл: если прошлый запуск оборвался
+                # ПОСЕРЕДИНЕ города, уже собранные категории не переспрашиваем.
+                resume_path=part if part.exists() else None,
+                **kwargs,
+            )
+        except KeyboardInterrupt:
+            log.warning("Прервано пользователем на городе %s", city)
+            break
+        except Exception as exc:
+            log.error("Город %s упал (%s) — иду дальше", city, exc)
+            continue
+
+        added = 0
+        for query, orgs in per_city.items():
+            bucket = merged.setdefault(query, [])
+            for o in orgs:
+                key = _dedup_key(o)
+                if key in seen:
+                    continue
+                seen.add(key)
+                bucket.append(o)
+                added += 1
+        done.add(city)
+        log.info("%s: +%d новых (всего %d)", city, added, len(seen))
+
+        # Инкрементальное сохранение — прерывание не теряет данные.
+        save_xlsx_by_categories(merged, out_path)
+        try:
+            done_file.write_text(json.dumps(sorted(done), ensure_ascii=False),
+                                 encoding="utf-8")
+        except Exception as exc:
+            log.warning("Не сохранил прогресс по городам: %s", exc)
+
+    return merged
+
+
 # ---------------------------------------------------------------------------
 # Национальный свип — сплошной сбор по ВСЕЙ территории страны сеткой вьюпортов
 # (города, посёлки, трассы). Устойчив к перезапуску: прогресс по тайлам и уже
@@ -4614,6 +4783,12 @@ def main() -> None:
              "Запрос из позиционного аргумента или --category (напр. \"АЗС\" --country).",
     )
     parser.add_argument(
+        "--all-cities", action="store_true",
+        help="Прогнать --category по ВСЕМ городам Казахстана из справочника "
+             "(см. --list-cities) и слить в один файл. Быстрее --country: "
+             "только города, без сплошной сетки по степи и трассам.",
+    )
+    parser.add_argument(
         "--step", type=float, default=COUNTRY_STEP_DEG,
         help=f"Шаг национальной сетки в градусах (по умолч. {COUNTRY_STEP_DEG}; "
              "меньше = плотнее и дольше, напр. 0.15 — очень плотно, 0.3 — быстрее).",
@@ -4881,6 +5056,44 @@ def main() -> None:
             cooldown_sec=args.cooldown_sec,
         )
         print(f"\nГотово (или приостановлено)! Собрано {len(orgs)} организаций -> {output}")
+        return
+
+    # Режим: категории по ВСЕМ городам Казахстана
+    if args.all_cities:
+        if args.all_categories:
+            cats = list(CATEGORIES.keys())
+        elif args.category:
+            cats = args.category
+        elif args.query:
+            cats = [args.query]
+        else:
+            cats = ["gt"]
+        cities = list(KZ_CITIES.keys())
+        queries = resolve_categories(cats)
+        output = args.output or "kz_cities.xlsx"
+        print(f"\n🇰🇿 СБОР ПО ВСЕМ ГОРОДАМ КАЗАХСТАНА")
+        print(f"   Города:    {len(cities)} ({', '.join(cities[:6])}, …)")
+        print(f"   Запросы:   {', '.join(queries)}")
+        print(f"   Прогонов:  {len(cities) * len(queries)} (город × запрос)")
+        print(f"   Файл:      {output}  (+ {Path(output).stem}.cities.json для докачки)")
+        print(f"   ⚠️  Прогресс пишется после КАЖДОГО города — Ctrl+C безопасен,")
+        print(f"       повторный запуск той же команды продолжит с нужного места.\n")
+        results = run_cities_parser(
+            cities=cities,
+            categories=cats,
+            output=output,
+            max_results_per_category=args.max_results,
+            headless=headless,
+            detail=args.detail,
+            scroll_pause=args.scroll_pause,
+            api_intercept=args.api_intercept,
+            proxy_url=proxy_url,
+            cooldown_every=args.cooldown_every,
+            cooldown_sec=args.cooldown_sec,
+            grid=args.grid,
+        )
+        total = sum(len(v) for v in results.values())
+        print(f"\nГотово! Собрано {total} организаций по {len(cities)} городам -> {output}")
         return
 
     # Режим: парсинг по категориям

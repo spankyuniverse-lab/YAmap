@@ -1,0 +1,7 @@
+# cmd.exe криво исполняет .bat с LF-переводами строк (ломается goto/скобочные
+# блоки) — при checkout на Windows они должны получить CRLF.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+*.sh  text eol=lf
+*.py  text eol=lf

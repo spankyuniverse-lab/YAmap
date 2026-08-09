@@ -2,7 +2,9 @@ __pycache__/
 *.pyc
 .env
 venv/
+.venv/
 results/
+*_parts/
 *.xlsx
 *.csv
 .browser_profile/

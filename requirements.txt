@@ -2,4 +2,6 @@ patchright>=1.50.0
 openpyxl>=3.1.0
 tqdm>=4.60.0
 pyyaml>=6.0
-pyvirtualdisplay>=3.0    # авто-Xvfb на headless-сервере (нужен системный xvfb)
+# Авто-Xvfb на headless-сервере (нужен системный xvfb). На Windows/macOS не
+# ставится и не нужен — там браузер идёт видимым окном на настоящем рабочем столе.
+pyvirtualdisplay>=3.0 ; sys_platform == "linux"
