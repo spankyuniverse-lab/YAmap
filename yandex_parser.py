@@ -48,6 +48,15 @@ try:
 except ImportError:
     HAS_TQDM = False
 
+# Прогресс-бар только в живой консоли. При редиректе в файл (параллельные
+# воркеры пишут в logs/workerN.log) tqdm плюёт по строке на каждое обновление —
+# лог распухает на десятки тысяч строк и в нём не найти ничего полезного.
+try:
+    if HAS_TQDM and not sys.stderr.isatty():
+        HAS_TQDM = False
+except Exception:
+    pass
+
 # Patchright — drop-in замена Playwright без Runtime.enable CDP-утечки.
 # SmartCaptcha/Cloudflare/DataDome детектят Playwright через Runtime.enable —
 # patchright обходит это, выполняя JS в изолированных execution contexts.
@@ -299,7 +308,11 @@ def setup_file_logging() -> Path:
     остаёмся на консольном логировании.
     """
     global _file_logging_ready
-    log_path = LOGS_DIR / f"yamap_{time.strftime('%Y-%m-%d')}.log"
+    # У параллельных воркеров — свой файл: на Windows несколько процессов,
+    # пишущих в один лог, дерутся за файл и мешают строки друг друга.
+    worker = os.environ.get("YAMAP_WORKER")
+    suffix = f"_w{worker}" if worker else ""
+    log_path = LOGS_DIR / f"yamap_{time.strftime('%Y-%m-%d')}{suffix}.log"
     if _file_logging_ready:
         return log_path
     try:
@@ -905,8 +918,16 @@ class ResumeManager:
 # Config file support (YAML/JSON)
 # ---------------------------------------------------------------------------
 
+#: Потолок организаций на один поисковый запрос/категорию. Яндекс на один вид
+#: карты отдаёт заметно меньше, поэтому лимит фактически не режет выдачу —
+#: он лишь страхует от бесконечного скролла.
+DEFAULT_MAX_RESULTS = 5000
+#: Для --country лимит СВОЙ и намеренно низкий: тайлов десятки тысяч, и упор
+#: в лимит там означает «тайл плотный» → он делится на под-тайлы (quadtree).
+COUNTRY_MAX_PER_TILE = 250
+
 DEFAULT_CONFIG: dict[str, Any] = {
-    "max_results": 500,
+    "max_results": DEFAULT_MAX_RESULTS,
     "scroll_pause": 1.0,
     "headless": True,
     "detail": False,
@@ -1139,7 +1160,13 @@ ITEM_SEL = "[class*='search-snippet-view']"
 # Ссылка-оверлей на карточку организации
 LINK_SEL = "[class*='search-snippet-view__link-overlay']"
 # Кнопка «Показать ещё»
-SHOW_MORE_SEL = "[class*='show-more'] button, [class*='search-list-view__more'] button"
+# Только внутри списка результатов: голый [class*='show-more'] ловил ещё и
+# кнопку «Все фильтры» из search-full-filters-view.
+SHOW_MORE_SEL = (
+    "[class*='search-list-view__more'] button, "
+    "[class*='search-list-view'] [class*='show-more'] button, "
+    "[class*='search-list-view'] [class*='load-more'] button"
+)
 
 # -- Поля внутри сниппета (список результатов) --
 SNIPPET_TITLE_SEL = "[class*='search-business-snippet-view__title']"
@@ -1519,11 +1546,14 @@ _JS_DETECT_SCROLL = """() => {
 
 
 _JS_DETECT_SHOW_MORE = """() => {
-    // Кнопка «Показать ещё» / «Ещё» / «Show more»
+    // Кнопка «Показать ещё» / «Ещё» / «Show more».
+    // ВАЖНО: подстрока show-more есть и у панели фильтров Яндекса, поэтому
+    // кандидат обязан подтвердиться текстом — иначе закешируем «Все фильтры».
+    const OK = /показать|ещё|еще|загрузить|more/i;
     const patterns = ['show-more', 'search-list-view__more', 'load-more'];
     for (const pat of patterns) {
         const el = document.querySelector(`[class*="${pat}"] button, button[class*="${pat}"]`);
-        if (el) {
+        if (el && OK.test((el.textContent || '') + ' ' + (el.getAttribute('aria-label') || ''))) {
             const cls = Array.from(el.parentElement.classList).find(c => c.length > 4) ||
                         Array.from(el.classList).find(c => c.length > 4);
             if (cls) return `[class*="${cls.replace(/^_[a-f0-9]+_/i, '')}"] button`;
@@ -1810,18 +1840,68 @@ def _get_loaded_count(page: Page) -> int:
     return page.locator(engine.get("item")).count()
 
 
+# JS-клик по «Показать ещё» с проверкой ПО ТЕКСТУ.
+#
+# Почему не голый locator.click(): у Яндекса класс с подстрокой show-more есть и
+# на панели фильтров, и селектор ловил кнопку «Все фильтры». Клик по ней
+# раскрывал выпадашку, та перехватывала указатель, Playwright 30 секунд ждал
+# «стабильности» и валил весь поиск в retry. Поэтому: кандидат обязан выглядеть
+# как «показать ещё» по тексту/aria и не лежать внутри фильтров-дропдауна,
+# а сам клик делаем из JS — ему не мешают перекрывающие оверлеи.
+_JS_CLICK_SHOW_MORE = r"""(sel) => {
+    const BAD  = /фильтр|filter|dropdown|popup|modal|toolbar|tabs|header/i;
+    const GOOD = /показать\s+ещ|показать\s+больш|загрузить\s+ещ|ещё\s*\d|еще\s*\d|show\s+more|load\s+more/i;
+    const cands = [];
+    if (sel) { try { for (const el of document.querySelectorAll(sel)) cands.push(el); } catch (e) {} }
+    for (const el of document.querySelectorAll('button, a[role="button"], div[role="button"]')) cands.push(el);
+
+    const clsOf = (el) => {
+        const c = el.className;
+        if (typeof c === 'string') return c;
+        if (c && typeof c.baseVal === 'string') return c.baseVal;   // SVG
+        return '';
+    };
+    for (const el of cands) {
+        if (!el || el.nodeType !== 1) continue;
+        const txt  = (el.textContent || '').trim();
+        const aria = el.getAttribute('aria-label') || '';
+        if (BAD.test(aria)) continue;
+        if (!GOOD.test(txt) && !GOOD.test(aria)) continue;
+        if (el.disabled) continue;
+        // Не внутри панели фильтров / выпадашки.
+        let bad = false;
+        for (let p = el, i = 0; p && i < 10; p = p.parentElement, i++) {
+            if (BAD.test(clsOf(p))) { bad = true; break; }
+        }
+        if (bad) continue;
+        const r = el.getBoundingClientRect();
+        if (r.width < 2 || r.height < 2) continue;      // невидимая/схлопнутая
+        try { el.scrollIntoView({block: 'center'}); } catch (e) {}
+        el.click();
+        return (txt || aria).slice(0, 60);
+    }
+    return null;
+}"""
+
+
 def _click_show_more(page: Page) -> bool:
-    """Нажать кнопку «Показать ещё», если она видна."""
+    """Нажать «Показать ещё», если такая кнопка реально есть.
+
+    Никогда не бросает исключение: подгрузка «ещё» — необязательная оптимизация,
+    её падение не должно ронять весь поиск (раньше роняло и уводило в retry).
+    """
     engine = get_selector_engine()
-    sel = engine.get("show_more")
-    if not sel:
+    sel = engine.get("show_more") or ""
+    try:
+        label = page.evaluate(_JS_CLICK_SHOW_MORE, sel)
+    except Exception as exc:
+        log.debug("«Показать ещё»: клик не удался (%s) — не критично", exc)
         return False
-    btn = page.locator(sel).first
-    if btn.count() > 0 and btn.is_visible():
-        btn.click()
-        page.wait_for_timeout(1500)
-        return True
-    return False
+    if not label:
+        return False
+    log.debug("Клик «Показать ещё»: %s", label)
+    page.wait_for_timeout(1200)
+    return True
 
 
 # JS: за ОДИН проход извлекаем все видимые сниппеты (имя/адрес/…/ссылка).
@@ -3243,7 +3323,10 @@ _WEBGL_SPOOF_JS = r"""(() => {
 })();"""
 
 
-BROWSER_DATA_DIR = Path(".browser_profile")
+# Persistent-профиль браузера. Каждый параллельный воркер ДОЛЖЕН иметь свой:
+# один каталог профиля = один Chrome, второй просто не стартует («profile in use»).
+# Родитель раздаёт воркерам YAMAP_PROFILE_DIR (.browser_profile_w1, _w2, …).
+BROWSER_DATA_DIR = Path(os.environ.get("YAMAP_PROFILE_DIR") or ".browser_profile")
 
 
 # ---------------------------------------------------------------------------
@@ -4434,6 +4517,179 @@ def run_cities_parser(
 
 
 # ---------------------------------------------------------------------------
+# Параллельный запуск — несколько браузеров одновременно
+#
+# Каждый воркер — ОТДЕЛЬНЫЙ процесс того же скрипта со своим Chrome, своим
+# профилем, своим файлом результатов и своим прогрессом. Родитель только режет
+# работу на части, следит за воркерами и сливает их файлы в один.
+#
+# Почему процессы, а не потоки: sync-API Playwright не потокобезопасен, а один
+# persistent-профиль Chrome нельзя открыть дважды. Процессы дают полную
+# изоляцию и переживают падение соседа.
+# ---------------------------------------------------------------------------
+
+#: Больше — не всегда лучше: все воркеры сидят на ОДНОМ IP, и Яндекс считает
+#: запросы именно по нему. 2–3 браузера дом. интернет тянет, 6+ почти
+#: гарантированно приводят к капче на всех сразу.
+MAX_WORKERS = 8
+
+
+def _split_round_robin(items: list[Any], n: int) -> list[list[Any]]:
+    """Раздать элементы по n воркерам вперемешку (1,2,3,1,2,3,…).
+
+    Именно вперемешку, а не блоками: подряд идущие города/тайлы похожи по
+    плотности, и нарезка блоками дала бы одному воркеру все миллионники,
+    а другому — одну степь.
+    """
+    buckets: list[list[Any]] = [[] for _ in range(n)]
+    for i, item in enumerate(items):
+        buckets[i % n].append(item)
+    return [b for b in buckets if b]
+
+
+def _parse_shard(raw: str | None) -> tuple[int, int] | None:
+    """«0/3» → (0, 3). Кривое значение молча игнорируем (работаем как без шарда)."""
+    if not raw:
+        return None
+    try:
+        i_s, n_s = raw.split("/", 1)
+        i, n = int(i_s), int(n_s)
+    except (ValueError, AttributeError):
+        log.warning("Не понял --shard %r (ожидаю i/N, напр. 0/3) — игнорирую", raw)
+        return None
+    if n < 1 or not (0 <= i < n):
+        log.warning("--shard %r вне диапазона — игнорирую", raw)
+        return None
+    return (i, n)
+
+
+def _part_path(out_path: Path, idx: int) -> Path:
+    """Файл результатов воркера: kz_gt.xlsx → kz_gt.w1.xlsx."""
+    return out_path.with_name(f"{out_path.stem}.w{idx}{out_path.suffix}")
+
+
+def _merge_parts(parts: list[Path], out_path: Path) -> list[Organization]:
+    """Слить файлы воркеров в один итоговый (с дедупликацией между ними)."""
+    merged: list[Organization] = []
+    seen: set[str] = set()
+    # Уже существующий итоговый файл тоже подхватываем — иначе повторный запуск
+    # с меньшим числом воркеров затёр бы ранее собранное.
+    for src in [out_path, *parts]:
+        if not src.exists():
+            continue
+        for o in _load_existing_orgs(src):
+            key = _dedup_key(o)
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(o)
+    merged = _finalize_orgs(merged)
+    if not merged:
+        return merged
+    if out_path.suffix.lower() in (".csv", ".json"):
+        _save_auto(merged, out_path)
+    else:
+        grouped: dict[str, list[Organization]] = {}
+        for o in merged:
+            grouped.setdefault(o.search_query or "Прочее", []).append(o)
+        save_xlsx_by_categories(grouped, out_path)
+    return merged
+
+
+def run_parallel(base_argv: list[str], shards: list[list[str]], output: str) -> int:
+    """Запустить N воркеров-процессов и слить результаты.
+
+    base_argv — общие аргументы командной строки, shards[i] — аргументы,
+    уникальные для i-го воркера (свой список городов / свой шард тайлов).
+    Возвращает число собранных организаций.
+    """
+    import subprocess
+
+    out_path = Path(output)
+    n = len(shards)
+    parts = [_part_path(out_path, i + 1) for i in range(n)]
+    LOGS_DIR.mkdir(exist_ok=True)
+
+    procs: list[subprocess.Popen] = []
+    log_files = []
+    print(f"\n🧵 ПАРАЛЛЕЛЬНЫЙ РЕЖИМ: {n} браузер(ов) одновременно")
+    print(f"   Итоговый файл: {output} (сливается из частей .w1…{'.w%d' % n})")
+    print(f"   Логи воркеров: logs/worker1.log … logs/worker{n}.log")
+    print(f"   ⚠️  Все воркеры идут с ОДНОГО IP. Если посыпалась капча —")
+    print(f"       уменьши число браузеров, это единственное лечение.\n")
+
+    try:
+        for i, extra in enumerate(shards, 1):
+            argv = [sys.executable, os.path.abspath(__file__), *base_argv, *extra,
+                    "-o", str(_part_path(out_path, i))]
+            env = dict(os.environ)
+            # Свой профиль Chrome и свой лог-файл на воркера — иначе второй
+            # Chrome не стартует на занятом профиле.
+            env["YAMAP_PROFILE_DIR"] = f".browser_profile_w{i}"
+            env["YAMAP_WORKER"] = str(i)
+            lf = open(LOGS_DIR / f"worker{i}.log", "w", encoding="utf-8", errors="replace")
+            log_files.append(lf)
+            procs.append(subprocess.Popen(argv, env=env, stdout=lf,
+                                          stderr=subprocess.STDOUT))
+            log.info("Воркер %d/%d запущен (pid %s): %s", i, n, procs[-1].pid,
+                     " ".join(extra) or "—")
+            # Разносим старты: N одинаковых сессий, стартующих в одну секунду,
+            # выглядят как бот-ферма даже с одного нормального IP.
+            if i < n:
+                time.sleep(random.uniform(4.0, 9.0))
+
+        # Ждём воркеров, периодически показывая живой прогресс по их файлам.
+        last_report = 0.0
+        while any(p.poll() is None for p in procs):
+            time.sleep(3)
+            if time.time() - last_report < 30:
+                continue
+            last_report = time.time()
+            counts, total = [], 0
+            for i, part in enumerate(parts, 1):
+                cnt = len(_load_existing_orgs(part)) if part.exists() else 0
+                alive = "" if procs[i - 1].poll() is None else " ✓"
+                counts.append(f"w{i}: {cnt}{alive}")
+                total += cnt
+            print(f"   [{time.strftime('%H:%M:%S')}] {' | '.join(counts)}  →  всего ~{total}")
+    except KeyboardInterrupt:
+        print("\n⏹  Останавливаю воркеров (их прогресс сохранён)…")
+        for p in procs:
+            if p.poll() is None:
+                try:
+                    p.terminate()
+                except Exception:
+                    pass
+        for p in procs:
+            try:
+                p.wait(timeout=30)
+            except Exception:
+                pass
+    finally:
+        for p in procs:
+            if p.poll() is None:
+                try:
+                    p.kill()
+                except Exception:
+                    pass
+        for lf in log_files:
+            try:
+                lf.close()
+            except Exception:
+                pass
+
+    failed = [i + 1 for i, p in enumerate(procs) if p.returncode not in (0, None)]
+    if failed:
+        log.warning("Воркеры с ошибкой: %s — смотри logs/worker<N>.log",
+                    ", ".join(map(str, failed)))
+
+    merged = _merge_parts(parts, out_path)
+    print(f"\n✅ Слито из {n} воркеров: {len(merged)} организаций → {output}")
+    print_stats(merged, label="Статистика (все воркеры)")
+    return len(merged)
+
+
+# ---------------------------------------------------------------------------
 # Национальный свип — сплошной сбор по ВСЕЙ территории страны сеткой вьюпортов
 # (города, посёлки, трассы). Устойчив к перезапуску: прогресс по тайлам и уже
 # собранные организации сохраняются, при повторном запуске сбор продолжается.
@@ -4474,6 +4730,7 @@ def run_country_sweep(
     save_every_tiles: int = 8,
     adaptive: bool = True,
     min_span: float = 0.03,
+    shard: tuple[int, int] | None = None,
 ) -> list[Organization]:
     """Сплошной сбор по ВСЕЙ стране с АДАПТИВНЫМ уплотнением (quadtree).
 
@@ -4499,6 +4756,13 @@ def run_country_sweep(
     base_z = tile_z if tile_z and tile_z > 0 else _zoom_for_span(step_deg)
 
     base_tiles = country_grid(step_deg)
+    if shard:
+        idx, total = shard
+        # Тайлы режем по остатку — воркеры получают чередующиеся ячейки, то есть
+        # каждому достаётся вперемешку и город, и степь (равномерная загрузка).
+        # Под-тайлы остаются внутри своего воркера, поэтому пересечений нет.
+        base_tiles = [t for i, t in enumerate(base_tiles) if i % total == idx]
+        log.info("Шард %d/%d: %d тайлов из общей сетки", idx + 1, total, len(base_tiles))
     log.info("НАЦИОНАЛЬНЫЙ СВИП (адаптивный=%s): база %d тайлов × %d запрос(ов); "
              "шаг %.2f° z=%d (авто под размер тайла), деление до %.3f°",
              adaptive, len(base_tiles), len(queries), step_deg, base_z, min_span)
@@ -4744,8 +5008,10 @@ def main() -> None:
         help="Парсить все категории из каталога",
     )
     parser.add_argument(
-        "--max-results", "-n", type=int, default=500,
-        help="Максимум организаций на запрос/категорию (по умолчанию 500)",
+        "--max-results", "-n", type=int, default=None,
+        help=f"Максимум организаций на запрос/категорию (по умолчанию "
+             f"{DEFAULT_MAX_RESULTS}; для --country — {COUNTRY_MAX_PER_TILE} на "
+             f"тайл, там тайлов десятки тысяч). 0 = без лимита, брать всё.",
     )
     parser.add_argument(
         "--output", "-o", default=None,
@@ -4787,6 +5053,23 @@ def main() -> None:
         help="Прогнать --category по ВСЕМ городам Казахстана из справочника "
              "(см. --list-cities) и слить в один файл. Быстрее --country: "
              "только города, без сплошной сетки по степи и трассам.",
+    )
+    parser.add_argument(
+        "--workers", "-w", type=int, default=1,
+        help=f"Сколько браузеров гнать ОДНОВРЕМЕННО (1-{MAX_WORKERS}, по умолч. 1). "
+             "Работа режется между воркерами: по городам (--all-cities), "
+             "по тайлам (--country) или по категориям (--city). Все воркеры "
+             "сидят на одном IP — 2-3 безопасно, больше = риск капчи.",
+    )
+    parser.add_argument(
+        "--cities", default=None,
+        help="Явный список городов через запятую для --all-cities "
+             "(родитель раздаёт их воркерам этим флагом).",
+    )
+    parser.add_argument(
+        "--shard", default=None,
+        help="Доля национальной сетки для этого процесса, формат i/N "
+             "(напр. 0/3). Проставляется автоматически при --workers.",
     )
     parser.add_argument(
         "--step", type=float, default=COUNTRY_STEP_DEG,
@@ -5020,6 +5303,25 @@ def main() -> None:
     # Резюме
     resume_path = Path(args.resume) if args.resume else None
 
+    # Лимит выдачи. -n не задан → авто: у обычных режимов свой дефолт, у
+    # --country свой (там лимит на ТАЙЛ, а тайлов десятки тысяч). Явный -n
+    # перекрывает оба; -n 0 = «без лимита, брать всё».
+    max_results = args.max_results if args.max_results is not None else DEFAULT_MAX_RESULTS
+    max_per_tile = (args.max_results if (args.max_results is not None and args.max_results > 0)
+                    else COUNTRY_MAX_PER_TILE)
+
+    # Режим: НЕСКОЛЬКО БРАУЗЕРОВ ОДНОВРЕМЕННО.
+    # Родитель сам ничего не парсит — режет работу и запускает воркеров-детей
+    # (тот же скрипт, --workers 1), потом сливает их файлы в один.
+    if args.workers and args.workers > 1:
+        workers = min(args.workers, MAX_WORKERS)
+        if workers < args.workers:
+            log.warning("Ограничил до %d браузеров: больше с одного IP почти "
+                        "гарантированно даёт капчу на всех сразу", MAX_WORKERS)
+        rc = _dispatch_parallel(args, workers, headless=headless)
+        if rc is not None:
+            return
+
     # Режим: СПЛОШНОЙ национальный свип (вся страна)
     if args.country:
         # Запросы: позиционный аргумент, или категории, или дефолт «АЗС»
@@ -5031,10 +5333,15 @@ def main() -> None:
         else:
             queries = ["АЗС"]
         output = args.output or "kz_" + re.sub(r"[^\w]+", "_", queries[0])[:20] + ".xlsx"
+        shard = _parse_shard(args.shard)
         n_tiles = len(country_grid(args.step))
+        if shard:
+            n_tiles = len([1 for i in range(n_tiles) if i % shard[1] == shard[0]])
         auto_z = args.tile_z if args.tile_z and args.tile_z > 0 else _zoom_for_span(args.step)
         print(f"\n🇰🇿 СПЛОШНОЙ СБОР ПО КАЗАХСТАНУ (адаптивный quadtree)")
         print(f"   Запросы:   {', '.join(queries)}")
+        if shard:
+            print(f"   Шард:      {shard[0] + 1}/{shard[1]} (часть общей сетки)")
         print(f"   База:      {n_tiles} тайлов (шаг {args.step}°, зум z={auto_z} авто)")
         print(f"   Адаптив:   тайл, где Яндекс упёрся в лимит выдачи (город),")
         print(f"              авто-делится на под-тайлы глубже по зуму, пока не")
@@ -5045,7 +5352,7 @@ def main() -> None:
         orgs = run_country_sweep(
             queries=queries,
             output=output,
-            max_per_tile=args.max_results if args.max_results and args.max_results > 0 else 250,
+            max_per_tile=max_per_tile,
             step_deg=args.step,
             tile_z=args.tile_z,
             scroll_pause=args.scroll_pause,
@@ -5054,6 +5361,7 @@ def main() -> None:
             api_intercept=args.api_intercept,
             cooldown_every=args.cooldown_every or 40,
             cooldown_sec=args.cooldown_sec,
+            shard=shard,
         )
         print(f"\nГотово (или приостановлено)! Собрано {len(orgs)} организаций -> {output}")
         return
@@ -5068,7 +5376,8 @@ def main() -> None:
             cats = [args.query]
         else:
             cats = ["gt"]
-        cities = list(KZ_CITIES.keys())
+        cities = ([c.strip() for c in args.cities.split(",") if c.strip()]
+                  if args.cities else list(KZ_CITIES.keys()))
         queries = resolve_categories(cats)
         output = args.output or "kz_cities.xlsx"
         print(f"\n🇰🇿 СБОР ПО ВСЕМ ГОРОДАМ КАЗАХСТАНА")
@@ -5082,7 +5391,7 @@ def main() -> None:
             cities=cities,
             categories=cats,
             output=output,
-            max_results_per_category=args.max_results,
+            max_results_per_category=max_results,
             headless=headless,
             detail=args.detail,
             scroll_pause=args.scroll_pause,
@@ -5108,7 +5417,7 @@ def main() -> None:
         results = run_category_parser(
             city=args.city,
             categories=cats,
-            max_results_per_category=args.max_results,
+            max_results_per_category=max_results,
             output=output,
             headless=headless,
             detail=args.detail,
@@ -5134,7 +5443,7 @@ def main() -> None:
     output = args.output or "results.xlsx"
     orgs = run_parser(
         query=args.query,
-        max_results=args.max_results,
+        max_results=max_results,
         output=output,
         headless=headless,
         detail=args.detail,
@@ -5146,6 +5455,91 @@ def main() -> None:
     )
 
     print(f"\nГотово! Собрано {len(orgs)} организаций -> {output}")
+
+
+def _dispatch_parallel(args, workers: int, headless: bool) -> int | None:
+    """Разложить работу на N воркеров и запустить их. None = делить нечего.
+
+    Аргументы воркерам передаём той же командной строкой, что пришла родителю,
+    минус то, что уникально для каждого (-o, --workers, --cities, --shard).
+    """
+    # Общая часть командной строки для всех воркеров.
+    base: list[str] = ["--tld", args.tld]
+    if args.api_intercept:
+        base.append("--api-intercept")
+    if args.detail:
+        base.append("--detail")
+    if args.no_headless:
+        base.append("--no-headless")
+    if args.max_results is not None:
+        base += ["-n", str(args.max_results)]
+    if args.scroll_pause:
+        base += ["--scroll-pause", str(args.scroll_pause)]
+    if args.cooldown_every:
+        base += ["--cooldown-every", str(args.cooldown_every)]
+    if args.cooldown_sec:
+        base += ["--cooldown-sec", str(args.cooldown_sec)]
+    if args.grid and args.grid > 1:
+        base += ["--grid", str(args.grid)]
+    if args.proxy:
+        base += ["--proxy", args.proxy]
+    if args.proxy_file:
+        base += ["--proxy-file", args.proxy_file]
+
+    # --- вся страна: режем сетку тайлов на шарды ---
+    if args.country:
+        output = args.output or "kz_country.xlsx"
+        base += ["--country", "--step", str(args.step)]
+        if args.tile_z:
+            base += ["--tile-z", str(args.tile_z)]
+        if args.all_categories:
+            base.append("--all-categories")
+        elif args.category:
+            base += ["--category", *args.category]
+        elif args.query:
+            base.append(args.query)
+        shards = [["--shard", f"{i}/{workers}"] for i in range(workers)]
+        run_parallel(base, shards, output)
+        return 0
+
+    # --- все города: раздаём города вперемешку ---
+    if args.all_cities:
+        output = args.output or "kz_cities.xlsx"
+        cities = ([c.strip() for c in args.cities.split(",") if c.strip()]
+                  if args.cities else list(KZ_CITIES.keys()))
+        if len(cities) < 2:
+            log.warning("Городов меньше двух — параллелить нечего, иду в один браузер")
+            return None
+        workers = min(workers, len(cities))
+        base.append("--all-cities")
+        if args.all_categories:
+            base.append("--all-categories")
+        elif args.category:
+            base += ["--category", *args.category]
+        shards = [["--cities", ",".join(chunk)]
+                  for chunk in _split_round_robin(cities, workers)]
+        run_parallel(base, shards, output)
+        return 0
+
+    # --- один город: режем по категориям ---
+    if args.city and (args.category or args.all_categories):
+        cats = list(CATEGORIES.keys()) if args.all_categories else args.category
+        queries = resolve_categories(cats)
+        if len(queries) < 2:
+            log.warning("Запрос всего один — параллелить нечего, иду в один браузер")
+            return None
+        output = args.output or f"{args.city}_categories.xlsx"
+        workers = min(workers, len(queries))
+        base += ["--city", args.city]
+        shards = [["--category", *chunk]
+                  for chunk in _split_round_robin(queries, workers)]
+        run_parallel(base, shards, output)
+        return 0
+
+    log.warning("--workers применим к --all-cities, --country или --city "
+                "--category. Для одиночного запроса делить нечего — "
+                "иду в один браузер.")
+    return None
 
 
 # ---------------------------------------------------------------------------

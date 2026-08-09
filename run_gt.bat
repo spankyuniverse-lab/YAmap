@@ -67,10 +67,22 @@ goto run
 
 :run
 echo.
-echo Запускаю: yandex_parser.py %ARGS%
+echo   Сколько браузеров запустить ОДНОВРЕМЕННО?
+echo     1 - безопасно, капчи почти нет
+echo     2 - вдвое быстрее, риск капчи небольшой ^(рекомендую^)
+echo     3 - втрое быстрее, но капча уже вероятна
+echo     4+ - только если интернет и комп тянут, капча очень вероятна
+echo   Все браузеры идут с ОДНОГО твоего IP - в этом всё дело.
+echo.
+set "W="
+set /p W=Число браузеров [Enter = 2]:
+if "%W%"=="" set "W=2"
+
+echo.
+echo Запускаю: yandex_parser.py %ARGS% --workers %W%
 echo Прогресс сохраняется - Ctrl+C можно жать, повторный запуск продолжит.
 echo.
-"%VPY%" yandex_parser.py %ARGS% -n 500 --api-intercept
+"%VPY%" yandex_parser.py %ARGS% --workers %W% --api-intercept
 echo.
 echo Готово. Файл лежит рядом с этим .bat
 pause
