@@ -5988,6 +5988,61 @@ def _input_yn(prompt: str, default: bool = False) -> bool:
     return raw in ("y", "yes", "д", "да", "1")
 
 
+def _menu_gt() -> None:
+    """Быстрый путь: GT-сегмент по всем городам Казахстана.
+
+    Это самый частый сценарий, и гонять ради него длинный опросник незачем —
+    спрашиваем только два реальных решения (что собираем и сколько браузеров),
+    остальное берём проверенными значениями.
+    """
+    print("\n--- GT-сегмент по всем городам Казахстана ---")
+    print(f"Обход по справочнику: {len(KZ_CITIES_ALL)} городов и посёлков.")
+    print("Прогресс сохраняется — прервать и продолжить можно в любой момент.\n")
+
+    what = _input_choice(
+        "Что собираем? [1]:",
+        [
+            "Только АЗС — быстрее всего, часа 4",
+            "Только продуктовые магазины — ночь",
+            "АЗС + продуктовые — сутки",
+        ],
+        allow_empty=True,
+    ) or "Только АЗС — быстрее всего, часа 4"
+
+    preset, output = {
+        "Только АЗС — быстрее всего, часа 4": ("gt-fuel", "kz_azs.xlsx"),
+        "Только продуктовые магазины — ночь": ("gt-grocery", "kz_grocery.xlsx"),
+        "АЗС + продуктовые — сутки": ("gt", "kz_gt.xlsx"),
+    }[what]
+
+    print("\nСколько браузеров одновременно? Все идут с одного твоего IP:")
+    print("  1 — безопасно, капчи почти нет")
+    print("  2 — вдвое быстрее, риск небольшой (рекомендую)")
+    print("  3 — втрое быстрее, капча уже вероятна")
+    raw = input("\nЧисло браузеров [2]: ").strip()
+    workers = int(raw) if raw.isdigit() and 1 <= int(raw) <= MAX_WORKERS else 2
+
+    raw_out = input(f"\nИмя файла [{output}]: ").strip()
+    output = raw_out or output
+
+    already = _done_cities(Path(output))
+    print("\n" + "=" * 55)
+    print(f"  Запросы:   {', '.join(resolve_categories([preset]))}")
+    print(f"  Города:    {len(KZ_CITIES_ALL) - len(already)} к сбору"
+          + (f" ({len(already)} уже собрано ранее — пропущу)" if already else ""))
+    print(f"  Браузеров: {workers}")
+    print(f"  Файл:      {output}")
+    print("=" * 55)
+    if not _input_yn("\nЗапускаем?", True):
+        print("Отменено.")
+        return
+
+    # Дальше — обычный путь main(): собираем командную строку и идём в него.
+    sys.argv = [sys.argv[0], "--all-cities", "--category", preset,
+                "-o", output, "--workers", str(workers), "--api-intercept"]
+    main()
+
+
 def interactive_menu() -> None:
     """Пошаговое интерактивное меню — запускается при старте без аргументов."""
     print()
@@ -6010,16 +6065,28 @@ def interactive_menu() -> None:
 
     # 1. Режим работы
     print("\nВыберите режим:")
+    _GT_MODE = "GT по всем городам КЗ (АЗС / продуктовые) ⭐"
+    _DOCTOR_MODE = "Диагностика: что уже собрано, ошибки, капчи"
     mode = _input_choice(
         "Номер:",
         [
+            _GT_MODE,
             "Поиск по запросу",
             "Парсинг по категориям (как 2ГИС)",
             "Все категории города",
             "Показать список категорий",
+            _DOCTOR_MODE,
             "Автодетект селекторов",
         ],
     )
+
+    if mode == _GT_MODE:
+        _menu_gt()
+        return
+
+    if mode == _DOCTOR_MODE:
+        run_doctor()
+        return
 
     if mode == "Показать список категорий":
         list_categories()
@@ -6079,8 +6146,8 @@ def interactive_menu() -> None:
             print(f"\nБудут спарсены ВСЕ {len(categories_input)} групп категорий")
 
     # 3. Максимум результатов
-    raw_max = input("\nМаксимум организаций на запрос [500]: ").strip()
-    max_results = int(raw_max) if raw_max.isdigit() else 500
+    raw_max = input(f"\nМаксимум организаций на запрос [{DEFAULT_MAX_RESULTS}]: ").strip()
+    max_results = int(raw_max) if raw_max.isdigit() else DEFAULT_MAX_RESULTS
 
     # 4. Формат вывода
     print("\nФормат сохранения:")
