@@ -11,15 +11,23 @@ def fake_main():
 y.main = fake_main
 
 CASES = [
-    # (ввод пользователя, ожидаемые аргументы)
-    ("1\n1\n\n\n\n",  ["--all-cities", "--category", "gt-fuel", "-o", "kz_azs.xlsx",
-                       "--workers", "2", "--api-intercept"]),
-    ("1\n2\n3\n\n\n", ["--all-cities", "--category", "gt-grocery", "-o", "kz_grocery.xlsx",
+    # Все 5 категорий GT (Enter = дефолт), 2 браузера (Enter = дефолт)
+    ("1\n\n\n\n\n", ["--all-cities", "--category", "gt", "-o", "kz_gt.xlsx",
+                     "--workers", "2", "--api-intercept"]),
+    # Только Заправки, 3 браузера
+    ("1\n2\n3\n\n\n", ["--all-cities", "--category", "gt-fuel", "-o", "kz_azs.xlsx",
                        "--workers", "3", "--api-intercept"]),
-    ("1\n3\n1\nмой.xlsx\n\n", ["--all-cities", "--category", "gt", "-o", "мой.xlsx",
-                               "--workers", "1", "--api-intercept"]),
-    # мусор в числе браузеров → безопасный дефолт 2
-    ("1\n1\n99\n\n\n", ["--all-cities", "--category", "gt-fuel", "-o", "kz_azs.xlsx",
+    # Только магазины, 1 браузер, своё имя файла
+    ("1\n3\n1\nмой.xlsx\n\n", ["--all-cities", "--category", "gt-grocery",
+                               "-o", "мой.xlsx", "--workers", "1", "--api-intercept"]),
+    # Только «Где поесть»
+    ("1\n4\n2\n\n\n", ["--all-cities", "--category", "gt-food", "-o", "kz_food.xlsx",
+                       "--workers", "2", "--api-intercept"]),
+    # Мусор в числе браузеров → безопасный дефолт 2
+    ("1\n1\n99\n\n\n", ["--all-cities", "--category", "gt", "-o", "kz_gt.xlsx",
+                        "--workers", "2", "--api-intercept"]),
+    # Имя без расширения → дописываем .xlsx, а не создаём файл «1»
+    ("1\n2\n2\n1\n\n", ["--all-cities", "--category", "gt-fuel", "-o", "1.xlsx",
                         "--workers", "2", "--api-intercept"]),
 ]
 fails = []

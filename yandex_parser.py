@@ -4602,6 +4602,20 @@ def run_category_parser(
     return results
 
 
+def _ensure_ext(name: str) -> str:
+    """Дописать .xlsx, если пользователь ввёл имя без расширения.
+
+    Иначе на ответ «1» получался файл с именем `1`, который ни Excel, ни
+    Numbers не открывают, хотя внутри лежит нормальная книга.
+    """
+    name = name.strip().strip('"').strip("'")
+    if not name:
+        return "results.xlsx"
+    if Path(name).suffix.lower() in (".xlsx", ".csv", ".json"):
+        return name
+    return name + ".xlsx"
+
+
 def _safe_name(text: str) -> str:
     """Имя города → безопасное имя файла (Windows не любит \\ / : * ? " < > |)."""
     cleaned = re.sub(r'[\\/:*?"<>|]+', "_", text).strip(" .")
@@ -4987,7 +5001,7 @@ def run_parallel(base_argv: list[str], shards: list[list[str]], output: str,
             if time.time() - last_report < 30:
                 continue
             last_report = time.time()
-            counts, total = [], 0
+            rows, total = [], 0
             for i, part in enumerate(parts, 1):
                 cnt = len(_load_existing_orgs(part, quiet=True)) if part.exists() else 0
                 # Воркер может как раз перезаписывать файл — чтение упадёт и
@@ -4995,16 +5009,20 @@ def run_parallel(base_argv: list[str], shards: list[list[str]], output: str,
                 if cnt == 0 and seen_counts[i - 1]:
                     cnt = seen_counts[i - 1]
                 seen_counts[i - 1] = cnt
-                p = procs[i - 1]
-                mark = "" if (p is not None and p.poll() is None) else " ✓"
+                pr = procs[i - 1]
+                alive = pr is not None and pr.poll() is None
+                mark = "" if alive else " ✓ готов"
                 if restarts[i - 1]:
                     mark += f" ⟳{restarts[i - 1]}"
-                counts.append(f"w{i}: {cnt}{mark}")
+                state = _worker_state(i) if alive else ""
+                rows.append(f"     w{i}  собрано {cnt}{mark}"
+                            + (f"   —   {state}" if state else ""))
                 total += cnt
             caps = _count_captchas()
-            cap_note = f"  ⚠ капч: {caps}" if caps else ""
-            print(f"   [{time.strftime('%H:%M:%S')}] {' | '.join(counts)}  "
-                  f"→  всего ~{total}{cap_note}")
+            cap_note = f"   ⚠ капч: {caps}" if caps else ""
+            print(f"   [{time.strftime('%H:%M:%S')}]  всего ~{total}{cap_note}")
+            for row in rows:
+                print(row)
     except KeyboardInterrupt:
         stopped = True
         print("\n⏹  Останавливаю воркеров (их прогресс сохранён)…")
@@ -5062,6 +5080,53 @@ def run_parallel(base_argv: list[str], shards: list[list[str]], output: str,
     print_stats(merged, label="Статистика (все воркеры)")
     _print_health(parts)
     return len(merged)
+
+
+def _tail(path: Path, limit: int = 64_000) -> list[str]:
+    """Последние строки файла, не вчитывая его целиком (лог растёт часами)."""
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as f:
+            if size > limit:
+                f.seek(size - limit)
+                f.readline()          # обрезанную строку выбрасываем
+            return f.read().decode("utf-8", errors="replace").splitlines()
+    except Exception:
+        return []
+
+
+_RE_CITY = re.compile(r"Город (\d+)/(\d+): (.+?) ═══")
+_RE_QUERY = re.compile(r"━━━ \[(\d+)/(\d+)\] (.+?) ━━━")
+_RE_FOUND = re.compile(r"Категория «(.+?)»: (\d+) организаций")
+
+
+def _worker_state(idx: int) -> str:
+    """Чем воркер занят прямо сейчас — вытаскиваем из хвоста его лога.
+
+    Родителю неоткуда узнать это иначе: воркер — отдельный процесс, весь его
+    вывод уходит в logs/workerN.log. Без этого в консоли видны только голые
+    счётчики, и непонятно, работает оно или висит.
+    """
+    lines = _tail(LOGS_DIR / f"worker{idx}.log")
+    city = city_name = query = ""
+    for line in reversed(lines):
+        if not city:
+            m = _RE_CITY.search(line)
+            if m:
+                city_name = m.group(3).strip()
+                city = f"{city_name} ({m.group(1)}/{m.group(2)})"
+        if not query:
+            m = _RE_QUERY.search(line)
+            if m:
+                query = f"{m.group(3).strip()} ({m.group(1)}/{m.group(2)})"
+        if city and query:
+            break
+    # В логе запрос записан вместе с городом («Заправки Шымкент») — город и так
+    # стоит рядом отдельной колонкой, дублировать его в строке незачем.
+    if city_name and query.startswith(f"{city_name} ") is False:
+        query = query.replace(f" {city_name} (", " (")
+    parts = [p for p in (city, query) if p]
+    return " · ".join(parts) if parts else "стартует…"
 
 
 def _count_captchas() -> int:
@@ -6077,23 +6142,28 @@ def _menu_gt() -> None:
     остальное берём проверенными значениями.
     """
     print("\n--- GT-сегмент по всем городам Казахстана ---")
-    print(f"Обход по справочнику: {len(KZ_CITIES_ALL)} городов и посёлков.")
+    cities = resolve_city_list(None)
+    print(f"Обход по справочнику: {len(cities)} рабочих городов "
+          f"(все {len(KZ_CITIES_ALL)} с посёлками — флагом --cities all).")
     print("Прогресс сохраняется — прервать и продолжить можно в любой момент.\n")
 
     what = _input_choice(
         "Что собираем? [1]:",
         [
-            "Только АЗС — быстрее всего, часа 4",
-            "Только продуктовые магазины — ночь",
-            "АЗС + продуктовые — сутки",
+            "Все 5 категорий GT — примерно полтора часа",
+            "Только Заправки — минут двадцать",
+            "Только магазины (продуктовые, супермаркеты, гипермаркеты)",
+            "Только Где поесть",
         ],
         allow_empty=True,
-    ) or "Только АЗС — быстрее всего, часа 4"
+    ) or "Все 5 категорий GT — примерно полтора часа"
 
     preset, output = {
-        "Только АЗС — быстрее всего, часа 4": ("gt-fuel", "kz_azs.xlsx"),
-        "Только продуктовые магазины — ночь": ("gt-grocery", "kz_grocery.xlsx"),
-        "АЗС + продуктовые — сутки": ("gt", "kz_gt.xlsx"),
+        "Все 5 категорий GT — примерно полтора часа": ("gt", "kz_gt.xlsx"),
+        "Только Заправки — минут двадцать": ("gt-fuel", "kz_azs.xlsx"),
+        "Только магазины (продуктовые, супермаркеты, гипермаркеты)":
+            ("gt-grocery", "kz_grocery.xlsx"),
+        "Только Где поесть": ("gt-food", "kz_food.xlsx"),
     }[what]
 
     print("\nСколько браузеров одновременно? Все идут с одного твоего IP:")
@@ -6104,12 +6174,12 @@ def _menu_gt() -> None:
     workers = int(raw) if raw.isdigit() and 1 <= int(raw) <= MAX_WORKERS else 2
 
     raw_out = input(f"\nИмя файла [{output}]: ").strip()
-    output = raw_out or output
+    output = _ensure_ext(raw_out) if raw_out else output
 
     already = _done_cities(Path(output))
     print("\n" + "=" * 55)
     print(f"  Запросы:   {', '.join(resolve_categories([preset]))}")
-    print(f"  Города:    {len(KZ_CITIES_ALL) - len(already)} к сбору"
+    print(f"  Города:    {len(cities) - len(already)} к сбору"
           + (f" ({len(already)} уже собрано ранее — пропущу)" if already else ""))
     print(f"  Браузеров: {workers}")
     print(f"  Файл:      {output}")
@@ -6246,7 +6316,7 @@ def interactive_menu() -> None:
         default_name = f"results{ext}"
 
     raw_output = input(f"\nИмя файла [{default_name}]: ").strip()
-    output = raw_output if raw_output else default_name
+    output = _ensure_ext(raw_output) if raw_output else default_name
 
     # 5. Полнота данных
     print("\n--- Какие данные собирать? ---")
