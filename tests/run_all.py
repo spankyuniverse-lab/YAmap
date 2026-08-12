@@ -17,7 +17,7 @@ import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-TESTS = ["t_cli", "t_menu", "t_par", "t_cities", "t_expand", "t_supervise", "t_showmore"]
+TESTS = ["t_cli", "t_gt", "t_menu", "t_par", "t_cities", "t_expand", "t_supervise", "t_showmore"]
 JUNK = ["out", "logs", "crashy_worker.py", "fake_worker.py"]
 
 

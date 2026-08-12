@@ -246,8 +246,28 @@ KZ_CITIES_EXTRA: dict[str, str] = {
     "Аксай": "48.2833,51.1667",
 }
 
-#: Полный список для --all-cities: областные центры + остальные города.
+#: Полный список: областные центры + остальные города и посёлки (96).
 KZ_CITIES_ALL: dict[str, str] = {**KZ_CITIES, **KZ_CITIES_EXTRA}
+
+#: Рабочий список из 19 городов — то, что реально нужно для GT-покрытия.
+#: Это KZ_CITIES (18 областных центров и крупнейших) + Талдыкорган.
+#: Именно он идёт по умолчанию в --all-cities; все 96 — через `--cities all`.
+KZ_CITIES_MAJOR: dict[str, str] = {
+    **KZ_CITIES,
+    "Талдыкорган": KZ_CITIES_EXTRA["Талдыкорган"],
+}
+
+
+def resolve_city_list(spec: str | None) -> list[str]:
+    """`--cities`: `major` (19, по умолчанию), `all` (96) или свой список.
+
+    Свой список — через запятую: `--cities "Алматы,Астана,Шымкент"`.
+    """
+    if not spec or spec.strip().lower() in ("major", "main", "основные", "19"):
+        return list(KZ_CITIES_MAJOR.keys())
+    if spec.strip().lower() in ("all", "все", "96"):
+        return list(KZ_CITIES_ALL.keys())
+    return [c.strip() for c in spec.split(",") if c.strip()]
 
 KZ_COUNTRY_LL = "66.9237,48.0196"   # весь Казахстан (регион 159), использовать с z=5
 DEFAULT_CITY_Z = 12                 # зум для сбора по городу
@@ -545,6 +565,12 @@ class Organization:
     social_links: str = ""
     yandex_url: str = ""
     search_query: str = ""
+    #: Слаг GT-категории (gt_zapravki, gt_produktovye, …) — чтобы выгрузку
+    #: можно было сматчить со своей таблицей по ключу, а не по названию.
+    gt_slug: str = ""
+    #: Город прогона. Именно прогона, а не разобранного адреса: так строка
+    #: однозначно ложится в таблицу «город × категория».
+    city: str = ""
     # --- расширенные поля: «снять все данные» с Яндекс.Карт ---
     # идентификаторы и ссылки
     org_id: str = ""             # items[].id (стабильный permalink/oid)
@@ -1154,28 +1180,38 @@ CATEGORIES: dict[str, list[str]] = {
 # иначе одни и те же запросы прогонялись бы дважды.
 # ---------------------------------------------------------------------------
 
-#: GT (General Trade) — традиционная розница: АЗС + продуктовые точки.
-GT_FUEL: list[str] = [
-    "АЗС",
-    "АГЗС",
-    "газовая заправка",
+# GT-сегмент — РОВНО 5 категорий, один в один с рабочей таксономией (2ГИС).
+# Пара: (слаг как в 2ГИС, поисковый запрос к Яндексу). Запрос он же название
+# листа в Excel, поэтому формулировки взяты те, которые Яндекс уверенно сводит
+# на свою рубрику.
+#
+# Почему не «АЗС + АГЗС + газовая заправка», как было: в прошлом прогоне эти
+# три запроса вернули один и тот же набор (в статистике АГЗС/АГНС/АГНКС дали
+# ровно по 1653 — это ярлыки на тех же организациях). Тройное время ради
+# дублей. Один запрос на категорию.
+GT_SEGMENT: list[tuple[str, str]] = [
+    ("gt_zapravki",     "Заправки"),
+    ("gt_poest",        "Где поесть"),
+    ("gt_produktovye",  "Продуктовые магазины"),
+    ("gt_supermarkety", "Супермаркеты"),
+    ("gt_gipermarkety", "Гипермаркеты"),
 ]
 
-GT_GROCERY: list[str] = [
-    "продуктовый магазин",
-    "супермаркет",
-    "минимаркет",
-    "гипермаркет",
-    "магазин у дома",
-    "продуктовый рынок",
-]
+#: Запрос → слаг: чтобы выгрузку можно было сматчить со своей таблицей.
+GT_SLUG_BY_QUERY: dict[str, str] = {q: s for s, q in GT_SEGMENT}
+
+GT_ALL: list[str] = [q for _s, q in GT_SEGMENT]
+GT_FUEL: list[str] = ["Заправки"]
+GT_GROCERY: list[str] = ["Продуктовые магазины", "Супермаркеты", "Гипермаркеты"]
 
 PRESETS: dict[str, list[str]] = {
-    "gt": GT_FUEL + GT_GROCERY,
+    "gt": GT_ALL,
     "gt-азс": GT_FUEL,
     "gt-fuel": GT_FUEL,
     "gt-магазины": GT_GROCERY,
     "gt-grocery": GT_GROCERY,
+    "gt-еда": ["Где поесть"],
+    "gt-food": ["Где поесть"],
 }
 
 
@@ -3210,6 +3246,8 @@ HEADERS_RU = {
     "email": "Email",
     "social_links": "Соцсети",
     "search_query": "Поисковый запрос",
+    "gt_slug": "Код категории",
+    "city": "Город (прогон)",
     "yandex_url": "Ссылка",
     # расширенные поля
     "org_id": "ID организации",
@@ -4299,6 +4337,7 @@ def run_parser(
 
             for org in orgs:
                 org.search_query = query
+                org.gt_slug = GT_SLUG_BY_QUERY.get(query, "")
 
             # Фильтруем уже известные (из резюме)
             if resume:
@@ -4405,7 +4444,10 @@ def run_category_parser(
             full_query = f"{cat_query} {city}"
 
             # Пропускаем уже выполненные запросы (резюме)
-            if resume and resume.is_query_done(full_query):
+            # Сверяемся по ЯРЛЫКУ, который реально пишем в файл (cat_query).
+            # Файл резюме здесь всегда пофайлово-погородный, так что города
+            # в ключе не нужно — и оно должно совпадать с тем, что пишем.
+            if resume and resume.is_query_done(cat_query):
                 log.info("Пропуск (резюме): %s", full_query)
                 continue
 
@@ -4425,13 +4467,15 @@ def run_category_parser(
                 key = _dedup_key(org)
                 if key not in seen_global:
                     seen_global.add(key)
-                    org.search_query = full_query
+                    org.search_query = cat_query
+                    org.gt_slug = GT_SLUG_BY_QUERY.get(cat_query, "")
+                    org.city = city
                     unique_orgs.append(org)
 
             if detail:
                 _enrich_orgs(ctx, unique_orgs)
 
-            results[full_query] = unique_orgs
+            results.setdefault(cat_query, []).extend(unique_orgs)
             log.info("Категория «%s»: %d организаций (уникальных)", cat_query, len(unique_orgs))
 
             # Промежуточное сохранение после каждой категории
@@ -5210,6 +5254,7 @@ def run_country_sweep(
                 for o in tile_orgs:
                     if not o.search_query:
                         o.search_query = q
+                        o.gt_slug = GT_SLUG_BY_QUERY.get(q, "")
                     k = _dedup_key(o)
                     if k in seen:
                         continue
@@ -5395,9 +5440,9 @@ def main() -> None:
     )
     parser.add_argument(
         "--all-cities", action="store_true",
-        help="Прогнать --category по ВСЕМ городам Казахстана из справочника "
-             "(см. --list-cities) и слить в один файл. Быстрее --country: "
-             "только города, без сплошной сетки по степи и трассам.",
+        help="Прогнать --category по городам Казахстана и слить в один файл. "
+             "По умолчанию — рабочие 19 городов; все 96 — с `--cities all`. "
+             "Быстрее --country: только города, без сетки по степи и трассам.",
     )
     parser.add_argument(
         "--workers", "-w", type=int, default=1,
@@ -5408,8 +5453,9 @@ def main() -> None:
     )
     parser.add_argument(
         "--cities", default=None,
-        help="Явный список городов через запятую для --all-cities "
-             "(родитель раздаёт их воркерам этим флагом).",
+        help="Какие города берёт --all-cities: `major` — рабочие 19 (по "
+             "умолчанию), `all` — все 96 включая посёлки, либо свой список "
+             "через запятую: --cities \"Алматы,Астана,Шымкент\".",
     )
     parser.add_argument(
         "--shard", default=None,
@@ -5735,8 +5781,7 @@ def main() -> None:
             cats = [args.query]
         else:
             cats = ["gt"]
-        cities = ([c.strip() for c in args.cities.split(",") if c.strip()]
-                  if args.cities else list(KZ_CITIES_ALL.keys()))
+        cities = resolve_city_list(args.cities)
         queries = resolve_categories(cats)
         output = args.output or "kz_cities.xlsx"
         print(f"\n🇰🇿 СБОР ПО ВСЕМ ГОРОДАМ КАЗАХСТАНА")
@@ -5874,8 +5919,7 @@ def _dispatch_parallel(args, workers: int, headless: bool) -> int | None:
     # --- все города: раздаём города вперемешку ---
     if args.all_cities:
         output = args.output or "kz_cities.xlsx"
-        cities = ([c.strip() for c in args.cities.split(",") if c.strip()]
-                  if args.cities else list(KZ_CITIES_ALL.keys()))
+        cities = resolve_city_list(args.cities)
         # Что уже собрано прошлыми прогонами — заново не трогаем. Это делает
         # расширение списка городов дешёвым: доберутся только новые.
         already = _done_cities(Path(output))

@@ -1,5 +1,6 @@
 """Расширили список городов — прошлый прогон не должен пересобираться.
-Воспроизводим ситуацию: 18 городов уже собраны, список вырос до 96."""
+Воспроизводим: 18 городов собраны, список расширили до всех 96 (--cities all).
+Плюс проверяем дефолт --all-cities = рабочие 19."""
 import sys, json, argparse
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -29,7 +30,7 @@ ns = argparse.Namespace(
     max_results=None, scroll_pause=1.0, cooldown_every=0, cooldown_sec=90, grid=1,
     proxy=None, proxy_file=None, country=False, all_cities=True, all_categories=False,
     category=["gt-fuel"], query=None, city=None, output=str(out), step=0.25,
-    tile_z=0, cities=None)
+    tile_z=0, cities="all")
 y._dispatch_parallel(ns, 2, headless=True)
 
 sent = []
@@ -40,6 +41,12 @@ print(f"к сбору отправлено: {len(sent)} городов, пере
 assert not overlap, f"пересобирает уже собранное: {sorted(overlap)[:5]}"
 assert len(sent) == len(y.KZ_CITIES_ALL) - len(prev), \
     f"ожидал {len(y.KZ_CITIES_ALL) - len(prev)}, отправлено {len(sent)}"
+
+# Дефолт --all-cities — рабочие 19, а не все 96
+assert len(y.resolve_city_list(None)) == 19, y.resolve_city_list(None)
+assert len(y.resolve_city_list("all")) == len(y.KZ_CITIES_ALL)
+assert y.resolve_city_list("Алматы,Астана") == ["Алматы", "Астана"]
+print("дефолт --all-cities:", len(y.resolve_city_list(None)), "городов")
 
 # Повторный вызов, когда собрано ВСЁ — должен честно сказать «работы нет»
 for i, chunk in enumerate(y._split_round_robin(list(y.KZ_CITIES_ALL), 2), 1):
