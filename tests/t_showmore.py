@@ -1,4 +1,6 @@
+import os
 import sys
+from pathlib import Path
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent.parent))
 import yandex_parser as y
 from patchright.sync_api import sync_playwright
@@ -34,7 +36,15 @@ HTML_HIDDEN = f"""
 """
 
 with sync_playwright() as pw:
-    b = pw.chromium.launch(executable_path="/opt/pw-browsers/chromium", headless=True)
+    # Браузер ищем, а не прибиваем путём: на маке это Chrome из /Applications,
+    # в песочнице — chromium из /opt, в CI — тот, что скачал playwright.
+    exe = os.environ.get("YAMAP_BROWSER_PATH") or next(
+        (c for c in ("/opt/pw-browsers/chromium",
+                     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+                     "/usr/bin/google-chrome", "/usr/bin/chromium")
+         if Path(c).exists()), None)
+    b = (pw.chromium.launch(executable_path=exe, headless=True) if exe
+         else pw.chromium.launch(headless=True))
     page = b.new_page()
     y.get_selector_engine = lambda: {"show_more": y.SHOW_MORE_SEL}
     fails = []
