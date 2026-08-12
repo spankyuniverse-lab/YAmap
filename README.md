@@ -17,7 +17,17 @@
 Chrome. Дальше **`run_gt.bat`** (меню) или `run.bat <аргументы>`.
 Подробности — **[WINDOWS.md](WINDOWS.md)**.
 
-### Linux / macOS
+### macOS
+
+```bash
+chmod +x setup_mac.sh && ./setup_mac.sh
+```
+
+Дальше `./run_gt.sh` (меню), `./watch_gt.sh` (долгий прогон с авто-перезапуском)
+или `./run.sh <аргументы>`. Нужен Python 3.10+ (системный 3.9 не подойдёт:
+`brew install python@3.12`). Подробности — **[MACOS.md](MACOS.md)**.
+
+### Linux
 
 ```bash
 pip install -r requirements.txt
