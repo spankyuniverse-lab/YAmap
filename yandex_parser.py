@@ -4866,8 +4866,13 @@ def _parse_shard(raw: str | None) -> tuple[int, int] | None:
 
 
 def _part_path(out_path: Path, idx: int) -> Path:
-    """Файл результатов воркера: kz_gt.xlsx → kz_gt.w1.xlsx."""
-    return out_path.with_name(f"{out_path.stem}.w{idx}{out_path.suffix}")
+    """Файл результатов воркера: kz_gt.xlsx → kz_gt.w1.xlsx.
+
+    Расширение обязательно: без него part получился бы `1.w1`, и дальше и
+    чтение книги, и вычисление имени .cities.json уехали бы.
+    """
+    suffix = out_path.suffix if out_path.suffix.lower() in (".xlsx", ".csv", ".json") else ".xlsx"
+    return out_path.with_name(f"{out_path.stem}.w{idx}{suffix}")
 
 
 def _merge_parts(parts: list[Path], out_path: Path) -> list[Organization]:
@@ -5792,6 +5797,12 @@ def main() -> None:
             arg_key = k.replace("-", "_")
             if hasattr(args, arg_key) and getattr(args, arg_key) is None:
                 setattr(args, arg_key, v)
+
+    # Имя выходного файла без расширения ломает ВСЮ цепочку частей:
+    # `-o 1` даёт части `1.w1` (не читаются как книга) и прогресс `1.cities.json`
+    # вместо `1.w1.cities.json`. В итоге воркеры собирают, а слияние даёт ноль.
+    if args.output:
+        args.output = _ensure_ext(args.output)
 
     # Повторно резолвим вьюпорт после мерджа конфига (city/ll/z могли прийти из конфига).
     set_viewport(city=args.city, ll=args.ll, z=args.z)
