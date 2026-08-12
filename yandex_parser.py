@@ -3528,6 +3528,40 @@ def get_throttle() -> AdaptiveThrottle:
 
 _virtual_display = None
 _SERVER_MODE = False
+_caffeinate_proc = None
+
+
+def _prevent_sleep() -> None:
+    """macOS: не дать ноутбуку уснуть на время прогона.
+
+    Раньше это делал только run.sh (обёртка `caffeinate -is`), поэтому запуск
+    из PyCharm или из IDE-терминала оставался незащищённым и ноутбук засыпал
+    посреди ночного сбора. Держим сон сами: `caffeinate -w <наш pid>` живёт
+    ровно столько же, сколько процесс, и снимает блокировку при выходе —
+    в том числе при падении и при Ctrl+C.
+
+    В воркерах не поднимаем: их родитель уже держит сон, а N лишних процессов
+    ничего не добавляют.
+    """
+    global _caffeinate_proc
+    if sys.platform != "darwin" or _caffeinate_proc is not None:
+        return
+    if os.environ.get("YAMAP_WORKER"):
+        return
+    import shutil
+    import subprocess
+    if not shutil.which("caffeinate"):
+        return
+    try:
+        _caffeinate_proc = subprocess.Popen(
+            # -d экран, -i простой, -m диск, -s система при питании от сети
+            ["caffeinate", "-dimsu", "-w", str(os.getpid())],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        log.info("macOS: сон отключён на время прогона (крышку всё равно "
+                 "держи открытой — закрытая усыпляет мак в обход caffeinate)")
+    except Exception as exc:
+        log.debug("caffeinate не запустился: %s", exc)
 
 
 def _resolve_display(headless: bool) -> bool:
@@ -5682,6 +5716,9 @@ def main() -> None:
     # Дисплей/Xvfb поднимаем ЗДЕСЬ — ДО sync_playwright. Иначе драйвер patchright
     # (Node) стартует без DISPLAY, и Chrome не находит X-сервер ("Missing X server").
     headless = _resolve_display(headless)
+
+    # Не дать ноутбуку уснуть посреди многочасового сбора.
+    _prevent_sleep()
 
     # Конфиг-файл (перезаписывает дефолты, CLI-аргументы приоритетнее)
     if args.config:

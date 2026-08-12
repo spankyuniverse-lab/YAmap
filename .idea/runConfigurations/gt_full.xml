@@ -1,5 +1,5 @@
 <component name="ProjectRunConfigurationManager">
-  <configuration default="false" name="2. АЗС — все города КЗ (2 браузера)" type="PythonConfigurationType" factoryName="Python">
+  <configuration default="false" name="4. GT по всем 96 городам (долго)" type="PythonConfigurationType" factoryName="Python">
     <option name="ENV_FILES" value="" />
     <option name="INTERPRETER_OPTIONS" value="" />
     <option name="PARENT_ENVS" value="true" />
@@ -13,7 +13,7 @@
     <option name="ADD_CONTENT_ROOTS" value="true" />
     <option name="ADD_SOURCE_ROOTS" value="true" />
     <option name="SCRIPT_NAME" value="$PROJECT_DIR$/yandex_parser.py" />
-    <option name="PARAMETERS" value="--all-cities --category gt-fuel -o kz_azs.xlsx --workers 2 --api-intercept" />
+    <option name="PARAMETERS" value="--all-cities --cities all --category gt -o kz_gt_full.xlsx --workers 2 --api-intercept" />
     <option name="SHOW_COMMAND_LINE" value="false" />
     <option name="EMULATE_TERMINAL" value="true" />
     <option name="MODULE_MODE" value="false" />

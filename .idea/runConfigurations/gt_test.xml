@@ -1,5 +1,5 @@
 <component name="ProjectRunConfigurationManager">
-  <configuration default="false" name="6. Меню (спросит что делать)" type="PythonConfigurationType" factoryName="Python">
+  <configuration default="false" name="2. Проверка — Алматы, все 5 категорий" type="PythonConfigurationType" factoryName="Python">
     <option name="ENV_FILES" value="" />
     <option name="INTERPRETER_OPTIONS" value="" />
     <option name="PARENT_ENVS" value="true" />
@@ -13,7 +13,7 @@
     <option name="ADD_CONTENT_ROOTS" value="true" />
     <option name="ADD_SOURCE_ROOTS" value="true" />
     <option name="SCRIPT_NAME" value="$PROJECT_DIR$/yandex_parser.py" />
-    <option name="PARAMETERS" value="" />
+    <option name="PARAMETERS" value="--city Алматы --category gt -o almaty_gt.xlsx --api-intercept" />
     <option name="SHOW_COMMAND_LINE" value="false" />
     <option name="EMULATE_TERMINAL" value="true" />
     <option name="MODULE_MODE" value="false" />
