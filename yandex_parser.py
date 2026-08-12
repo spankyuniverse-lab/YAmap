@@ -389,21 +389,26 @@ def _tld_of(host: str) -> str:
 
 
 def base_url() -> str:
-    return f"https://{DOMAIN}"
+    """Базовый адрес. YAMAP_BASE_URL подменяет хост — так сквозной тест гоняет
+    НАСТОЯЩИЙ парсер против локального макета Яндекса. Без такой точки подмены
+    проверить всю цепочку (поиск → скролл → разбор → книга) нечем, и ошибки
+    вылезают уже у пользователя."""
+    override = os.environ.get("YAMAP_BASE_URL")
+    return override.rstrip("/") if override else f"https://{DOMAIN}"
 
 
 def maps_url() -> str:
-    return f"https://{DOMAIN}/maps/"
+    return f"{base_url()}/maps/"
 
 
 def org_url(seoname: str, org_id: str) -> str:
     """Ссылка на карточку организации (канонизируется на yandex.com, но любой хост резолвит)."""
-    return f"https://{DOMAIN}/maps/org/{seoname}/{org_id}/"
+    return f"{base_url()}/maps/org/{seoname}/{org_id}/"
 
 
 def search_url(query: str, with_viewport: bool = True) -> str:
     """URL поиска с языком и (опционально) закреплённым вьюпортом для гео-привязки."""
-    u = f"https://{DOMAIN}/maps/?text={urllib.parse.quote(query)}&lang={LANG}"
+    u = f"{base_url()}/maps/?text={urllib.parse.quote(query)}&lang={LANG}"
     if with_viewport and MAP_LL:
         u += f"&ll={MAP_LL}&z={MAP_Z}"
     return u
@@ -665,29 +670,42 @@ def _dedup_key(org: Organization) -> str:
     показывает) — различаем точки сети по ID или координатам, чтобы разные
     филиалы не схлопнулись в одну запись.
     """
+    # ID организации у Яндекса — самая надёжная личность: он ОДИНАКОВ во всех
+    # источниках (сниппет, SSR, внутренний API) и при этом различает филиалы
+    # сети. Адрес слабее: источник может его не отдать, и тогда одна и та же
+    # точка попадала в выгрузку дважды — с адресом и без. Имя в ключ не берём:
+    # у одной точки оно может отличаться между источниками.
+    if org.org_id:
+        return f"id:{org.org_id}"
     name = _normalize_for_dedup(org.name)
     addr = _loose_addr(org.address)
     if addr:
         return f"{name}|{addr}"
-    if org.org_id:
-        return f"{name}|id:{org.org_id}"
     if org.latitude and org.longitude:
         return f"{name}|{org.latitude},{org.longitude}"
     return f"{name}|"
 
 
 def _finalize_orgs(orgs: list["Organization"]) -> list["Organization"]:
-    """Финальная подчистка перед сохранением: убрать записи без названия и дубли."""
+    """Финальная подчистка перед сохранением: убрать записи без названия и дубли.
+
+    Дубли не выбрасываем, а СЛИВАЕМ: одна и та же точка приходит из разных
+    источников с разной полнотой (в сниппете есть рейтинг, в API — телефон и
+    координаты). Прежний вариант «первый выиграл» терял то, что было только у
+    второго.
+    """
     out: list[Organization] = []
-    seen: set[str] = set()
+    index: dict[str, int] = {}
     for o in orgs:
         if not (o.name or "").strip():
             continue
         k = _dedup_key(o)
-        if k in seen:
-            continue
-        seen.add(k)
-        out.append(o)
+        pos = index.get(k)
+        if pos is None:
+            index[k] = len(out)
+            out.append(o)
+        else:
+            _merge_orgs(out[pos], o)
     return out
 
 
@@ -4461,6 +4479,18 @@ def run_category_parser(
         "Город: %s | Категорий: %d | Макс. на категорию: %d",
         city, total_queries, max_results_per_category,
     )
+
+    # Если резюме говорит, что по этому городу сделано всё — не поднимаем
+    # браузер вообще. Иначе на доборе Chrome стартовал на КАЖДЫЙ город только
+    # чтобы тут же написать «Пропуск (резюме)»: десяток запусков впустую.
+    if resume and all(resume.is_query_done(q) for q in queries):
+        log.info("%s: все %d категорий уже собраны — браузер не поднимаю",
+                 city, total_queries)
+        existing = resume.existing_orgs()
+        done: dict[str, list[Organization]] = {}
+        for o in existing:
+            done.setdefault(o.search_query or "Прочее", []).append(o)
+        return done
 
     # Прогресс по категориям
     cat_iter = enumerate(queries, 1)

@@ -17,8 +17,9 @@ import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-TESTS = ["t_cli", "t_gt", "t_badname", "t_progress", "t_menu", "t_par", "t_cities", "t_expand", "t_supervise", "t_showmore"]
-JUNK = ["out", "logs", "crashy_worker.py", "fake_worker.py"]
+TESTS = ["t_cli", "t_dedup", "t_gt", "t_badname", "t_progress", "t_menu", "t_par", "t_cities", "t_expand", "t_supervise", "t_showmore"]
+JUNK = ["out", "logs", "crashy_worker.py", "fake_worker.py",
+        "selectors_cache.json", "e2e.xlsx", "e2e_par.xlsx"]
 
 
 def _clean() -> None:
