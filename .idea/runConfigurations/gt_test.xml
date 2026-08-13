@@ -1,5 +1,5 @@
 <component name="ProjectRunConfigurationManager">
-  <configuration default="false" name="2. Проверка — Алматы, все 5 категорий" type="PythonConfigurationType" factoryName="Python">
+  <configuration default="false" name="2. Проверка — Алматы, все категории" type="PythonConfigurationType" factoryName="Python">
     <option name="ENV_FILES" value="" />
     <option name="INTERPRETER_OPTIONS" value="" />
     <option name="PARENT_ENVS" value="true" />
