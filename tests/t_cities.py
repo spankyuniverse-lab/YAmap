@@ -31,3 +31,28 @@ print("exists:", out.exists(), "progress:", json.loads((out.parent/"kz_gt.cities
 calls.clear()
 res2 = y.run_cities_parser(cities=["Алматы","Астана","Шымкент","Караганда"], categories=["gt-азс"], output=str(out))
 print("resume calls:", calls, "total:", sum(len(v) for v in res2.values()))
+
+
+# --- Регресс: после параллельного прогона запуск в ОДИН браузер не должен
+# затирать слитый файл (штатный совет при капче — «уменьши --workers»).
+import json as _json
+out2 = Path("out/kz_sw.xlsx")
+out2.parent.mkdir(parents=True, exist_ok=True)
+par_orgs = [y.Organization(name=f"АЗС-{c}", address=f"{c}, ул. 1", org_id=str(i),
+                           search_query="Заправки", city=c)
+            for i, c in enumerate(["Алматы", "Астана"], 1)]
+y.save_xlsx_by_categories({"Заправки": par_orgs}, out2)
+# прогресс лежит в ЧАСТЯХ воркеров, своего kz_sw.cities.json нет
+(out2.parent / "kz_sw.w1.cities.json").write_text(
+    _json.dumps(["Алматы"], ensure_ascii=False), encoding="utf-8")
+(out2.parent / "kz_sw.w2.cities.json").write_text(
+    _json.dumps(["Астана"], ensure_ascii=False), encoding="utf-8")
+
+res_sw = y.run_cities_parser(cities=["Алматы", "Астана", "Шымкент"],
+                             categories=["gt-азс"], output=str(out2))
+total_sw = sum(len(v) for v in res_sw.values())
+names_sw = {o.name for v in res_sw.values() for o in v}
+assert {"АЗС-Алматы", "АЗС-Астана"} <= names_sw,     f"параллельные данные затёрты: {sorted(names_sw)}"
+assert "Шымкент" in {o.city for v in res_sw.values() for o in v if o.city} or total_sw > 2,     "новый город не добрался"
+print(f"✅ смена --workers 2 → 1 не теряет данные ({total_sw} записей, "
+      f"старые города на месте)")

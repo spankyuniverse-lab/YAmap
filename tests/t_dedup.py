@@ -51,5 +51,29 @@ old_style = [O(name="АЗС", address="Алматы, ул. Абая, 1", org_id=
 check(len(y._finalize_orgs(old_style)) == 1,
       "копия без адреса не создаёт дубль (был баг)")
 
+# 6. Одна точка: снята без ID (имя+адрес) и с ID — должна слиться в одну
+no_id = O(name="АЗС Гелиос", address="Алматы, ул. Абая, 1", rating="4.5")
+with_id = O(name="АЗС Гелиос", address="Алматы, ул. Абая, 1", org_id="555",
+            phone="+7 777 555-55-55")
+res6 = y._finalize_orgs([no_id, with_id])
+check(len(res6) == 1, f"строка без ID слилась со строкой с ID (вышло {len(res6)})")
+if res6:
+    check(res6[0].phone and res6[0].rating == "4.5",
+          "после слияния есть и телефон (ID-строка), и рейтинг (без-ID)")
+
+# 7. ResumeManager: чтение файла не схлопывает филиалы с одинаковым именем
+import tempfile, os
+from pathlib import Path as _P
+tmpdir = _P(tempfile.mkdtemp())
+f = tmpdir / "resume_test.xlsx"
+branches = [O(name="КазМунайГаз", address="", org_id=str(1000 + i),
+              search_query="Заправки", source_query="Заправки")
+            for i in range(5)]
+y.save_xlsx(branches, f)
+rm = y.ResumeManager(f)
+check(rm.existing_count == 5,
+      f"резюме сохранило все 5 филиалов без адреса (вышло {rm.existing_count})")
+check(rm.is_query_done("Заправки"), "выполненный запрос виден в резюме")
+
 print("\n" + ("✅ ДЕДУП ОК" if not fails else f"❌ ПРОВАЛЫ: {fails}"))
 sys.exit(1 if fails else 0)

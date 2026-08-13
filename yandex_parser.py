@@ -705,12 +705,24 @@ def _finalize_orgs(orgs: list["Organization"]) -> list["Organization"]:
         if not (o.name or "").strip():
             continue
         k = _dedup_key(o)
+        # Запасной ключ «имя|адрес»: та же точка могла быть снята и без ID
+        # (сниппет), и с ID (API) — это разные основные ключи, но одна строка.
+        alias = ""
+        addr = _loose_addr(o.address)
+        if o.org_id and addr:
+            alias = f"{_normalize_for_dedup(o.name)}|{addr}"
         pos = index.get(k)
+        if pos is None and alias:
+            pos = index.get(alias)
         if pos is None:
-            index[k] = len(out)
+            pos = len(out)
+            index[k] = pos
             out.append(o)
         else:
             _merge_orgs(out[pos], o)
+            index.setdefault(k, pos)
+        if alias:
+            index.setdefault(alias, pos)
     return out
 
 
@@ -1035,15 +1047,20 @@ class ResumeManager:
                 en_key = ru_to_en.get(k, k)
                 norm[en_key] = str(v) if v else ""
 
-            key = f"{_normalize_for_dedup(norm.get('name', ''))}|{_normalize_for_dedup(norm.get('address', ''))}"
-            if key != "|":
-                org = Organization(**{f: norm.get(f, "") for f in FIELDNAMES if f in norm})
-                self._existing[key] = org
-                # source_query — точный запрос; search_query оставлен как
-                # запасной вариант для файлов, снятых до его появления.
-                q = norm.get("source_query", "") or norm.get("search_query", "")
-                if q:
-                    self._completed_queries.add(q)
+            org = Organization(**{f: norm.get(f, "") for f in FIELDNAMES if f in norm})
+            # Ключ — ТОТ ЖЕ _dedup_key, что и в живом сборе (org_id важнее
+            # имени+адреса). Старый ключ «имя|адрес» схлопывал разные точки
+            # сети с одинаковым названием и пустым/общим адресом: 30 АЗС
+            # «КазМунайГаз» вдоль трассы при чтении файла превращались в одну,
+            # и следующее сохранение затирало остальные навсегда.
+            if not ((org.name or "").strip() or org.org_id):
+                continue
+            self._existing[_dedup_key(org)] = org
+            # source_query — точный запрос; search_query оставлен как
+            # запасной вариант для файлов, снятых до его появления.
+            q = norm.get("source_query", "") or norm.get("search_query", "")
+            if q:
+                self._completed_queries.add(q)
 
         log.info(
             "Резюме: загружено %d существующих организаций, %d выполненных запросов",
@@ -1054,8 +1071,8 @@ class ResumeManager:
     def existing_count(self) -> int:
         return len(self._existing)
 
-    def is_known(self, name: str, address: str) -> bool:
-        return f"{_normalize_for_dedup(name)}|{_normalize_for_dedup(address)}" in self._existing
+    def is_known(self, org: "Organization") -> bool:
+        return _dedup_key(org) in self._existing
 
     def is_query_done(self, query: str) -> bool:
         return query in self._completed_queries
@@ -2107,9 +2124,6 @@ _JS_COLLECT_SNIPPETS = """(sels) => {
         const name = q(card, sels.snippet_title);
         if (!name) continue;  // обёртки/оверлеи без названия пропускаем
         const address = q(card, sels.snippet_address);
-        const key = name + "|" + address;
-        if (seen.has(key)) continue;  // дедуп вложенных обёрток в пределах прохода
-        seen.add(key);
         let href = "";
         if (sels.link) {
             const a = card.querySelector(sels.link);
@@ -2119,6 +2133,14 @@ _JS_COLLECT_SNIPPETS = """(sels) => {
             const a = card.querySelector('a[href*="/org/"]');
             if (a) href = a.getAttribute("href") || "";
         }
+        // href — в ключ дедупа. Ключ «имя|адрес» схлопывал филиалы сети с
+        // одинаковым названием и пустым/общим адресом в сниппете; при
+        // устаревшем селекторе адреса (address == "" у всех) выдача молча
+        // сжималась до списка уникальных имён. Вложенные обёртки одной
+        // карточки делят один href, так что их дедуп сохраняется.
+        const key = name + "|" + address + "|" + href;
+        if (seen.has(key)) continue;
+        seen.add(key);
         out.push({
             name, address,
             category: q(card, sels.snippet_category),
@@ -2263,6 +2285,15 @@ def scroll_and_parse(
             break
 
         if stale_rounds >= max_stale:
+            # Отличаем «выдача кончилась» от «вылезла капча и всё замерло»:
+            # раньше капча посреди скролла выглядела как штатный конец, хвост
+            # выдачи терялся, а запрос помечался выполненным — докачка его
+            # больше никогда не пересобирала.
+            if detect_captcha(page):
+                get_throttle().on_captcha()
+                raise RuntimeError(
+                    f"Капча посреди скролла — собрано лишь {len(orgs)}, "
+                    "запрос надо повторить")
             log.info("Новые результаты не появляются, завершаем (всего %d)", len(orgs))
             break
 
@@ -3257,13 +3288,34 @@ def run_api_intercept(
 # Export
 # ---------------------------------------------------------------------------
 
+def _tmp_path(path: Path) -> Path:
+    """Соседний временный файл для атомарной записи (тот же каталог/диск)."""
+    return path.with_name(path.name + ".tmp")
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Записать текст атомарно: tmp-файл + os.replace.
+
+    Все сохранения идут через подмену, а не запись в целевой файл напрямую:
+    kill воркера родителем (на Windows это мгновенный TerminateProcess),
+    Ctrl+C или обесточивание посреди записи оставляли полузаписанный файл,
+    который все читатели молча считали пустым — и следующая запись затирала
+    его уже без старых данных. os.replace атомарен на всех трёх ОС.
+    """
+    tmp = _tmp_path(path)
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+
 def save_csv(orgs: list[Organization], path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", newline="", encoding="utf-8-sig") as f:
+    tmp = _tmp_path(path)
+    with open(tmp, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(f, fieldnames=FIELDNAMES, delimiter=";")
         writer.writeheader()
         for org in orgs:
             writer.writerow(asdict(org))
+    os.replace(tmp, path)
     log.info("CSV сохранён: %s (%d записей)", path, len(orgs))
 
 
@@ -3273,10 +3325,7 @@ def save_json(orgs: list[Organization], path: Path) -> None:
         "total": len(orgs),
         "organizations": [asdict(org) for org in orgs],
     }
-    path.write_text(
-        json.dumps(data, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    _atomic_write_text(path, json.dumps(data, ensure_ascii=False, indent=2))
     log.info("JSON сохранён: %s (%d записей)", path, len(orgs))
 
 
@@ -3391,7 +3440,9 @@ def save_xlsx(orgs: list[Organization], path: Path) -> None:
         ws = wb.active
         ws.title = "Яндекс.Карты"
         _write_sheet(ws, orgs)
-        wb.save(path)
+        tmp = _tmp_path(path)
+        wb.save(tmp)
+        os.replace(tmp, path)
         log.info("XLSX сохранён: %s (%d записей)", path, len(orgs))
     except Exception as exc:
         # Не теряем данные из-за ошибки openpyxl — падаем в CSV.
@@ -3442,7 +3493,9 @@ def save_xlsx_by_categories(
             ws = wb.create_sheet(title=sheet_name)
             _write_sheet(ws, orgs)
 
-        wb.save(path)
+        tmp = _tmp_path(path)
+        wb.save(tmp)
+        os.replace(tmp, path)
         log.info(
             "XLSX сохранён: %s (%d записей, %d листов)",
             path, len(all_orgs), len(wb.sheetnames),
@@ -4301,13 +4354,17 @@ def _enrich_orgs(ctx: BrowserContext, orgs: list[Organization], n_tabs: int = 3)
             pass
 
 
-def _make_incremental_saver(out_path: Path, save_every: int = 25):
+def _make_incremental_saver(out_path: Path, save_every: int = 25,
+                            resume: "ResumeManager | None" = None):
     """Создать callback для инкрементального сохранения по мере сбора.
 
     Возвращает (on_org_callback, all_orgs_list).
-    Каждые save_every организаций промежуточный результат сбрасывается в файл.
+    Каждые save_every организаций промежуточный результат сбрасывается в файл —
+    ВМЕСТЕ с resume-строками: при докачке в тот же файл запись только текущих
+    данных усекала его, и обрыв терял всё собранное прошлыми запусками.
     """
     all_orgs: list[Organization] = []
+    base: list[Organization] = resume.existing_orgs() if resume else []
 
     def on_org(org: Organization, index: int) -> None:
         all_orgs.append(org)
@@ -4315,8 +4372,9 @@ def _make_incremental_saver(out_path: Path, save_every: int = 25):
             try:
                 # Учитываем формат по расширению (.csv/.json/.xlsx),
                 # иначе в .json-файл писались бы XLSX-байты.
-                _save_auto(list(all_orgs), out_path)
-                log.info("Промежуточное сохранение: %d записей → %s", len(all_orgs), out_path)
+                merged = _finalize_orgs(base + all_orgs)
+                _save_auto(merged, out_path)
+                log.info("Промежуточное сохранение: %d записей → %s", len(merged), out_path)
             except Exception as exc:
                 log.debug("Ошибка промежуточного сохранения: %s", exc)
 
@@ -4443,7 +4501,8 @@ def run_parser(
         log.info("Резюме: %d организаций уже собраны", resume.existing_count)
 
     # Промежуточное сохранение: каждые 25 организаций сбрасываем в файл
-    on_org, incremental_orgs = _make_incremental_saver(out_path, save_every=25)
+    on_org, incremental_orgs = _make_incremental_saver(out_path, save_every=25,
+                                                       resume=resume)
 
     try:
         with sync_playwright() as pw:
@@ -4459,14 +4518,6 @@ def run_parser(
                 org.search_query = query
                 org.gt_slug = category_of(query)[1]
 
-            # Фильтруем уже известные (из резюме)
-            if resume:
-                before = len(orgs)
-                orgs = [o for o in orgs if not resume.is_known(o.name, o.address)]
-                if before != len(orgs):
-                    log.info("Резюме: пропущено %d уже собранных", before - len(orgs))
-                orgs = resume.existing_orgs() + orgs
-
             if detail:
                 _enrich_orgs(ctx, orgs)
 
@@ -4476,6 +4527,12 @@ def run_parser(
         record_error(f"Критическая ошибка прогона: {exc}")
         log.error("Прогон прерван ошибкой: %s", exc)
 
+    # Слияние с резюме — ВНЕ try: если браузер упал до первого результата
+    # (например, «profile is already in use»), orgs пуст, и раньше файл
+    # перезаписывался пустой книгой — все прошлые данные уничтожались.
+    if resume:
+        orgs = resume.existing_orgs() + orgs
+
     # Финальная подчистка: дубли + пустые названия
     before_fin = len(orgs)
     orgs = _finalize_orgs(orgs)
@@ -4483,7 +4540,12 @@ def run_parser(
         log.info("Финальная подчистка: %d → %d (убрано дублей/пустых: %d)",
                  before_fin, len(orgs), before_fin - len(orgs))
 
-    _save_auto(orgs, out_path)
+    if not orgs and resume_path and Path(resume_path) == out_path:
+        # Совсем ничего (и собрать не удалось, и резюме пустое) — не трогаем
+        # файл: перезапись нулём хуже, чем устаревший результат.
+        log.warning("Ничего не собрано — файл %s не перезаписываю", out_path)
+    else:
+        _save_auto(orgs, out_path)
     stats = print_stats(orgs)
     save_run_report({
         "mode": "search",
@@ -4503,6 +4565,26 @@ def run_parser(
 # ---------------------------------------------------------------------------
 # Category-based parser (аналог 2ГИС)
 # ---------------------------------------------------------------------------
+
+def _merge_results_with_resume(
+    results: dict[str, list["Organization"]],
+    resume: "ResumeManager | None",
+) -> dict[str, list["Organization"]]:
+    """Слить результаты текущего запуска с ранее собранными из resume-файла.
+
+    Возвращает финализированную (дедуп + слияние полей) группировку по
+    категориям — единый вид для промежуточных сейвов, финала и возврата.
+    """
+    all_orgs: list[Organization] = []
+    if resume:
+        all_orgs.extend(resume.existing_orgs())
+    for v in results.values():
+        all_orgs.extend(v)
+    grouped: dict[str, list[Organization]] = {}
+    for o in _finalize_orgs(all_orgs):
+        grouped.setdefault(o.search_query or "Прочее", []).append(o)
+    return grouped
+
 
 def run_category_parser(
     city: str,
@@ -4620,15 +4702,20 @@ def run_category_parser(
             log.info("«%s» по запросу «%s»: +%d (в категории всего %d)",
                      cat_label, cat_query, len(unique_orgs), len(results[cat_label]))
 
-            # Промежуточное сохранение после каждой категории
+            # Промежуточное сохранение после каждой категории.
+            # ОБЯЗАТЕЛЬНО вместе с resume-строками: при resume_path == output
+            # (штатный режим докачки и рестарта воркера) запись только текущих
+            # результатов усекала файл, и обрыв до финального сейва терял всё,
+            # что было собрано прошлыми запусками.
             try:
+                merged_now = _merge_results_with_resume(results, resume)
                 suffix = out_path.suffix.lower()
                 if suffix in (".csv", ".json"):
-                    all_tmp = [o for v in results.values() for o in v]
+                    all_tmp = [o for v in merged_now.values() for o in v]
                     (save_csv if suffix == ".csv" else save_json)(all_tmp, out_path)
                 else:
-                    save_xlsx_by_categories(results, out_path)
-                total_so_far = sum(len(v) for v in results.values())
+                    save_xlsx_by_categories(merged_now, out_path)
+                total_so_far = sum(len(v) for v in merged_now.values())
                 log.info("Промежуточное сохранение: %d записей → %s", total_so_far, out_path)
             except Exception as exc:
                 log.debug("Ошибка промежуточного сохранения: %s", exc)
@@ -4664,17 +4751,9 @@ def run_category_parser(
         record_error(f"Критическая ошибка прогона: {exc}")
         log.error("Прогон прерван ошибкой: %s", exc)
 
-    # Финальное сохранение
-    all_orgs: list[Organization] = []
-    for v in results.values():
-        all_orgs.extend(v)
-
-    # Добавляем ранее собранные (из резюме)
-    if resume:
-        existing = resume.existing_orgs()
-        all_orgs = existing + all_orgs
-
-    all_orgs = _finalize_orgs(all_orgs)
+    # Финальное сохранение: текущие результаты + resume, финализированные
+    grouped = _merge_results_with_resume(results, resume)
+    all_orgs = [o for v in grouped.values() for o in v]
 
     suffix = out_path.suffix.lower()
     if suffix == ".json":
@@ -4682,11 +4761,6 @@ def run_category_parser(
     elif suffix == ".csv":
         save_csv(all_orgs, out_path)
     else:
-        # Группируем ФИНАЛИЗИРОВАННЫЕ all_orgs (включая resume) по запросу,
-        # иначе XLSX терял бы ранее собранные организации из resume-файла.
-        grouped: dict[str, list[Organization]] = {}
-        for o in all_orgs:
-            grouped.setdefault(o.search_query or "Прочее", []).append(o)
         save_xlsx_by_categories(grouped, out_path)
 
     total_orgs = len(all_orgs)
@@ -4707,7 +4781,10 @@ def run_category_parser(
         "captchas": get_throttle().captcha_count - _captchas_before,
         "per_query": {q: len(v) for q, v in results.items()},
     }, stats)
-    return results
+    # Возвращаем СЛИТОЕ (текущее + resume): вызывающий --all-cities пишет это
+    # в общий файл, и город, доделанный с середины, должен попасть туда целиком,
+    # а не только доделанными категориями.
+    return grouped
 
 
 def _ensure_ext(name: str) -> str:
@@ -4751,22 +4828,28 @@ def run_cities_parser(
     seen: set[str] = set()
     done_file = out_path.parent / (out_path.stem + ".cities.json")
 
-    # Резюме: города, уже пройденные в прошлом запуске той же команды.
-    done: set[str] = set()
-    if done_file.exists():
-        try:
-            done = set(json.loads(done_file.read_text(encoding="utf-8")))
-        except Exception:
-            done = set()
-    # Подхватываем уже собранное из частичных файлов (в т.ч. из прошлого запуска).
-    for city in list(done):
-        for o in _load_existing_orgs(parts_dir / f"{_safe_name(city)}.xlsx"):
+    # Резюме: города, пройденные прошлыми запусками — СВОИМ (stem.cities.json)
+    # И параллельным (stem.w*.cities.json). Раньше читался только свой файл:
+    # после прогона в 2 браузера запуск в один (штатный совет при капче —
+    # «уменьши --workers») стартовал с пустым merged и затирал слитый файл
+    # после первого же города.
+    done: set[str] = _done_cities(out_path)
+
+    def _seed(orgs: list[Organization]) -> None:
+        for o in orgs:
             key = _dedup_key(o)
             if key not in seen:
                 seen.add(key)
                 merged.setdefault(o.search_query or "Прочее", []).append(o)
-    if done:
-        log.info("Резюме: %d городов уже пройдено, %d организаций поднято из частей",
+
+    # Подхватываем уже собранное: сам итоговый файл (в нём лежит слитое из
+    # прошлых прогонов, включая параллельные) + погородные части.
+    if out_path.exists():
+        _seed(_load_existing_orgs(out_path))
+    for city in sorted(done):
+        _seed(_load_existing_orgs(parts_dir / f"{_safe_name(city)}.xlsx"))
+    if done or seen:
+        log.info("Резюме: %d городов уже пройдено, %d организаций поднято",
                  len(done), len(seen))
 
     todo = [c for c in cities if c not in done]
@@ -4810,8 +4893,8 @@ def run_cities_parser(
         # Инкрементальное сохранение — прерывание не теряет данные.
         save_xlsx_by_categories(merged, out_path)
         try:
-            done_file.write_text(json.dumps(sorted(done), ensure_ascii=False),
-                                 encoding="utf-8")
+            _atomic_write_text(done_file,
+                                 json.dumps(sorted(done), ensure_ascii=False))
         except Exception as exc:
             log.warning("Не сохранил прогресс по городам: %s", exc)
 
@@ -4947,7 +5030,13 @@ def _done_cities(out_path: Path) -> set[str]:
     """
     done: set[str] = set()
     stem = out_path.stem
-    for cj in out_path.parent.glob(f"{stem}*.cities.json"):
+    # Только формы, которые генерирует сам код (сам файл, части воркеров,
+    # добор): глоб stem* цеплял и kz_gt2.cities.json от ДРУГОГО прогона,
+    # после чего свежий kz_gt.xlsx честно рапортовал «всё уже собрано».
+    patterns = [f"{stem}.cities.json", f"{stem}.w*.cities.json",
+                f"{stem}.finish*.cities.json"]
+    matches = {c for pat in patterns for c in out_path.parent.glob(pat)}
+    for cj in sorted(matches):
         try:
             data = json.loads(cj.read_text(encoding="utf-8"))
             if isinstance(data, list):
@@ -5087,10 +5176,10 @@ def run_parallel(base_argv: list[str], shards: list[list[str]], output: str,
 
         last_report = 0.0
         seen_counts = [0] * n
-        while any(p is not None and p.poll() is None for p in procs):
-            time.sleep(3)
-
+        while True:
             # --- присмотр: поднимаем упавших ---
+            # ВАЖНО до проверки выхода: иначе воркер, упавший последним (когда
+            # остальные уже готовы), не получал ни одной попытки рестарта.
             for i, p in enumerate(procs):
                 if p is None or p.poll() is None or p.returncode == 0:
                     continue
@@ -5110,6 +5199,10 @@ def run_parallel(base_argv: list[str], shards: list[list[str]], output: str,
                     _launch(i)
                 except Exception as exc:
                     log.error("Не смог перезапустить воркера %d: %s", i + 1, exc)
+
+            if not any(p is not None and p.poll() is None for p in procs):
+                break
+            time.sleep(3)
 
             if time.time() - last_report < 30:
                 continue
@@ -5250,7 +5343,8 @@ def _count_captchas() -> int:
             text = lf.read_text(encoding="utf-8", errors="replace")
         except Exception:
             continue
-        total += text.lower().count("капча обнаружена") + text.count("CAPTCHA обнаружена")
+        # Реальная строка в логе — «ОБНАРУЖЕНА CAPTCHA!» (см. detect-ветку).
+        total += text.upper().count("ОБНАРУЖЕНА CAPTCHA")
     return total
 
 
@@ -5407,9 +5501,9 @@ def run_country_sweep(
 
     def _save_progress() -> None:
         try:
-            progress_path.write_text(json.dumps(
+            _atomic_write_text(progress_path, json.dumps(
                 {"done": sorted(done), "queue": [list(u) for u in queue]},
-                ensure_ascii=False), encoding="utf-8")
+                ensure_ascii=False))
         except Exception as exc:
             log.debug("Не удалось сохранить прогресс: %s", exc)
 
@@ -5417,6 +5511,14 @@ def run_country_sweep(
     processed_since_save = 0
     subdivided = 0
     MAX_UNITS = 300_000   # предохранитель от разрастания
+    # Подряд неразрешённые капчи. Без потолка бан IP зацикливал свип навсегда:
+    # каждая итерация — «капча → cooldown → тайл обратно в очередь», очередь не
+    # пустеет, сохранения (по числу ГОТОВЫХ тайлов) прекращаются.
+    captcha_streak = 0
+    MAX_CAPTCHA_STREAK = 5
+    # Повторы упавших тайлов: с какой попытки тайл считается безнадёжным.
+    attempts: dict[str, int] = {}
+    MAX_TILE_ATTEMPTS = 3
     try:
         with sync_playwright() as pw:
             _, ctx = _create_browser_context(pw, headless, proxy_url=proxy_url)
@@ -5445,17 +5547,43 @@ def run_country_sweep(
                             page.remove_listener("response", collector.on_response)
                             # вернём тайл в очередь (не помечаем done) — повторим позже
                             queue.append((lon, lat, span, z, q))
+                            captcha_streak += 1
+                            if captcha_streak >= MAX_CAPTCHA_STREAK:
+                                log.error(
+                                    "Капча не решается %d тайлов подряд — IP "
+                                    "забанен, крутиться дальше бессмысленно. "
+                                    "Прогресс сохранён, продолжай позже той же "
+                                    "командой (лучше сменив IP/уменьшив темп).",
+                                    captcha_streak)
+                                break
                             page.wait_for_timeout(cooldown_sec * 1000)
                             continue
+                        captcha_streak = 0
                     else:
                         throttle.on_success()
+                        captcha_streak = 0
                     tile_orgs = _collect_current_results(
                         page, q, max_per_tile, scroll_pause, api_intercept,
                         on_org=None, headless=headless, collector=collector,
                     )
                 except Exception as exc:
                     record_error(f"Тайл {MAP_LL} ({q}): {exc}")
-                    log.warning("Тайл %s (%s) — ошибка: %s", MAP_LL, q, exc)
+                    # №: тайл с ошибкой раньше помечался done — обрыв сети на
+                    # ночном свипе оставлял дырки в покрытии, которые resume
+                    # уже не добирал. Теперь до MAX_TILE_ATTEMPTS повторов.
+                    attempts[uk] = attempts.get(uk, 0) + 1
+                    if attempts[uk] < MAX_TILE_ATTEMPTS:
+                        log.warning("Тайл %s (%s) — ошибка: %s (попытка %d/%d, "
+                                    "вернул в очередь)", MAP_LL, q, exc,
+                                    attempts[uk], MAX_TILE_ATTEMPTS)
+                        queue.append((lon, lat, span, z, q))
+                        try:
+                            page.remove_listener("response", collector.on_response)
+                        except Exception:
+                            pass
+                        continue
+                    log.warning("Тайл %s (%s) — ошибка: %s (исчерпаны попытки, "
+                                "пропускаю)", MAP_LL, q, exc)
                 finally:
                     try:
                         page.remove_listener("response", collector.on_response)
@@ -5898,12 +6026,18 @@ def main() -> None:
     # Не дать ноутбуку уснуть посреди многочасового сбора.
     _prevent_sleep()
 
-    # Конфиг-файл (перезаписывает дефолты, CLI-аргументы приоритетнее)
+    # Конфиг-файл (перезаписывает дефолты, CLI-аргументы приоритетнее).
+    # Значение из конфига применяется, если аргумент не задан в CLI, то есть
+    # равен своему дефолту. Сравнение с None ломало булевы ключи: у store_true
+    # дефолт False, и `api_intercept: true` из конфига молча игнорировался.
     if args.config:
         cfg = load_config(args.config)
         for k, v in cfg.items():
             arg_key = k.replace("-", "_")
-            if hasattr(args, arg_key) and getattr(args, arg_key) is None:
+            if not hasattr(args, arg_key):
+                continue
+            cur = getattr(args, arg_key)
+            if cur is None or cur == parser.get_default(arg_key):
                 setattr(args, arg_key, v)
 
     # Имя выходного файла без расширения ломает ВСЮ цепочку частей:
