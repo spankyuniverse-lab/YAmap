@@ -20,7 +20,7 @@ sys.path.insert(0, str(HERE.parent))
 
 import mock_yandex  # noqa: E402
 
-CATALOG = {"Заправки": 30, "Супермаркеты": 18, "Где поесть": 25}
+CATALOG = {"Заправки": 30, "Супермаркет": 18, "Кафе": 14, "Ресторан": 11}
 
 fails: list[str] = []
 
@@ -75,8 +75,8 @@ def main() -> int:
     try:
         # ---- 1. Один город, три категории ----
         print("--- прогон: один город, 3 категории ---")
-        r = run(["--city", "Алматы", "--category", "Заправки", "Супермаркеты",
-                 "Где поесть", "-o", str(out), "--api-intercept", "-n", "500"], env)
+        r = run(["--city", "Алматы", "--category", "Заправки", "Супермаркет",
+                 "Кафе", "Ресторан", "-o", str(out), "--api-intercept", "-n", "500"], env)
         check(r.returncode == 0, f"парсер отработал без ошибки (код {r.returncode})")
         if r.returncode != 0:
             print(r.stdout[-3000:], r.stderr[-3000:])
@@ -92,7 +92,11 @@ def main() -> int:
         for row in data:
             by_cat[row.get("Поисковый запрос") or "?"] = \
                 by_cat.get(row.get("Поисковый запрос") or "?", 0) + 1
-        check(by_cat == CATALOG, f"разбивка по категориям: {by_cat}")
+        # «Кафе» и «Ресторан» — два запроса ОДНОЙ категории «Поесть»
+        want_cat = {"Заправки": 30, "Супермаркеты": 18, "Поесть": 14 + 11}
+        check(by_cat == want_cat, f"разбивка по категориям: {by_cat} (ждали {want_cat})")
+        check(sum(1 for row in data if row.get("Запрос") == "Ресторан") == 11,
+              "точный запрос сохранён в колонке «Запрос»")
 
         filled = lambda k: sum(1 for row in data if str(row.get(k) or "").strip())
         check(filled("Телефон") == got, f"телефон у всех: {filled('Телефон')}/{got}")

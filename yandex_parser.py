@@ -573,6 +573,11 @@ class Organization:
     #: Слаг GT-категории (gt_zapravki, gt_produktovye, …) — чтобы выгрузку
     #: можно было сматчить со своей таблицей по ключу, а не по названию.
     gt_slug: str = ""
+    #: Точный запрос, которым эту строку нашли («Кафе», «Ресторан», …).
+    #: Отличается от search_query: там название категории («Поесть»), общее для
+    #: нескольких запросов. Резюме считает выполненные запросы именно отсюда,
+    #: иначе первый же запрос категории закрыл бы остальные её запросы.
+    source_query: str = ""
     #: Город прогона. Именно прогона, а не разобранного адреса: так строка
     #: однозначно ложится в таблицу «город × категория».
     city: str = ""
@@ -1034,7 +1039,9 @@ class ResumeManager:
             if key != "|":
                 org = Organization(**{f: norm.get(f, "") for f in FIELDNAMES if f in norm})
                 self._existing[key] = org
-                q = norm.get("search_query", "")
+                # source_query — точный запрос; search_query оставлен как
+                # запасной вариант для файлов, снятых до его появления.
+                q = norm.get("source_query", "") or norm.get("search_query", "")
                 if q:
                     self._completed_queries.add(q)
 
@@ -1207,20 +1214,41 @@ CATEGORIES: dict[str, list[str]] = {
 # три запроса вернули один и тот же набор (в статистике АГЗС/АГНС/АГНКС дали
 # ровно по 1653 — это ярлыки на тех же организациях). Тройное время ради
 # дублей. Один запрос на категорию.
-GT_SEGMENT: list[tuple[str, str]] = [
-    ("gt_zapravki",     "Заправки"),
-    ("gt_poest",        "Где поесть"),
-    ("gt_produktovye",  "Продуктовые магазины"),
-    ("gt_supermarkety", "Супермаркеты"),
-    ("gt_gipermarkety", "Гипермаркеты"),
+# Категория = (слаг, название в выгрузке, запросы к Яндексу).
+#
+# Запросов на категорию может быть несколько, и все они пишутся в выгрузку под
+# ОДНИМ названием — таксономия остаётся из пяти пунктов, а охват берётся
+# нормальный. Формулировки — рубрики самого Яндекса, а не свободные фразы:
+# в прошлом прогоне «Продуктовые магазины Алматы» давало 7 точек, «Супермаркеты
+# Алматы» трижды отвечало «Результаты не найдены», а в собранных данных
+# Яндекс называет эти же места «Магазин продуктов», «Супермаркет», «Кафе».
+# По своим рубрикам он отдаёт полный список, по вольному пересказу — обрывок.
+GT_SEGMENT: list[tuple[str, str, list[str]]] = [
+    ("gt_zapravki",     "Заправки",             ["Заправки"]),
+    ("gt_poest",        "Поесть",               ["Кафе", "Ресторан",
+                                                 "Быстрое питание", "Столовая"]),
+    ("gt_produktovye",  "Продуктовые магазины", ["Магазин продуктов",
+                                                 "Магазин смешанных товаров"]),
+    ("gt_supermarkety", "Супермаркеты",         ["Супермаркет"]),
+    ("gt_gipermarkety", "Гипермаркеты",         ["Гипермаркет"]),
 ]
 
-#: Запрос → слаг: чтобы выгрузку можно было сматчить со своей таблицей.
-GT_SLUG_BY_QUERY: dict[str, str] = {q: s for s, q in GT_SEGMENT}
+#: Запрос → (название категории, слаг). Нужен, чтобы четыре запроса «Поесть»
+#: легли в выгрузку одной категорией, а не четырьмя.
+QUERY_CATEGORY: dict[str, tuple[str, str]] = {
+    q: (label, slug) for slug, label, queries in GT_SEGMENT for q in queries
+}
 
-GT_ALL: list[str] = [q for _s, q in GT_SEGMENT]
-GT_FUEL: list[str] = ["Заправки"]
-GT_GROCERY: list[str] = ["Продуктовые магазины", "Супермаркеты", "Гипермаркеты"]
+
+def category_of(query: str) -> tuple[str, str]:
+    """Запрос → (название категории, слаг). Незнакомый запрос — сам себе имя."""
+    return QUERY_CATEGORY.get(query, (query, ""))
+
+
+GT_ALL: list[str] = [q for _s, _l, qs in GT_SEGMENT for q in qs]
+GT_FUEL: list[str] = GT_SEGMENT[0][2]
+GT_FOOD: list[str] = GT_SEGMENT[1][2]
+GT_GROCERY: list[str] = [q for _s, _l, qs in GT_SEGMENT[2:] for q in qs]
 
 PRESETS: dict[str, list[str]] = {
     "gt": GT_ALL,
@@ -1228,8 +1256,8 @@ PRESETS: dict[str, list[str]] = {
     "gt-fuel": GT_FUEL,
     "gt-магазины": GT_GROCERY,
     "gt-grocery": GT_GROCERY,
-    "gt-еда": ["Где поесть"],
-    "gt-food": ["Где поесть"],
+    "gt-еда": GT_FOOD,
+    "gt-food": GT_FOOD,
 }
 
 
@@ -3265,6 +3293,7 @@ HEADERS_RU = {
     "social_links": "Соцсети",
     "search_query": "Поисковый запрос",
     "gt_slug": "Код категории",
+    "source_query": "Запрос",
     "city": "Город (прогон)",
     "yandex_url": "Ссылка",
     # расширенные поля
@@ -4389,7 +4418,7 @@ def run_parser(
 
             for org in orgs:
                 org.search_query = query
-                org.gt_slug = GT_SLUG_BY_QUERY.get(query, "")
+                org.gt_slug = category_of(query)[1]
 
             # Фильтруем уже известные (из резюме)
             if resume:
@@ -4459,7 +4488,12 @@ def run_category_parser(
         log.info("Grid-свип: %d вьюпортов (%dx%d) на каждую категорию", len(tiles), grid, grid)
     out_path = Path(output)
     results: dict[str, list[Organization]] = {}
-    seen_global: set[str] = set()
+    # Дедуп ведём ПО КАТЕГОРИЯМ, а не общий на город. Общий выкидывал точку из
+    # её собственной категории, если её уже видели в предыдущей: в прошлом
+    # прогоне «Супермаркеты Шымкент» из трёх найденных оставили одну, потому
+    # что две уже попались среди заправок (у АЗС есть магазин). Лист категории
+    # обязан быть полным; сводный лист схлопнет повторы сам.
+    seen_by_cat: dict[str, set[str]] = {}
 
     # Отчётность
     setup_file_logging()
@@ -4470,7 +4504,8 @@ def run_category_parser(
     # Резюме
     resume = ResumeManager(resume_path) if resume_path else None
     if resume and resume.existing_count > 0:
-        seen_global = resume.existing_keys()
+        for _o in resume.existing_orgs():
+            seen_by_cat.setdefault(_o.search_query or "", set()).add(_dedup_key(_o))
         log.info("Резюме: %d организаций уже собраны", resume.existing_count)
 
     queries = resolve_categories(categories)
@@ -4526,21 +4561,25 @@ def run_category_parser(
                              f"(возможна капча/блокировка)")
 
             # Дедупликация по имени+адресу
+            cat_label, cat_slug = category_of(cat_query)
+            seen_cat = seen_by_cat.setdefault(cat_label, set())
             unique_orgs: list[Organization] = []
             for org in orgs:
                 key = _dedup_key(org)
-                if key not in seen_global:
-                    seen_global.add(key)
-                    org.search_query = cat_query
-                    org.gt_slug = GT_SLUG_BY_QUERY.get(cat_query, "")
+                if key not in seen_cat:
+                    seen_cat.add(key)
+                    org.search_query = cat_label
+                    org.gt_slug = cat_slug
+                    org.source_query = cat_query
                     org.city = city
                     unique_orgs.append(org)
 
             if detail:
                 _enrich_orgs(ctx, unique_orgs)
 
-            results.setdefault(cat_query, []).extend(unique_orgs)
-            log.info("Категория «%s»: %d организаций (уникальных)", cat_query, len(unique_orgs))
+            results.setdefault(cat_label, []).extend(unique_orgs)
+            log.info("«%s» по запросу «%s»: +%d (в категории всего %d)",
+                     cat_label, cat_query, len(unique_orgs), len(results[cat_label]))
 
             # Промежуточное сохранение после каждой категории
             try:
@@ -5388,7 +5427,7 @@ def run_country_sweep(
                 for o in tile_orgs:
                     if not o.search_query:
                         o.search_query = q
-                        o.gt_slug = GT_SLUG_BY_QUERY.get(q, "")
+                        o.gt_slug = category_of(q)[1]
                     k = _dedup_key(o)
                     if k in seen:
                         continue

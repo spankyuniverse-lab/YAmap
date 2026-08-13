@@ -12,25 +12,34 @@ def check(cond, msg):
         fails.append(msg)
 
 qs = y.resolve_categories(["gt"])
-check(qs == ["Заправки", "Где поесть", "Продуктовые магазины",
-             "Супермаркеты", "Гипермаркеты"], f"GT = ровно 5 категорий: {qs}")
+labels = []
+for q in qs:
+    lab = y.category_of(q)[0]
+    if lab not in labels:
+        labels.append(lab)
+check(labels == ["Заправки", "Поесть", "Продуктовые магазины",
+                 "Супермаркеты", "Гипермаркеты"], f"GT = 5 категорий: {labels}")
+check(len(qs) > 5, f"под категориями несколько запросов Яндексу: {len(qs)}")
+check(y.category_of("Ресторан")[0] == "Поесть", "«Ресторан» ложится в «Поесть»")
+check(y.category_of("Кафе")[1] == "gt_poest", "слаг у всех запросов категории один")
 check(len(y.resolve_city_list(None)) == 19, "по умолчанию 19 городов")
 check(y.resolve_categories(["gt-fuel"]) == ["Заправки"],
       "gt-fuel = один запрос (без дублей АГЗС/АГНКС)")
 
-# Слаги на всех пяти
-slugs = [y.GT_SLUG_BY_QUERY.get(q) for q in qs]
-check(all(slugs) and slugs == ["gt_zapravki", "gt_poest", "gt_produktovye",
-                               "gt_supermarkety", "gt_gipermarkety"],
-      f"слаги проставлены: {slugs}")
+# Слаг есть у каждого запроса
+slugs = {y.category_of(q)[1] for q in qs}
+check(all(slugs) and slugs == {"gt_zapravki", "gt_poest", "gt_produktovye",
+                               "gt_supermarkety", "gt_gipermarkety"},
+      f"слаги проставлены: {sorted(slugs)}")
 
 # Книга: лист на категорию, город — колонкой
 orgs, res = [], {}
 for city in ["Алматы", "Астана", "Шымкент"]:
     for q in qs:
+        lab, slug = y.category_of(q)
         o = y.Organization(name=f"{q}-{city}", address=f"{city}, ул. 1",
-                           search_query=q, gt_slug=y.GT_SLUG_BY_QUERY[q], city=city)
-        res.setdefault(q, []).append(o)
+                           search_query=lab, gt_slug=slug, source_query=q, city=city)
+        res.setdefault(lab, []).append(o)
         orgs.append(o)
 
 out = Path(__file__).resolve().parent / "out" / "gt.xlsx"
@@ -40,8 +49,8 @@ y.save_xlsx_by_categories(res, out)
 from openpyxl import load_workbook
 wb = load_workbook(out)
 sheets = [s for s in wb.sheetnames if s != "Все результаты"]
-check(sorted(sheets) == sorted(qs),
-      f"листов ровно 5, по категориям: {sheets}")
+check(sorted(sheets) == sorted(labels),
+      f"листов ровно 5, по КАТЕГОРИЯМ (не по запросам): {sheets}")
 
 ws = wb["Все результаты"]
 head = [c.value for c in ws[1]]
@@ -51,7 +60,9 @@ i_slug, i_city = head.index("Код категории"), head.index("Город
 row = [c.value for c in ws[2]]
 check(row[i_slug].startswith("gt_") and row[i_city] in ("Алматы", "Астана", "Шымкент"),
       f"в строке заполнены слаг={row[i_slug]!r} и город={row[i_city]!r}")
-check(ws.max_row - 1 == 15, f"строк 3 города × 5 категорий = 15 (вышло {ws.max_row - 1})")
+check(ws.max_row - 1 == 3 * len(qs),
+      f"строк 3 города × {len(qs)} запросов (вышло {ws.max_row - 1})")
+check("Запрос" in head, "в шапке есть колонка «Запрос» (точный запрос Яндексу)")
 
 print("\n" + ("✅ GT ОК" if not fails else f"❌ ПРОВАЛЫ: {fails}"))
 sys.exit(1 if fails else 0)
