@@ -18,7 +18,9 @@ for q in qs:
     if lab not in labels:
         labels.append(lab)
 check(labels == ["Заправки", "Поесть", "Продуктовые магазины",
-                 "Супермаркеты", "Гипермаркеты"], f"GT = 5 категорий: {labels}")
+                 "Гипермаркеты"], f"GT = 4 категории: {labels}")
+check(y.category_of("Супермаркет")[0] == "Продуктовые магазины",
+      "«Супермаркет» ложится в «Продуктовые магазины», отдельной категории нет")
 check(len(qs) > 5, f"под категориями несколько запросов Яндексу: {len(qs)}")
 check(y.category_of("Ресторан")[0] == "Поесть", "«Ресторан» ложится в «Поесть»")
 check(y.category_of("Кафе")[1] == "gt_poest", "слаг у всех запросов категории один")
@@ -29,7 +31,7 @@ check(y.resolve_categories(["gt-fuel"]) == ["Заправки"],
 # Слаг есть у каждого запроса
 slugs = {y.category_of(q)[1] for q in qs}
 check(all(slugs) and slugs == {"gt_zapravki", "gt_poest", "gt_produktovye",
-                               "gt_supermarkety", "gt_gipermarkety"},
+                               "gt_gipermarkety"},
       f"слаги проставлены: {sorted(slugs)}")
 
 # Книга: лист на категорию, город — колонкой
@@ -50,7 +52,7 @@ from openpyxl import load_workbook
 wb = load_workbook(out)
 sheets = [s for s in wb.sheetnames if s != "Все результаты"]
 check(sorted(sheets) == sorted(labels),
-      f"листов ровно 5, по КАТЕГОРИЯМ (не по запросам): {sheets}")
+      f"лист на КАЖДУЮ категорию (не на запрос): {sheets}")
 
 ws = wb["Все результаты"]
 head = [c.value for c in ws[1]]
