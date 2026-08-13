@@ -2035,7 +2035,7 @@ def _get_loaded_count(page: Page) -> int:
 # как «показать ещё» по тексту/aria и не лежать внутри фильтров-дропдауна,
 # а сам клик делаем из JS — ему не мешают перекрывающие оверлеи.
 _JS_CLICK_SHOW_MORE = r"""(sel) => {
-    const BAD  = /фильтр|filter|dropdown|popup|modal|toolbar|tabs|header/i;
+    const BAD  = /фильтр|filter|dropdown|popup|modal|toolbar|tabs|header|отзыв|фото|филиал|маршрут|review|photo|branch|route/i;
     const GOOD = /показать\s+ещ|показать\s+больш|загрузить\s+ещ|ещё\s*\d|еще\s*\d|show\s+more|load\s+more/i;
     const cands = [];
     if (sel) { try { for (const el of document.querySelectorAll(sel)) cands.push(el); } catch (e) {} }
@@ -2051,7 +2051,7 @@ _JS_CLICK_SHOW_MORE = r"""(sel) => {
         if (!el || el.nodeType !== 1) continue;
         const txt  = (el.textContent || '').trim();
         const aria = el.getAttribute('aria-label') || '';
-        if (BAD.test(aria)) continue;
+        if (BAD.test(aria) || BAD.test(txt)) continue;
         if (!GOOD.test(txt) && !GOOD.test(aria)) continue;
         if (el.disabled) continue;
         // Не внутри панели фильтров / выпадашки.
@@ -3860,23 +3860,26 @@ def _warmup(page: Page, headless: bool) -> None:
             )
             page.wait_for_timeout(random.randint(100, 400))
 
-        # Кликаем куда-нибудь на карту
-        page.mouse.click(random.randint(500, 900), random.randint(300, 600))
-        page.wait_for_timeout(random.randint(1000, 2500))
+        # По карте НЕ кликаем: слепой клик попадает в пин организации и
+        # открывает её карточку — браузер уезжает на /maps/org/…, а сбор потом
+        # ловит ответы карточки (fetchReviews) вместо выдачи. Достаточно
+        # движения мышью, для «естественности» этого хватает.
+        page.wait_for_timeout(random.randint(600, 1500))
 
         # Скроллим карту немного (зум)
         page.mouse.wheel(0, random.randint(-200, 200))
         page.wait_for_timeout(random.randint(500, 1500))
 
-        # Иногда (30%) «ищем что-то» на карте — создаёт видимость активности
+        # Иногда (30%) «ищем что-то» — кликаем в строку поиска и «передумываем».
+        # Выходим по Escape, НЕ кликом по карте: слепой клик попадает в пин
+        # организации, открывает её карточку, и браузер уезжает с выдачи.
         if random.random() < 0.3:
             try:
                 search_input = page.locator("input[class*='search'], input[class*='input']").first
                 if search_input.count() > 0 and search_input.is_visible():
                     search_input.click()
                     page.wait_for_timeout(random.randint(300, 700))
-                    # Просто кликнули и «передумали»
-                    page.mouse.click(random.randint(500, 900), random.randint(300, 600))
+                    page.keyboard.press("Escape")
                     page.wait_for_timeout(random.randint(500, 1000))
             except Exception:
                 pass
@@ -3886,15 +3889,21 @@ def _warmup(page: Page, headless: bool) -> None:
         log.debug("Прогрев не удался: %s", exc)
 
 
-def _type_like_human(page: Page, selector: str, text: str) -> None:
-    """Напечатать текст по буквам с человеческими задержками между символами."""
+def _type_like_human(page: Page, selector: str, text: str) -> bool:
+    """Напечатать текст по буквам с человеческими задержками между символами.
+
+    Возвращает True, если в поле в итоге лежит РОВНО нужный текст.
+
+    Поле чистим через fill(""), а не «Ctrl+A → Delete»: на macOS выделяет всё
+    Cmd+A, а Ctrl+A там уводит курсор в начало строки. Из-за этого прошлый
+    запрос не стирался, и новый дописывался к нему — в строке поиска
+    оказывалось «Кафе Астана заправки Астана», а Яндекс на такое отвечал
+    парой случайных точек или «Результаты не найдены».
+    """
     el = page.locator(selector).first
     el.click()
     page.wait_for_timeout(random.randint(200, 500))
-    # Очищаем поле (Ctrl+A → Delete)
-    el.press("Control+a")
-    page.wait_for_timeout(random.randint(50, 150))
-    el.press("Delete")
+    el.fill("")                       # надёжная очистка, без клавиатурных сочетаний
     page.wait_for_timeout(random.randint(100, 300))
     # Печатаем по буквам
     for char in text:
@@ -3902,6 +3911,12 @@ def _type_like_human(page: Page, selector: str, text: str) -> None:
         # Иногда (5%) микро-пауза — человек думает
         if random.random() < 0.05:
             page.wait_for_timeout(random.randint(200, 600))
+    # Проверяем, что в поле именно то, что хотели: молчаливая порча запроса
+    # обходится дороже, чем лишний goto.
+    try:
+        return (el.input_value() or "").strip() == text.strip()
+    except Exception:
+        return False
 
 
 def _do_search(page: Page, query: str, headless: bool) -> bool:
@@ -3923,7 +3938,11 @@ def _do_search(page: Page, query: str, headless: bool) -> bool:
             inp = page.locator(sel).first
             if inp.count() > 0 and inp.is_visible():
                 log.info("Ввожу запрос в строку поиска: %s", query)
-                _type_like_human(page, sel, query)
+                if not _type_like_human(page, sel, query):
+                    log.warning("В строке поиска оказался не тот текст "
+                                "(«%s») — иду по прямому URL",
+                                (inp.input_value() or "")[:80])
+                    break
                 page.wait_for_timeout(random.randint(300, 700))
                 inp.press("Enter")
                 return True
@@ -3968,9 +3987,27 @@ def _search_and_collect(
     collector = _ApiCollector(dump=bool(os.environ.get("YAMAP_DEBUG_API")))
     page.on("response", collector.on_response)
     try:
+        # Если предыдущий шаг оставил страницу на КАРТОЧКЕ организации
+        # (/maps/org/…), выдачи на ней нет и строка поиска ведёт себя иначе.
+        # Уходим на чистую карту до ввода запроса.
+        if "/maps/org/" in page.url:
+            log.info("Открыта карточка организации — возвращаюсь на карту")
+            page.goto(f"{maps_url()}?lang={LANG}"
+                      + (f"&ll={MAP_LL}&z={MAP_Z}" if MAP_LL else ""),
+                      wait_until="domcontentloaded", timeout=20000)
+            page.wait_for_timeout(random.randint(1000, 2000))
+
         # Вводим запрос через строку поиска (как человек)
         _do_search(page, query, headless)
         page.wait_for_timeout(random.randint(2500, 4500))
+
+        # Один результат Яндекс иногда открывает сразу карточкой — на ней
+        # нет списка, и парсер зря решил бы «пусто». Прямой URL поиска
+        # возвращает обычную выдачу.
+        if "/maps/org/" in page.url:
+            log.info("Яндекс открыл карточку вместо выдачи — иду прямым URL поиска")
+            page.goto(search_url(query), wait_until="domcontentloaded", timeout=30000)
+            page.wait_for_timeout(random.randint(1500, 3000))
 
         # Проверка CAPTCHA
         if detect_captcha(page):

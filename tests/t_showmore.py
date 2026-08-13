@@ -34,6 +34,15 @@ HTML_HIDDEN = f"""
   <button class="_y_show-more" data-id="hidden" onclick="{MARK}">Показать ещё</button>
 </div></div>
 """
+# Ловушки со словом «ещё»/«показать», но НЕ про подгрузку выдачи:
+# филиалы в сниппете, отзывы и фото в карточке. Раньше /ещё\s*\d/ их ловил.
+HTML_TRAPS = f"""
+<div class="_x_search-list-view">
+  <button data-id="branches" onclick="{MARK}">Ещё 2 филиала</button>
+  <button data-id="reviews" onclick="{MARK}">Показать ещё 12 отзывов</button>
+  <button data-id="photos" onclick="{MARK}">Ещё 5 фото</button>
+</div>
+"""
 
 with sync_playwright() as pw:
     # Браузер ищем, а не прибиваем путём: на маке это Chrome из /Applications,
@@ -50,7 +59,8 @@ with sync_playwright() as pw:
     fails = []
     for label, html, expect in [("настоящая кнопка + фильтры-ловушка", HTML, "real"),
                                 ("только фильтры", HTML_NO_BUTTON, None),
-                                ("кнопка скрыта", HTML_HIDDEN, None)]:
+                                ("кнопка скрыта", HTML_HIDDEN, None),
+                                ("филиалы/отзывы/фото — не трогаем", HTML_TRAPS, None)]:
         page.set_content(html)
         old = "[class*='show-more'] button, [class*='search-list-view__more'] button"
         c = page.locator(old).first
