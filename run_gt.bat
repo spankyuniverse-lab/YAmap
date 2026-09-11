@@ -16,12 +16,15 @@ echo ============================================================
 echo    GT-сегмент Казахстана ^(АЗС + продуктовая розница^)
 echo ============================================================
 echo.
-echo   [1] Все города КЗ: АЗС + продуктовые       ~ часы
-echo   [2] Все города КЗ: только АЗС              ~ быстрее
-echo   [3] Все города КЗ: только продуктовые
-echo   [4] ВСЯ страна сплошняком: АЗС             ~ сутки+
-echo   [5] ВСЯ страна сплошняком: АЗС + продукты  ~ несколько суток
-echo   [6] Один город ^(спросит какой^)
+echo   [1] 19 городов КЗ: весь GT                 ~ 2,5-3 часа
+echo   [2] 19 городов КЗ: только АЗС              ~ 20-30 минут
+echo   [3] 19 городов КЗ: только продуктовые
+echo   [4] Все города и посёлки ^(96^): весь GT     ~ 6-9 часов
+echo   [5] АУЛЫ И СЁЛА: сельский GT-набор         ~ 12-18 часов
+echo   [6] ТРАССЫ: придорожные АЗС/кафе           ~ 8-14 часов
+echo   [7] ВСЯ страна сплошняком: сельский набор  ~ несколько суток
+echo   [8] ВСЯ страна сплошняком: весь GT         ~ неделя
+echo   [9] Один город ^(спросит какой^)
 echo   [0] Выход
 echo.
 set "CHOICE="
@@ -30,9 +33,12 @@ set /p CHOICE=Выбор:
 if "%CHOICE%"=="1" goto cities_gt
 if "%CHOICE%"=="2" goto cities_azs
 if "%CHOICE%"=="3" goto cities_shop
-if "%CHOICE%"=="4" goto country_azs
-if "%CHOICE%"=="5" goto country_gt
-if "%CHOICE%"=="6" goto one_city
+if "%CHOICE%"=="4" goto cities_all
+if "%CHOICE%"=="5" goto auls
+if "%CHOICE%"=="6" goto routes
+if "%CHOICE%"=="7" goto country_rural
+if "%CHOICE%"=="8" goto country_gt
+if "%CHOICE%"=="9" goto one_city
 if "%CHOICE%"=="0" exit /b 0
 goto menu
 
@@ -40,8 +46,8 @@ goto menu
 set "ARGS=--all-cities --category gt -o kz_gt.xlsx"
 goto run
 
-rem Пресеты в .bat зовём латиницей (gt-fuel/gt-grocery) — кириллица в
-rem аргументах cmd.exe зависит от кодовой страницы и может побиться.
+rem Пресеты и спеки в .bat зовём латиницей (gt-fuel/gt-selo/aul/max) —
+rem кириллица в аргументах cmd.exe зависит от кодовой страницы и может побиться.
 :cities_azs
 set "ARGS=--all-cities --category gt-fuel -o kz_azs.xlsx"
 goto run
@@ -50,12 +56,24 @@ goto run
 set "ARGS=--all-cities --category gt-grocery -o kz_grocery.xlsx"
 goto run
 
-:country_azs
-set "ARGS=--country --category gt-fuel --step 0.2 -o kz_azs_country.xlsx"
+:cities_all
+set "ARGS=--all-cities --cities all --category gt -o kz_gt.xlsx"
+goto run
+
+:auls
+set "ARGS=--all-cities --cities aul --category gt-rural -o kz_aul.xlsx"
+goto run
+
+:routes
+set "ARGS=--routes --category gt-rural -o kz_routes.xlsx"
+goto run
+
+:country_rural
+set "ARGS=--country --category gt-rural -o kz_country.xlsx"
 goto run
 
 :country_gt
-set "ARGS=--country --category gt --step 0.2 -o kz_gt_country.xlsx"
+set "ARGS=--country --category gt -o kz_country.xlsx"
 goto run
 
 :one_city

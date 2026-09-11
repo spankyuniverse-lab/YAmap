@@ -28,7 +28,8 @@ y.run_parallel = lambda base, shards, output, finalize=None: (
 ns = argparse.Namespace(
     tld=None, ll=None, z=None, api_intercept=True, detail=False, no_headless=False,
     max_results=None, scroll_pause=1.0, cooldown_every=0, cooldown_sec=90, grid=1,
-    proxy=None, proxy_file=None, country=False, all_cities=True, all_categories=False,
+    proxy=None, proxy_file=None, country=False, routes=False, corridor=3,
+    all_cities=True, all_categories=False,
     category=["gt-fuel"], query=None, city=None, output=str(out), step=0.25,
     tile_z=0, cities="all")
 y._dispatch_parallel(ns, 2, headless=True)

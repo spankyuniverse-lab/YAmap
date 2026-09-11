@@ -1,5 +1,5 @@
 <component name="ProjectRunConfigurationManager">
-  <configuration default="false" name="6. Меню (спросит что делать)" type="PythonConfigurationType" factoryName="Python">
+  <configuration default="false" name="9. Меню (спросит что делать)" type="PythonConfigurationType" factoryName="Python">
     <option name="ENV_FILES" value="" />
     <option name="INTERPRETER_OPTIONS" value="" />
     <option name="PARENT_ENVS" value="true" />

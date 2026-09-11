@@ -24,6 +24,10 @@ CASES = [
     "--city Алматы --category gt -w 2",
     "--all-cities --category gt -w 2 --detail --no-headless -n 1000 --grid 2 --cooldown-every 5",
     "--country -w 2 --tld ru --ll 37.6,55.7 --z 12 АЗС",
+    "--routes --category gt-село -o kz_routes.xlsx --workers 2",
+    "--routes -w 3 --corridor 1 --step 0.3 --api-intercept",
+    "--all-cities --cities аулы --category gt-село -o kz_aul.xlsx -w 2",
+    "--all-cities --cities макс --category gt -o kz_max.xlsx -w 2",
 ]
 fails = []
 for cmd in CASES:

@@ -36,12 +36,15 @@
 Двойной клик по **`run_gt.bat`**:
 
 ```
-[1] Все города КЗ: АЗС + продуктовые
-[2] Все города КЗ: только АЗС
-[3] Все города КЗ: только продуктовые
-[4] ВСЯ страна сплошняком: АЗС
-[5] ВСЯ страна сплошняком: АЗС + продукты
-[6] Один город
+[1] 19 городов КЗ: весь GT
+[2] 19 городов КЗ: только АЗС
+[3] 19 городов КЗ: только продуктовые
+[4] Все города и посёлки (96): весь GT
+[5] АУЛЫ И СЁЛА: сельский GT-набор
+[6] ТРАССЫ: придорожные АЗС/кафе
+[7] ВСЯ страна сплошняком: сельский набор
+[8] ВСЯ страна сплошняком: весь GT
+[9] Один город
 ```
 
 После выбора режима спросит, **сколько браузеров запускать одновременно**
@@ -54,7 +57,9 @@
 ```bat
 run.bat --city Алматы --category gt
 run.bat --all-cities --category gt -o kz_gt.xlsx --workers 3
-run.bat --country --category gt-fuel --step 0.2 -o kz_azs.xlsx -w 2
+run.bat --all-cities --cities aul --category gt-rural -o kz_aul.xlsx -w 2
+run.bat --routes --category gt-rural -o kz_routes.xlsx -w 2
+run.bat --country --category gt-rural -o kz_country.xlsx -w 2
 run.bat --list-cities
 run.bat --list-categories
 ```

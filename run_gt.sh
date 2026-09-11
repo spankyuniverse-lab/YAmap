@@ -16,9 +16,12 @@ cat <<'MENU'
   [1] 19 городов: весь GT (4 категории)      ~ 2,5-3 часа
   [2] 19 городов: только заправки            ~ 20-30 минут
   [3] 19 городов: только магазины            ~ 1,5-2 часа
-  [4] ВСЯ страна сплошняком: АЗС             ~ сутки+
-  [5] ВСЯ страна сплошняком: АЗС + продукты  ~ несколько суток
-  [6] Один город (спросит какой)
+  [4] Все города и посёлки (96): весь GT     ~ 6-9 часов
+  [5] АУЛЫ И СЁЛА: сельский GT-набор         ~ 12-18 часов
+  [6] ТРАССЫ: придорожные АЗС/кафе/магазины  ~ 8-14 часов
+  [7] ВСЯ страна сплошняком: сельский набор  ~ несколько суток
+  [8] ВСЯ страна сплошняком: весь GT         ~ неделя
+  [9] Один город (спросит какой)
   [0] Выход
 
 MENU
@@ -28,9 +31,12 @@ case "$CHOICE" in
     1) ARGS=(--all-cities --category gt         -o kz_gt.xlsx) ;;
     2) ARGS=(--all-cities --category gt-fuel    -o kz_azs.xlsx) ;;
     3) ARGS=(--all-cities --category gt-grocery -o kz_grocery.xlsx) ;;
-    4) ARGS=(--country --category gt-fuel --step 0.2 -o kz_azs_country.xlsx) ;;
-    5) ARGS=(--country --category gt      --step 0.2 -o kz_gt_country.xlsx) ;;
-    6) read -r -p "Город (напр. Алматы): " CITY
+    4) ARGS=(--all-cities --cities all --category gt -o kz_gt.xlsx) ;;
+    5) ARGS=(--all-cities --cities аулы --category gt-село -o kz_aul.xlsx) ;;
+    6) ARGS=(--routes --category gt-село -o kz_routes.xlsx) ;;
+    7) ARGS=(--country --category gt-село -o kz_country.xlsx) ;;
+    8) ARGS=(--country --category gt      -o kz_country.xlsx) ;;
+    9) read -r -p "Город (напр. Алматы): " CITY
        [ -z "$CITY" ] && exit 0
        ARGS=(--city "$CITY" --category gt -o "${CITY}_gt.xlsx") ;;
     0) exit 0 ;;

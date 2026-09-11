@@ -24,3 +24,8 @@ reports/
 tests/e2e*
 tests/logs/
 tests/out/
+
+# тестовые артефакты
+crashy_worker.py
+fake_worker.py
+*.flag
