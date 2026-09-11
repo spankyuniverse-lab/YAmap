@@ -23,6 +23,10 @@ CATALOG: dict[str, int] = {}
 
 PAGE_SIZE = 12
 
+#: Тумблер для теста отката: при True макет отвечает на /maps/api/search
+#: ошибкой, и парсер обязан молча вернуться к обычному сбору по HTML.
+DISABLE_API = False
+
 
 def _org(query: str, city: str, n: int) -> dict:
     """Организация в том виде, в каком её кладёт в SSR настоящий Яндекс."""
@@ -131,10 +135,26 @@ class Handler(BaseHTTPRequestHandler):
         total = CATALOG.get(query, 0)
 
         if u.path.startswith("/maps/api/search"):
+            if DISABLE_API:
+                self.send_response(503)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
             page = int((q.get("page") or ["0"])[0])
             city = (q.get("city") or [city])[0]
-            query = (q.get("text") or [query])[0]
-            total = CATALOG.get(query, 0)
+            api_text = (q.get("text") or [query])[0]
+            # Страница зовёт API с раздельными text=<рубрика>&city=<город>,
+            # а прямой запрос (--fast-api) — одним text=«Рубрика Город».
+            # Принимаем оба: сперва целиком, потом как «рубрика + город».
+            if api_text in CATALOG:
+                query, total = api_text, CATALOG[api_text]
+            else:
+                bits = api_text.rsplit(" ", 1)
+                if len(bits) == 2 and bits[0] in CATALOG:
+                    query, city = bits[0], city or bits[1]
+                    total = CATALOG[query]
+                else:
+                    query, total = api_text, 0
             start = page * PAGE_SIZE
             items = [_org(query, city, i) for i in range(start, min(start + PAGE_SIZE, total))]
             body = json.dumps({"data": {"items": items},

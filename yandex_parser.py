@@ -697,6 +697,65 @@ KZ_CITIES_MAJOR: dict[str, str] = {
 }
 
 
+#: Куда fetch_osm_places.py кладёт выгрузку населённых пунктов из OSM.
+OSM_PLACES_FILE = "kz_osm_places.json"
+
+
+def load_osm_places(path: str | Path = OSM_PLACES_FILE) -> list[str]:
+    """Подключить справочник НП из OSM (`--cities osm`) и вернуть их имена.
+
+    Встроенные KZ_SETTLEMENTS собраны вручную и покрывают сотни НП, а в OSM
+    их тысячи. Файл готовится отдельным скриптом `fetch_osm_places.py` —
+    парсер сам в интернет за ним не ходит.
+
+    Имена кладём в KZ_PLACES_ALL, чтобы `set_viewport(city=...)` нашёл по ним
+    координаты. Свои (выверенные) координаты приоритетнее: если такой НП уже
+    known, запись из OSM его не перетирает.
+    """
+    p = Path(path)
+    if not p.exists():
+        raise SystemExit(
+            f"Нет файла {p} — справочник OSM ещё не выкачан.\n"
+            f"Сделай это один раз:  python3 fetch_osm_places.py\n"
+            f"(скрипту нужен интернет; парсер сам туда не ходит)")
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise SystemExit(f"Файл {p} не читается как JSON: {exc}")
+    if not isinstance(data, dict) or not data:
+        raise SystemExit(f"Файл {p} пуст или не словарь «имя: lon,lat»")
+
+    names: list[str] = []
+    added = 0
+    for name, ll in data.items():
+        name = str(name).strip()
+        if not name or not isinstance(ll, str) or "," not in ll:
+            continue
+        names.append(name)
+        if name not in KZ_PLACES_ALL:
+            KZ_PLACES_ALL[name] = ll
+            added += 1
+    log.info("OSM-справочник: %d НП из %s (новых для парсера: %d)",
+             len(names), p, added)
+    return names
+
+
+def _names_from_file(path: str) -> list[str]:
+    """`--cities @файл` — список НП из файла: по имени на строку, либо JSON."""
+    p = Path(path)
+    if not p.exists():
+        raise SystemExit(f"Нет файла со списком НП: {p}")
+    text = p.read_text(encoding="utf-8").strip()
+    if text.startswith("{"):
+        return load_osm_places(p)
+    if text.startswith("["):
+        try:
+            return [str(x).strip() for x in json.loads(text) if str(x).strip()]
+        except Exception as exc:
+            raise SystemExit(f"{p}: не читается как JSON-список: {exc}")
+    return [ln.strip() for ln in text.splitlines() if ln.strip()]
+
+
 def resolve_city_list(spec: str | None) -> list[str]:
     """`--cities`: `major` (19, по умолчанию), `all` (96), `аулы` (сельские
     НП), `макс` (города + сёла разом) или свой список.
@@ -713,6 +772,12 @@ def resolve_city_list(spec: str | None) -> list[str]:
         return list(KZ_SETTLEMENTS.keys())
     if key in ("макс", "max", "всё", "полный", "full", "everything", "вся"):
         return list(KZ_PLACES_ALL.keys())
+    # Справочник из OpenStreetMap (тысячи сёл и аулов) — см. fetch_osm_places.py
+    if key in ("osm", "осм", "овермап", "оsm"):
+        return load_osm_places()
+    # Свой список из файла: --cities @places.txt (или @places.json)
+    if spec.strip().startswith("@"):
+        return _names_from_file(spec.strip()[1:])
     return [c.strip() for c in spec.split(",") if c.strip()]
 
 KZ_COUNTRY_LL = "66.9237,48.0196"   # весь Казахстан (регион 159), использовать с z=5
@@ -1166,6 +1231,142 @@ def search_url(query: str, with_viewport: bool = True) -> str:
     if with_viewport and MAP_LL:
         u += f"&ll={MAP_LL}&z={MAP_Z}"
     return u
+
+
+# ---------------------------------------------------------------------------
+# ОПЦИОНАЛЬНЫЕ УСКОРИТЕЛИ. По умолчанию ВЫКЛЮЧЕНЫ — основной алгоритм сбора
+# (ввод в строку поиска + скролл выдачи) остаётся ровно таким, каким прошёл
+# боевой прогон. Включаются флагами и при любом сбое молча откатываются на
+# обычный путь, поэтому включение не может «сломать» сбор, только ускорить.
+# ---------------------------------------------------------------------------
+
+#: `--url-only` — не печатать запрос в строку поиска, сразу идти по URL.
+#: Экономит 1-3 с на запросе и убирает класс багов со склейкой запросов;
+#: платим тем, что переход по готовой ссылке чуть менее «человеческий».
+URL_ONLY = False
+
+#: `--fast-api` — дёргать внутренний JSON-API из УЖЕ ОТКРЫТОЙ вкладки
+#: (fetch внутри страницы), вместо прокрутки выдачи. Куки, токены и заголовки
+#: при этом настоящие — для Яндекса это запрос его собственного фронтенда.
+FAST_API = False
+
+#: Сколько страниц API просить максимум на один запрос (страховка от цикла).
+FAST_API_MAX_PAGES = 40
+
+#: fetch выполняется В КОНТЕКСТЕ СТРАНИЦЫ: тот же origin, те же куки.
+_FAST_API_JS = """
+async (url) => {
+  try {
+    const r = await fetch(url, {
+      credentials: 'include',
+      headers: {'Accept': 'application/json, text/plain, */*'},
+    });
+    const text = await r.text();
+    if (!r.ok) return {ok: false, status: r.status, body: text.slice(0, 300)};
+    try { return {ok: true, json: JSON.parse(text)}; }
+    catch (e) { return {ok: false, status: r.status, body: text.slice(0, 300)}; }
+  } catch (e) { return {ok: false, status: -1, body: String(e)}; }
+}
+"""
+
+
+def api_search_url(query: str, page_no: int = 0) -> str:
+    """Обобщённый URL внутреннего API поиска (запасной, когда шаблона нет).
+
+    Настоящий Яндекс ждёт в этом запросе ещё и сессионные параметры, поэтому
+    основной путь — шаблон из перехваченного запроса самой страницы
+    (см. `_ApiCollector.last_url`), а этот URL нужен как запасной вариант.
+    """
+    u = (f"{base_url()}/maps/api/search?text={urllib.parse.quote(query)}"
+         f"&lang={LANG}&page={page_no}")
+    if MAP_LL:
+        u += f"&ll={MAP_LL}&z={MAP_Z}"
+    return u
+
+
+def _bump_page(url: str, page_no: int, page_size: int = 20) -> str:
+    """Поставить в URL нужную страницу, каким бы параметром она ни звалась.
+
+    Яндекс листает то `page`, то `skip`/`offset` — подменяем тот, что есть,
+    а если нет ни одного, дописываем `page`.
+    """
+    for key in ("page", "p"):
+        if re.search(rf"[?&]{key}=\d+", url):
+            return re.sub(rf"([?&]{key}=)\d+", rf"\g<1>{page_no}", url)
+    for key in ("skip", "offset"):
+        if re.search(rf"[?&]{key}=\d+", url):
+            return re.sub(rf"([?&]{key}=)\d+", rf"\g<1>{page_no * page_size}", url)
+    sep = "&" if "?" in url else "?"
+    return f"{url}{sep}page={page_no}"
+
+
+def _fast_api_fetch(page: Page, url: str) -> dict | None:
+    """Один запрос к API из контекста страницы. None — не вышло."""
+    try:
+        res = page.evaluate(_FAST_API_JS, url)
+    except Exception as exc:
+        log.debug("fast-api: evaluate упал: %s", exc)
+        return None
+    if not isinstance(res, dict) or not res.get("ok"):
+        log.debug("fast-api: ответ не JSON (status=%s) %s",
+                  (res or {}).get("status"), str((res or {}).get("body"))[:120])
+        return None
+    data = res.get("json")
+    return data if isinstance(data, dict) else None
+
+
+def _collect_via_api(page: Page, query: str, max_results: int,
+                     collector: "_ApiCollector | None" = None) -> list[Organization] | None:
+    """Собрать выдачу постраничными запросами к API. None — путь не сработал.
+
+    None (а не пустой список) означает «откатись на обычный сбор»: пустой
+    список — это законный ответ «тут ничего нет», и путать их нельзя, иначе
+    пустые тайлы свипа каждый раз прокручивались бы браузером впустую.
+    """
+    template = getattr(collector, "last_url", "") if collector else ""
+    if template:
+        log.debug("fast-api: шаблон из перехвата: %s", template.split("?")[0])
+
+    orgs: list[Organization] = []
+    seen: set[str] = set()
+    total_expected = 0
+    for page_no in range(FAST_API_MAX_PAGES):
+        url = _bump_page(template, page_no) if template else api_search_url(query, page_no)
+        data = _fast_api_fetch(page, url)
+        if data is None:
+            if page_no == 0:
+                return None                    # API не дался — обычный путь
+            break                              # часть собрали — отдаём что есть
+        items = _find_api_items(data)
+        if not items:
+            break
+        total = _extract_total_count(data)
+        if total.isdigit():
+            total_expected = max(total_expected, int(total))
+        added = 0
+        for it in items:
+            org = _org_from_item(it, total)
+            if not org or not org.name:
+                continue
+            key = _dedup_key(org)
+            if key in seen:
+                continue
+            seen.add(key)
+            org.search_query = org.search_query or query
+            orgs.append(org)
+            added += 1
+            if max_results and len(orgs) >= max_results:
+                log.info("fast-api: «%s» — %d организаций (лимит)", query, len(orgs))
+                return orgs
+        if not added:
+            break                              # страница без новых — конец
+        if data.get("hasMore") is False:
+            break
+        if total_expected and len(orgs) >= total_expected:
+            break
+    log.info("fast-api: «%s» — %d организаций за %d стр.", query, len(orgs),
+             page_no + 1)
+    return orgs
 
 
 # ---------------------------------------------------------------------------
@@ -3892,6 +4093,9 @@ class _ApiCollector:
         # индекса достаточно, чтобы сопоставить DOM (с городом) и API (без города).
         self.by_key: dict[str, Organization] = {}
         self.matched = 0
+        # URL последнего настоящего запроса страницы к API — шаблон
+        # со всеми её сессионными параметрами для режима --fast-api.
+        self.last_url = ""
         self.dump = dump
         self._dumped = 0
 
@@ -3906,6 +4110,7 @@ class _ApiCollector:
         except Exception:
             return
         self.matched += 1
+        self.last_url = url
         orgs = _extract_orgs_from_api_response(body)
 
         # Диагностика: ответ пойман, но ничего не извлекли — покажем форму JSON.
@@ -4740,6 +4945,13 @@ def _do_search(page: Page, query: str, headless: bool) -> bool:
     Возвращает True если удалось ввести и отправить запрос.
     Fallback: если строка поиска не найдена — goto по URL.
     """
+    # --url-only: пропускаем ввод целиком и идём по прямой ссылке.
+    # По умолчанию флаг выключен, и ниже работает обычный «человеческий» ввод.
+    if URL_ONLY:
+        log.debug("--url-only: иду по прямому URL, строку поиска не трогаю")
+        page.goto(search_url(query), wait_until="domcontentloaded", timeout=30000)
+        return True
+
     # Пробуем найти строку поиска на странице
     search_sels = [
         "input[class*='input__control']",
@@ -4862,6 +5074,24 @@ def _collect_current_results(
     if owns_collector:
         collector = _ApiCollector(dump=bool(os.environ.get("YAMAP_DEBUG_API")))
         page.on("response", collector.on_response)
+
+    # --fast-api: пробуем снять выдачу постраничными запросами к внутреннему
+    # API прямо из этой вкладки — без прокрутки и дорисовки карточек. Не
+    # получилось (нет доступа, чужой формат) — молча идём обычным путём ниже.
+    if FAST_API:
+        try:
+            fast = _collect_via_api(page, query, max_results, collector)
+        except Exception as exc:
+            log.debug("fast-api упал (%s) — обычный сбор", exc)
+            fast = None
+        if fast is not None:
+            if owns_collector:
+                try:
+                    page.remove_listener("response", collector.on_response)
+                except Exception:
+                    pass
+            return fast
+        log.info("fast-api не дал результата — собираю обычным способом")
 
     try:
         # Ждём появления результатов ОДНИМ объединённым ожиданием (быстрее:
@@ -5699,6 +5929,78 @@ def _split_round_robin(items: list[Any], n: int) -> list[list[Any]]:
     for i, item in enumerate(items):
         buckets[i % n].append(item)
     return [b for b in buckets if b]
+
+
+def run_probe_api(query: str = "Заправки", headless: bool = True,
+                  proxy_url: str | None = None) -> None:
+    """Проверить, годится ли `--fast-api` на этой машине и в этом регионе.
+
+    Открывает один обычный поиск, показывает, какие API-запросы делает сама
+    страница, и пробует повторить их нашим способом. Ничего не собирает —
+    только печатает отчёт, который можно переслать.
+    """
+    global _warmed_up
+    _warmed_up = False
+    setup_file_logging()
+    print("=" * 62)
+    print("  ДИАГНОСТИКА ВНУТРЕННЕГО API (--fast-api)")
+    print("=" * 62)
+    print(f"  Запрос:  {query}")
+    print(f"  Вьюпорт: ll={MAP_LL or '—'} z={MAP_Z}")
+    print(f"  Домен:   {base_url()}\n")
+
+    collector = _ApiCollector()
+    seen_urls: list[str] = []
+    try:
+        with sync_playwright() as pw:
+            _, ctx = _create_browser_context(pw, headless, proxy_url=proxy_url)
+            page = _setup_page(ctx)
+
+            def _watch(resp: Response) -> None:
+                if any(pat in resp.url for pat in _API_URL_PATTERNS):
+                    seen_urls.append(f"{resp.status} {resp.url}")
+
+            page.on("response", _watch)
+            page.on("response", collector.on_response)
+            _warmup(page, headless)
+            page.goto(search_url(query), wait_until="domcontentloaded", timeout=30000)
+            page.wait_for_timeout(4000)
+
+            print(f"1) Запросы страницы к API: {len(seen_urls)}")
+            for u in seen_urls[:6]:
+                code, _, link = u.partition(" ")
+                print(f"     [{code}] {link[:150]}")
+            if not seen_urls:
+                print("     НИ ОДНОГО. Значит выдача пришла в HTML (SSR), и")
+                print("     шаблона для --fast-api нет — сработает запасной URL.")
+
+            print(f"\n2) Организаций разобрано из перехвата: "
+                  f"{len(collector.by_key)}")
+
+            print("\n3) Пробую наш запрос к API из вкладки…")
+            template = collector.last_url
+            url = _bump_page(template, 0) if template else api_search_url(query, 0)
+            print(f"     {url[:150]}")
+            data = _fast_api_fetch(page, url)
+            if data is None:
+                print("     ❌ ответ не получен или не JSON")
+                print("     → --fast-api тут НЕ поможет, оставь обычный сбор.")
+            else:
+                items = _find_api_items(data)
+                total = _extract_total_count(data)
+                print(f"     ✅ JSON получен: организаций в ответе {len(items)}"
+                      + (f", всего по запросу {total}" if total else ""))
+                if items:
+                    org = _org_from_item(items[0], total)
+                    if org:
+                        print(f"     Первая: {org.name} | {org.address}")
+                    print("     → --fast-api можно включать.")
+                else:
+                    print("     Ответ пустой — проверь запрос и вьюпорт.")
+            ctx.close()
+    except Exception as exc:
+        print(f"\nДиагностика упала: {exc}")
+    print("=" * 62)
 
 
 def run_doctor() -> None:
@@ -6597,6 +6899,25 @@ def main() -> None:
              "--cities \"Алматы,Астана,Шымкент\".",
     )
     parser.add_argument(
+        "--url-only", action="store_true",
+        help="Не печатать запрос в строку поиска, а сразу открывать прямую "
+             "ссылку. Быстрее на 1-3 с с запроса; чуть менее «человечно». "
+             "По умолчанию выключено — сбор идёт как раньше.",
+    )
+    parser.add_argument(
+        "--fast-api", action="store_true",
+        help="Снимать выдачу постраничными запросами к внутреннему JSON-API "
+             "из уже открытой вкладки (куки и токены настоящие), вместо "
+             "прокрутки списка. Кратно быстрее; если не сработает — парсер "
+             "молча вернётся к обычному сбору. По умолчанию выключено.",
+    )
+    parser.add_argument(
+        "--probe-api", action="store_true",
+        help="Диагностика --fast-api: открыть один поиск, показать, какие "
+             "API-запросы делает сама страница и отвечает ли API на наш "
+             "запрос. Ничего не собирает — только печатает отчёт.",
+    )
+    parser.add_argument(
         "--shard", default=None,
         help="Доля национальной сетки для этого процесса, формат i/N "
              "(напр. 0/3). Проставляется автоматически при --workers.",
@@ -6848,6 +7169,15 @@ def main() -> None:
     if args.output:
         args.output = _ensure_ext(args.output)
 
+    # Опциональные ускорители — строго по флагам, дефолт прежний.
+    global URL_ONLY, FAST_API
+    URL_ONLY = bool(getattr(args, "url_only", False))
+    FAST_API = bool(getattr(args, "fast_api", False))
+    if URL_ONLY:
+        log.info("Режим --url-only: запросы открываются прямой ссылкой")
+    if FAST_API:
+        log.info("Режим --fast-api: выдача снимается запросами к внутреннему API")
+
     # Повторно резолвим вьюпорт после мерджа конфига (city/ll/z могли прийти из конфига).
     set_viewport(city=args.city, ll=args.ll, z=args.z)
     log.info("Домен: %s | язык: %s | вьюпорт: ll=%s z=%s",
@@ -6883,6 +7213,12 @@ def main() -> None:
         rc = _dispatch_parallel(args, workers, headless=headless)
         if rc is not None:
             return
+
+    # Режим: ДИАГНОСТИКА внутреннего API (для --fast-api)
+    if getattr(args, "probe_api", False):
+        run_probe_api(args.query or "Заправки", headless=headless,
+                      proxy_url=proxy_url)
+        return
 
     # Режим: КОРИДОРНЫЙ свип вдоль магистралей (придорожная инфраструктура)
     if args.routes:
@@ -7083,6 +7419,10 @@ def _dispatch_parallel(args, workers: int, headless: bool) -> int | None:
         base += ["--z", str(args.z)]
     if args.api_intercept:
         base.append("--api-intercept")
+    if getattr(args, "url_only", False):
+        base.append("--url-only")
+    if getattr(args, "fast_api", False):
+        base.append("--fast-api")
     if args.detail:
         base.append("--detail")
     if args.no_headless:
@@ -7160,8 +7500,21 @@ def _dispatch_parallel(args, workers: int, headless: bool) -> int | None:
             base.append("--all-categories")
         elif args.category:
             base += ["--category", *args.category]
-        shards = [["--cities", ",".join(chunk)]
-                  for chunk in _split_round_robin(cities, workers)]
+        # Список городов уезжает воркерам командной строкой. Для 19-96 городов
+        # это пара килобайт, а вот справочник OSM — тысячи имён, и Windows
+        # обрубает командную строку на ~32 КБ. Длинные списки поэтому кладём
+        # в файл рядом с выгрузкой и передаём «--cities @файл».
+        shards = []
+        for i, chunk in enumerate(_split_round_robin(cities, workers), 1):
+            joined = ",".join(chunk)
+            if len(joined) <= 6000:
+                shards.append(["--cities", joined])
+                continue
+            lst = Path(output).with_name(f"{Path(output).stem}.w{i}.cities.txt")
+            _atomic_write_text(lst, "\n".join(chunk))
+            log.info("Воркер %d: %d НП — список передан файлом %s",
+                     i, len(chunk), lst.name)
+            shards.append(["--cities", f"@{lst}"])
 
         def _finish_missing(parts: list[Path]) -> int:
             """Доделать города, до которых воркеры не добрались (умерли/капча).
