@@ -28,6 +28,19 @@ PAGE_SIZE = 12
 DISABLE_API = False
 
 
+#: Центры городов, которыми пользуются тесты (lon, lat).
+_CITY_LL = {
+    "Алматы": (76.89, 43.24),
+    "Астана": (71.45, 51.17),
+    "Шымкент": (69.60, 42.32),
+    "Караганда": (73.11, 49.80),
+}
+
+
+def _city_ll(city: str) -> tuple[float, float]:
+    return _CITY_LL.get((city or "").strip(), (76.89, 43.24))
+
+
 def _org(query: str, city: str, n: int) -> dict:
     """Организация в том виде, в каком её кладёт в SSR настоящий Яндекс."""
     return {
@@ -40,7 +53,12 @@ def _org(query: str, city: str, n: int) -> dict:
         "address": f"{city}, улица Тестовая, {n}",
         "fullAddress": f"Казахстан, {city}, улица Тестовая, {n}",
         "compositeAddress": {"locality": city, "street": "улица Тестовая", "house": str(n)},
-        "coordinates": [76.9 + n / 1000, 43.2 + n / 1000],
+        # Координаты — рядом с ЗАПРОШЕННЫМ городом, как и у настоящего
+        # Яндекса. Раньше макет всегда отдавал окрестности Алматы, из-за чего
+        # выглядел правдоподобно ровно до тех пор, пока парсер не научился
+        # отсеивать результаты, уехавшие от центра поиска (тёзки вроде двух
+        # «Актау» в 1400 км друг от друга).
+        "coordinates": [_city_ll(city)[0] + n / 1000, _city_ll(city)[1] + n / 1000],
         "phones": [{"type": "phone", "formatted": f"+7 701 000-{n:04d}"}],
         "urls": [f"https://example.kz/{n}"],
         "ratingData": {"ratingValue": 4.0, "reviewCount": 10 + n},
