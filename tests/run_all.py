@@ -32,6 +32,17 @@ def _clean() -> None:
             p.unlink()
     for flag in HERE.glob("*.flag"):
         flag.unlink()
+    # Профиль Chrome между тестами сносим. Persistent-профиль держит
+    # SingletonLock, и если предыдущий тест не успел погасить браузер, все
+    # следующие падают на «profile is already in use» — то есть на пустом
+    # месте, но выглядит это как провал парсера.
+    for prof in HERE.glob(".browser_profile*"):
+        shutil.rmtree(prof, ignore_errors=True)
+    for junk in list(HERE.glob("speed*")) + list(HERE.glob("fa_*.xlsx")):
+        if junk.is_dir():
+            shutil.rmtree(junk, ignore_errors=True)
+        else:
+            junk.unlink()
 
 
 def main() -> int:

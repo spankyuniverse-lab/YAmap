@@ -112,13 +112,60 @@ chmod +x setup_mac.sh
 
 ### Три страны
 
-По умолчанию собираются все три — Казахстан, Узбекистан, Киргизия. Сузить:
+По умолчанию активны все три. **Спеки `--cities` считаются по выбранным
+странам**: `--countries uz --cities аулы` даёт узбекские кишлаки, а не
+казахские аулы.
+
+| `--countries` | города | сёла | всего | магистралей | домен |
+|---|---|---|---|---|---|
+| `kz` | 96 | 408 | **504** | 32 | yandex.kz |
+| `uz` | 189 | 72 | **261** | 14 | yandex.uz |
+| `kg` | 58 | 105 | **163** | 12 | yandex.kz¹ |
+| все три (по умолч.) | 343 | 585 | **928** | 58 | yandex.kz |
+
+¹ yandex.kg не существует — Карты Киргизии отдаёт .kz.
+
+Если страна одна и `--tld` не задан, парсер сам берёт её домен и её центр
+карты. Смотреть, что есть:
 
 ```bash
-./run.sh --list-cities                    # что есть по каждой стране
-./watch_gt.sh --all-cities --countries uz --category gt -o uz.xlsx --workers 2 --api-intercept
-./watch_gt.sh --all-cities --countries kz,kg --category gt-село -o kz_kg.xlsx --workers 2 --api-intercept
+./run.sh --countries uz --list-cities     # по каждой стране: города, сёла, трассы
 ```
+
+Гонять:
+
+```bash
+# Узбекистан целиком — города и кишлаки
+./watch_gt.sh --all-cities --cities макс --countries uz \
+    --category "Заправки" "Магазин продуктов" "Супермаркет" \
+    -o uz.xlsx --workers 2 --api-intercept --new-run
+
+# Киргизия целиком
+./watch_gt.sh --all-cities --cities макс --countries kg \
+    --category "Заправки" "Магазин продуктов" "Супермаркет" \
+    -o kg.xlsx --workers 2 --api-intercept --new-run
+
+# Трассы и сплошная сетка работают так же, со своими границами и дорогами
+./watch_gt.sh --routes --countries uz --category gt-село -o uz_routes.xlsx --workers 2
+./watch_gt.sh --country --countries kg --category gt-село -o kg_country.xlsx --workers 2
+```
+
+### Все сёла UZ/KG — из OpenStreetMap
+
+Встроенный справочник собран вручную: он покрывает все райцентры и известные
+сёла, но реальных кишлаков и айылов тысячи. Забираются так же, как по
+Казахстану:
+
+```bash
+.venv/bin/python fetch_osm_places.py --countries uz,kg
+
+./watch_gt.sh --all-cities --cities osm --countries uz \
+    --category "Заправки" "Магазин продуктов" "Супермаркет" \
+    -o uz_osm.xlsx --workers 2 --api-intercept --new-run
+```
+
+Справочник можно выкачать сразу по трём странам, а гнать по одной:
+`--cities osm` отрезает всё, что вне выбранных `--countries`.
 
 ### Почему прогон стал быстрее
 

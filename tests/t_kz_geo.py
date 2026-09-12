@@ -223,12 +223,24 @@ def t_routes():
 
 
 def t_city_specs():
-    assert len(yp.resolve_city_list(None)) == 19
-    assert len(yp.resolve_city_list("all")) == len(yp.KZ_CITIES_ALL)
-    aul = yp.resolve_city_list("аулы")
-    assert set(aul) == set(yp.KZ_SETTLEMENTS)
+    # Спеки считаются по АКТИВНЫМ странам, поэтому страну фиксируем. Без
+    # этого «all == все города Казахстана» было верно только пока страна
+    # была одна, и тест закреплял ровно тот баг, из-за которого
+    # `--countries uz --cities аулы` гнал прогон по Казахстану.
+    try:
+        yp.set_countries(["kz"])
+        assert len(yp.resolve_city_list(None)) == len(yp.KZ_CITIES_MAJOR)
+        assert len(yp.resolve_city_list("all")) == len(yp.KZ_CITIES_ALL)
+        aul = yp.resolve_city_list("аулы")
+        assert set(aul) == set(yp.KZ_SETTLEMENTS)
+        mx = yp.resolve_city_list("макс")
+        assert set(mx) == set(yp.PLACES_ALL)
+        assert len(mx) == len(set(mx))
+    finally:
+        yp.set_countries(None)
+    # По умолчанию (три страны) — шире, и без дублей имён.
     mx = yp.resolve_city_list("макс")
-    assert set(mx) == set(yp.PLACES_ALL)
+    assert len(mx) > len(yp.KZ_SETTLEMENTS) + len(yp.KZ_CITIES_ALL)
     assert len(mx) == len(set(mx))
 
 
@@ -242,11 +254,131 @@ def t_rural_preset():
     assert yp.resolve_categories(["gt-аул"]) == yp.GT_RURAL
 
 
+def t_specs_follow_countries():
+    """Спеки --cities обязаны идти по ВЫБРАННЫМ странам.
+
+    Раньше major/all/аулы были жёстко казахстанскими: `--countries uz
+    --cities аулы` молча гнал прогон по казахским аулам — ни ошибки, ни
+    предупреждения, просто не та страна и потерянные сутки.
+    """
+    try:
+        for code in ("kz", "uz", "kg"):
+            yp.set_countries([code])
+            own = yp.COUNTRIES[code].places
+            for spec in ("major", "all", "аулы", "макс"):
+                names = yp.resolve_city_list(spec)
+                assert names, f"{code}/{spec}: пустой список"
+                chужие = [n for n in names if n not in own]
+                assert not chужие, (
+                    f"--countries {code} --cities {spec}: чужие НП "
+                    f"{chужие[:5]}")
+        # Объединение трёх стран шире каждой по отдельности.
+        yp.set_countries(["kz", "uz", "kg"])
+        alle = len(yp.resolve_city_list("макс"))
+        yp.set_countries(["kz"])
+        kz = len(yp.resolve_city_list("макс"))
+        assert alle > kz, (alle, kz)
+    finally:
+        yp.set_countries(None)
+
+
+def t_uz_kg_ready():
+    """Узбекистан и Киргизия укомплектованы так же, как Казахстан."""
+    for code in ("kz", "uz", "kg"):
+        c = yp.COUNTRIES[code]
+        assert len(c.border) >= 100, f"{code}: граница из {len(c.border)} точек"
+        assert c.routes, f"{code}: нет трасс"
+        assert c.major, f"{code}: не задана подборка крупнейших городов"
+        # Подборка major должна ссылаться на существующие города, иначе
+        # город молча выпадает из `--cities major`.
+        missing = [n for n in c.major_names if n not in c.cities]
+        assert not missing, f"{code}: major ссылается на несуществующие {missing}"
+        assert len(c.settlements) >= 60, (
+            f"{code}: сельских НП всего {len(c.settlements)}")
+        # Каждый НП — внутри своей страны. Ловит опечатку в координатах,
+        # из-за которой вьюпорт уехал бы в чужую страну.
+        for name, ll in c.places.items():
+            lon, lat = _ll(ll)
+            assert yp._point_in_polygon(lon, lat, c.border), (
+                f"{code}: «{name}» ({ll}) вне границы своей страны")
+    # Копипаста координат: два разных НП с одной точкой — почти наверняка
+    # ошибка, и один из них соберётся не там.
+    seen = {}
+    for code in ("kz", "uz", "kg"):
+        for name, ll in yp.COUNTRIES[code].places.items():
+            seen.setdefault(ll, []).append(f"{name}[{code}]")
+    dup = {k: v for k, v in seen.items() if len(v) > 1}
+    assert not dup, f"разные НП с одинаковыми координатами: {dup}"
+
+
+def t_single_country_uses_own_domain():
+    """Одна страна — её домен и её центр карты.
+
+    Без этого `--countries uz` без --tld уходил на yandex.kz с центром карты
+    посреди Казахстана: вьюпорт «по стране» приезжал не туда.
+    """
+    assert yp.COUNTRIES["uz"].tld == "uz"
+    # У Киргизии своего домена у Яндекса нет — это осознанный выбор, а не
+    # забытая строчка: yandex.kg не существует.
+    assert yp.COUNTRIES["kg"].tld == "kz"
+    for code in ("kz", "uz", "kg"):
+        c = yp.COUNTRIES[code]
+        assert c.tld in yp.DOMAIN_REGISTRY, (
+            f"{code}: домен «{c.tld}» не описан в DOMAIN_REGISTRY — "
+            f"set_domain молча откатится на kz")
+        lon, lat = _ll(c.center_ll)
+        assert yp._point_in_polygon(lon, lat, c.border), (
+            f"{code}: центр страны {c.center_ll} вне её же границы")
+
+
+def t_osm_follows_countries():
+    """`--cities osm` тоже обязан слушаться --countries.
+
+    Справочник качают сразу по трём странам, а гонят часто по одной.
+    """
+    import json
+    import tempfile
+    places = {"Алматы": "76.8897,43.2389", "Ташкент": "69.2401,41.3111",
+              "Бишкек": "74.5698,42.8746", "Москва": "37.6173,55.7558"}
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            f = Path(td) / "osm.json"
+            f.write_text(json.dumps(places, ensure_ascii=False), encoding="utf-8")
+
+            yp.set_countries(["kg"])
+            got = yp.load_osm_places(f)
+            assert "Бишкек" in got, got
+            assert "Алматы" not in got, f"чужой НП пролез: {got}"
+            assert "Москва" not in got, f"Москва не в наших странах: {got}"
+
+            yp.set_countries(["kz", "uz", "kg"])
+            got = yp.load_osm_places(f)
+            assert {"Алматы", "Бишкек", "Ташкент"} <= set(got), got
+            assert "Москва" not in got, got
+
+            # Файл вообще не про выбранную страну — это ошибка, а не пустой
+            # прогон: иначе воркер отрапортует «всё собрано» и выйдет с нулём.
+            only_ru = Path(td) / "ru.json"
+            only_ru.write_text(json.dumps({"Москва": "37.6173,55.7558"},
+                                          ensure_ascii=False), encoding="utf-8")
+            yp.set_countries(["kz"])
+            try:
+                yp.load_osm_places(only_ru)
+                assert False, "справочник не про наши страны должен ронять запуск"
+            except SystemExit:
+                pass
+    finally:
+        yp.set_countries(None)
+
+
 def main() -> int:
     fails = 0
     for fn in (t_border_present, t_cities_inside, t_foreign_outside,
                t_grid_clipped, t_foreign_addr_filter, t_countries, t_settlements,
-               t_query_place_name, t_routes, t_city_specs, t_rural_preset):
+               t_query_place_name, t_routes, t_city_specs, t_rural_preset,
+               t_specs_follow_countries, t_uz_kg_ready,
+               t_single_country_uses_own_domain,
+               t_osm_follows_countries):
         try:
             fn()
             print(f"  OK  {fn.__name__}")

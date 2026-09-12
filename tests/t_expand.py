@@ -6,6 +6,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import yandex_parser as y
 
+# Тест про Казахстан: спеки --cities теперь считаются по ВЫБРАННЫМ странам,
+# и по умолчанию активны все три. Без фиксации страны «all» означало бы 343
+# НП, и проверка расширения списка перестала бы что-либо значить.
+y.set_countries(["kz"])
+
 HERE = Path(__file__).resolve().parent
 out = HERE / "out" / "kz_azs.xlsx"
 out.parent.mkdir(parents=True, exist_ok=True)
@@ -44,7 +49,8 @@ assert len(sent) == len(y.KZ_CITIES_ALL) - len(prev), \
     f"ожидал {len(y.KZ_CITIES_ALL) - len(prev)}, отправлено {len(sent)}"
 
 # Дефолт --all-cities — рабочие 19, а не все 96
-assert len(y.resolve_city_list(None)) == 19, y.resolve_city_list(None)
+assert len(y.resolve_city_list(None)) == len(y.KZ_CITIES_MAJOR), \
+    y.resolve_city_list(None)
 assert len(y.resolve_city_list("all")) == len(y.KZ_CITIES_ALL)
 assert y.resolve_city_list("Алматы,Астана") == ["Алматы", "Астана"]
 print("дефолт --all-cities:", len(y.resolve_city_list(None)), "городов")

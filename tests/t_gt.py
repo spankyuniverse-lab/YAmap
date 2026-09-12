@@ -24,7 +24,14 @@ check(y.category_of("Супермаркет")[0] == "Продуктовые ма
 check(len(qs) > 5, f"под категориями несколько запросов Яндексу: {len(qs)}")
 check(y.category_of("Ресторан")[0] == "Поесть", "«Ресторан» ложится в «Поесть»")
 check(y.category_of("Кафе")[1] == "gt_poest", "слаг у всех запросов категории один")
-check(len(y.resolve_city_list(None)) == 19, "по умолчанию 19 городов")
+# Спеки --cities считаются по активным странам; по умолчанию их три, поэтому
+# «19 городов» верно только для Казахстана. Проверяем именно это, а не число.
+y.set_countries(["kz"])
+check(len(y.resolve_city_list(None)) == len(y.KZ_CITIES_MAJOR),
+      f"по Казахстану умолчание = {len(y.KZ_CITIES_MAJOR)} крупнейших городов")
+y.set_countries(None)
+check(len(y.resolve_city_list(None)) > len(y.KZ_CITIES_MAJOR),
+      "по трём странам крупнейших городов больше, чем по одному Казахстану")
 check(y.resolve_categories(["gt-fuel"]) == ["Заправки"],
       "gt-fuel = один запрос (без дублей АГЗС/АГНКС)")
 

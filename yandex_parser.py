@@ -800,18 +800,44 @@ def load_osm_places(path: str | Path = OSM_PLACES_FILE) -> list[str]:
 
     names: list[str] = []
     added = 0
+    skipped = 0
+    # Файл справочника обычно качают сразу по трём странам, а прогон может
+    # идти по одной. Раньше --countries на этот путь не влиял вовсе, и
+    # `--countries uz --cities osm` тихо уходил собирать все три. Отсекаем по
+    # границам АКТИВНЫХ стран. Границ нет — ничего не режем (fail-open).
+    #
+    # Отсечение грубое, и намеренно: полигоны границ смещены НАРУЖУ, чтобы ни
+    # одно своё село не срезать. Цена — приграничный чужой НП иногда остаётся
+    # (Ташкент лежит внутри полигона КЗ). Это стоит времени, но не данных, а
+    # обратная ошибка стоила бы данных. Точная область задаётся на выкачке:
+    # `fetch_osm_places.py --countries uz` кладёт в файл только Узбекистан.
     for name, ll in data.items():
         name = str(name).strip()
         if not name or not isinstance(ll, str) or "," not in ll:
             continue
+        if BORDERS:
+            try:
+                lon, lat = (float(x) for x in ll.split(",", 1))
+            except ValueError:
+                skipped += 1
+                continue
+            if not any(_point_in_polygon(lon, lat, b) for b in BORDERS):
+                skipped += 1
+                continue
         names.append(name)
         if name not in PLACES_ALL:
             PLACES_ALL[name] = ll
             added += 1
     if added:
         _refresh_locality_index()
-    log.info("OSM-справочник: %d НП из %s (новых для парсера: %d)",
-             len(names), p, added)
+    log.info("OSM-справочник: %d НП из %s (новых для парсера: %d%s)",
+             len(names), p, added,
+             f"; вне выбранных стран отсеяно {skipped}" if skipped else "")
+    if not names:
+        raise SystemExit(
+            f"В {p} нет НП внутри выбранных стран "
+            f"({', '.join(ACTIVE_COUNTRIES)}). Либо справочник выкачан по "
+            f"другой стране, либо --countries указывает не туда.")
     return names
 
 
@@ -831,6 +857,28 @@ def _names_from_file(path: str) -> list[str]:
     return [ln.strip() for ln in text.splitlines() if ln.strip()]
 
 
+def _active_union(field: str) -> dict[str, str]:
+    """Объединение поля (major/cities/settlements) по активным странам.
+
+    Имена разводятся так же, как в set_countries: тёзка из другой страны
+    получает суффикс «[UZ]», иначе Ташкентская область Казахстана и
+    узбекский Ташкент затирали бы друг друга.
+    """
+    out: dict[str, str] = {}
+    owner: dict[str, str] = {}
+    for code in ACTIVE_COUNTRIES:
+        c = COUNTRIES.get(code)
+        if c is None:
+            continue
+        for name, ll in getattr(c, field).items():
+            if name in out and owner.get(name) != code:
+                out[f"{name} [{c.code.upper()}]"] = ll
+            else:
+                out[name] = ll
+                owner[name] = code
+    return out
+
+
 def resolve_city_list(spec: str | None) -> list[str]:
     """`--cities`: `major` (19, по умолчанию), `all` (96), `аулы` (сельские
     НП), `макс` (города + сёла разом) или свой список.
@@ -838,13 +886,16 @@ def resolve_city_list(spec: str | None) -> list[str]:
     Свой список — через запятую: `--cities "Алматы,Астана,Шымкент"`.
     """
     key = (spec or "").strip().lower()
+    # ВАЖНО: спеки идут по АКТИВНЫМ странам. Раньше они были жёстко
+    # казахстанскими, и `--countries uz --cities аулы` молча гнал прогон по
+    # казахским аулам: ни ошибки, ни предупреждения — просто не та страна.
     if not key or key in ("major", "main", "основные", "19"):
-        return list(KZ_CITIES_MAJOR.keys())
+        return list(_active_union("major").keys())
     if key in ("all", "все", "города", "96"):
-        return list(KZ_CITIES_ALL.keys())
+        return list(_active_union("cities").keys())
     if key in ("аулы", "аул", "села", "сёла", "село", "aul", "selo", "rural",
-               "деревни"):
-        return list(KZ_SETTLEMENTS.keys())
+               "деревни", "кишлаки", "кишлак", "айылы"):
+        return list(_active_union("settlements").keys())
     if key in ("макс", "max", "всё", "полный", "full", "everything", "вся"):
         return list(PLACES_ALL.keys())
     # Справочник из OpenStreetMap (тысячи сёл и аулов) — см. fetch_osm_places.py
@@ -1489,6 +1540,28 @@ UZ_CITIES: dict[str, str] = {
 
 #: Кишлаки, пгт и придорожные посёлки Узбекистана.
 UZ_SETTLEMENTS: dict[str, str] = {
+    # Районные центры и кишлаки — добавлено к прежнему списку.
+    "Булокбоши": "72.20,40.63",
+    "Пахтаабад": "72.20,40.90",
+    "Улугнор": "71.75,40.85",
+    "Бустон (Андижанская)": "72.35,40.95",
+    "Дангара (Ферганская)": "71.35,40.47",
+    "Фуркат": "71.15,40.35",
+    "Бувайда": "70.95,40.50",
+    "Акдарья": "67.05,39.80",
+    "Пастдаргом": "66.85,39.55",
+    "Пешку": "64.20,40.10",
+    "Касби": "65.55,38.90",
+    "Нишан": "65.60,38.60",
+    "Миришкор": "65.75,38.75",
+    "Дехканабад": "66.55,38.35",
+    "Алтынсай": "67.90,38.15",
+    "Музрабад": "67.30,37.68",
+    "Бандихан": "66.85,38.05",
+    "Томди": "64.60,41.85",
+    "Фариш": "67.35,40.45",
+    "Мирзаабад": "68.85,40.58",
+    "Сайхунабад": "68.80,40.50",
     "Зангиата": "69.1600,41.2000",
     "Чарвак": "69.9700,41.6300",
     "Ходжикент": "69.9500,41.6000",
@@ -1715,6 +1788,43 @@ KG_CITIES: dict[str, str] = {
 
 #: Сёла (айылы) и придорожные посёлки Киргизии.
 KG_SETTLEMENTS: dict[str, str] = {
+    # Айылы и сёла районов — добавлено к прежнему списку.
+    "Пригородное": "74.70,42.83",
+    "Кара-Жыгач": "74.65,42.85",
+    "Беш-Кунгей": "74.55,42.78",
+    "Полтавка": "74.15,42.85",
+    "Садовое": "74.05,42.87",
+    "Джаны-Джер": "74.75,42.90",
+    "Панфиловка": "73.50,42.70",
+    "Сретенка": "73.95,42.75",
+    "Степное": "73.75,42.80",
+    "Красный Октябрь": "74.35,42.87",
+    "Ак-Суу (Чуйская)": "74.70,42.90",
+    "Аманбаево": "72.20,42.60",
+    "Копуро-Базар": "71.90,42.55",
+    "Кёк-Сай": "72.05,42.50",
+    "Кара-Буура": "71.50,42.55",
+    "Ак-Терек": "78.10,42.25",
+    "Сары-Камыш": "78.40,42.60",
+    "Чон-Кызыл-Суу": "78.15,42.35",
+    "Ак-Булун": "79.10,42.65",
+    "Тон": "77.00,42.10",
+    "Орто-Токой": "76.10,42.35",
+    "Липенка": "78.50,42.55",
+    "Куланак": "75.58,41.38",
+    "Эмгек-Талаа": "74.85,41.85",
+    "Баш-Кайынды": "76.00,41.60",
+    "Оттук": "75.90,41.30",
+    "Терек-Сай": "71.20,41.55",
+    "Ак-Там": "71.10,41.45",
+    "Благовещенка": "72.80,40.95",
+    "Кызыл-Жар": "72.90,41.20",
+    "Отуз-Адыр": "72.80,40.55",
+    "Тулейкен": "72.75,40.50",
+    "Жапалак": "72.70,40.55",
+    "Он-Адыр": "72.85,40.45",
+    "Ак-Турпак": "71.30,40.10",
+    "Кан": "71.80,40.15",
     "Ново-Павловка": "74.4800,42.8600",
     "Военно-Антоновка": "74.4400,42.8500",
     "Маевка": "74.5200,42.8800",
@@ -1872,6 +1982,14 @@ class Country:
     cities: dict[str, str]                      # города: имя → "lon,lat"
     settlements: dict[str, str]                 # сёла/аулы/кишлаки
     routes: list[tuple[str, list[tuple[float, float]]]]
+    #: Крупнейшие города — то, что берёт `--cities major`. Пусто — возьмём
+    #: первые 20 из cities (они перечислены по убыванию значимости).
+    major_names: tuple[str, ...] = ()
+
+    @property
+    def major(self) -> dict[str, str]:
+        names = self.major_names or tuple(self.cities)[:20]
+        return {n: self.cities[n] for n in names if n in self.cities}
 
     @property
     def places(self) -> dict[str, str]:
@@ -1884,16 +2002,32 @@ COUNTRIES: dict[str, Country] = {
         code="kz", name="Казахстан", tld="kz",
         center_ll=KZ_COUNTRY_LL, bbox=KZ_BBOX, border=KZ_BORDER,
         cities=KZ_CITIES_ALL, settlements=KZ_SETTLEMENTS, routes=KZ_ROUTES,
+        major_names=tuple(KZ_CITIES_MAJOR),
     ),
     "uz": Country(
         code="uz", name="Узбекистан", tld="uz",
         center_ll=UZ_COUNTRY_LL, bbox=UZ_BBOX, border=UZ_BORDER,
         cities=UZ_CITIES, settlements=UZ_SETTLEMENTS, routes=UZ_ROUTES,
+        major_names=(
+            "Ташкент", "Самарканд", "Наманган", "Андижан", "Фергана",
+            "Бухара", "Нукус", "Карши", "Коканд", "Маргилан", "Термез",
+            "Джизак", "Ургенч", "Навои", "Гулистан", "Чирчик", "Шахрисабз",
+            "Нурафшан", "Хива", "Денау",
+        ),
     ),
     "kg": Country(
         code="kg", name="Киргизия", tld="kz",   # yandex.kg нет; Карты КР отдаёт .kz
         center_ll=KG_COUNTRY_LL, bbox=KG_BBOX, border=KG_BORDER,
         cities=KG_CITIES, settlements=KG_SETTLEMENTS, routes=KG_ROUTES,
+        major_names=(
+            "Бишкек", "Ош", "Джалал-Абад", "Каракол", "Токмок", "Кара-Балта",
+            "Узген", "Балыкчы", "Кызыл-Кия", "Нарын", "Талас", "Баткен",
+            # Исфана с 2021-го официально Раззаков — в справочнике он под
+            # новым именем, и в подборке должно стоять то же, иначе город
+            # молча выпадал из `--cities major`.
+            "Кант", "Майлуу-Суу", "Сулюкта", "Таш-Кумыр", "Раззаков",
+            "Кара-Суу", "Ноокат", "Чолпон-Ата",
+        ),
     ),
 }
 
@@ -9017,23 +9151,38 @@ def main() -> None:
     # Логи всего происходящего пишутся в файл автоматически.
     setup_file_logging()
 
-    # Список городов KZ
+    # Список НП по ВЫБРАННЫМ странам. Раньше печатался Казахстан, что бы ни
+    # стояло в --countries: справочник, по которому человек решает, что
+    # запускать, показывал не ту страну.
     if args.list_cities:
-        print("\n🇰🇿 Областные центры и крупнейшие города:\n")
-        for name, ll in KZ_CITIES.items():
-            print(f"  {name:20s} ll={ll}")
-        print(f"\n🏙  Остальные города и крупные посёлки ({len(KZ_CITIES_EXTRA)}):\n")
-        for name, ll in KZ_CITIES_EXTRA.items():
-            print(f"  {name:20s} ll={ll}")
-        print(f"\n  ИТОГО {len(KZ_CITIES_ALL)} городов (--cities all)"
-              f" + {len(KZ_SETTLEMENTS)} сельских НП (--cities аулы)")
-        print("\n🌍 По странам (--countries kz,uz,kg):\n")
-        for code in COUNTRIES:
+        set_countries(resolve_countries(getattr(args, "countries", None)))
+        flag = {"kz": "🇰🇿", "uz": "🇺🇿", "kg": "🇰🇬"}
+        for code in ACTIVE_COUNTRIES:
             c = COUNTRIES[code]
-            print(f"  {c.name:12} {len(c.cities):4} городов и райцентров, "
-                  f"{len(c.settlements):4} сёл, {len(c.routes):2} магистралей")
-        print(f"\n  ИТОГО по активным странам: {len(PLACES_ALL)} НП "
-              f"(--cities макс), {len(ROUTES)} магистралей (--routes)")
+            print(f"\n{flag.get(code, '🌍')} {c.name} — крупнейшие города "
+                  f"({len(c.major)}):\n")
+            for name, ll in c.major.items():
+                print(f"  {name:24s} ll={ll}")
+            rest = {n: ll for n, ll in c.cities.items() if n not in c.major}
+            if rest:
+                print(f"\n  Остальные города и райцентры ({len(rest)}):\n")
+                for name, ll in rest.items():
+                    print(f"  {name:24s} ll={ll}")
+            print(f"\n  Сельские НП ({len(c.settlements)}) — первые 20:\n")
+            for name, ll in list(c.settlements.items())[:20]:
+                print(f"  {name:24s} ll={ll}")
+            if len(c.settlements) > 20:
+                print(f"  …и ещё {len(c.settlements) - 20}")
+            print(f"\n  {c.name}: {len(c.cities)} городов (--cities all), "
+                  f"{len(c.settlements)} сёл (--cities аулы), "
+                  f"{len(c.routes)} магистралей (--routes)")
+
+        print(f"\n🌍 ИТОГО по активным странам "
+              f"({', '.join(COUNTRIES[c].name for c in ACTIVE_COUNTRIES)}): "
+              f"{len(PLACES_ALL)} НП (--cities макс), "
+              f"{len(ROUTES)} магистралей")
+        print("\n  Сузить страну:  --countries kz   (или uz, kg, kz,kg)")
+        print("  Все сёла из OSM: python3 fetch_osm_places.py --countries kz,uz,kg")
         return
 
     # Режим: показать текущие селекторы
@@ -9212,6 +9361,19 @@ def main() -> None:
     # Страны сбора — до всего остального: от них зависят справочник НП,
     # сетка свипа и список трасс.
     set_countries(resolve_countries(getattr(args, "countries", None)))
+
+    # Страна одна и домен явно не задан — берём её собственный домен и её
+    # центр. Иначе `--countries uz` без --tld шёл на yandex.kz с центром
+    # карты посреди Казахстана: вьюпорт по стране приезжал не туда, а на
+    # узбекский домен запросы про Узбекистан ложатся естественнее.
+    # У Киргизии своего домена у Яндекса нет — там Country.tld = kz.
+    if len(ACTIVE_COUNTRIES) == 1 and not args.tld:
+        one = COUNTRIES[ACTIVE_COUNTRIES[0]]
+        if one.tld != _tld_of(DOMAIN):
+            set_domain(one.tld)
+            log.info("Страна одна (%s) — домен %s", one.name, DOMAIN)
+        if not args.city and not args.ll:
+            set_viewport(ll=one.center_ll, z=args.z or 5)
     if len(ACTIVE_COUNTRIES) != len(COUNTRIES):
         log.info("Страны сбора: %s",
                  ", ".join(COUNTRIES[c].name for c in ACTIVE_COUNTRIES))
@@ -9700,22 +9862,24 @@ def _menu_gt() -> None:
     print("\n--- GT-сегмент по Казахстану, Узбекистану и Киргизии ---")
     print("Прогресс сохраняется — прервать и продолжить можно в любой момент.\n")
 
+    # Числа считаем по ВЫБРАННЫМ странам, а не по Казахстану. Меню обещало
+    # три страны, а показывало казахстанские 96/408 — «все города» на деле
+    # означало 343, и человек не понимал, на сколько подписывается.
+    _n = {k: len(resolve_city_list(v))
+          for k, v in (("major", None), ("all", "all"),
+                       ("аулы", "аулы"), ("макс", "макс"))}
+    _where = ", ".join(COUNTRIES[c].name for c in ACTIVE_COUNTRIES)
+    labels = {
+        f"Крупнейшие города ({_n['major']}) — быстрее всего": None,
+        f"Все города и посёлки ({_n['all']})": "all",
+        f"Аулы и сёла ({_n['аулы']} НП: райцентры, аулы, придорожные)": "аулы",
+        f"МАКСИМУМ: города + аулы ({_n['макс']} НП)": "макс",
+    }
+    print(f"Страны: {_where}\n")
     cover = _input_choice(
-        "Какое покрытие? [1]:",
-        [
-            f"Рабочие {len(KZ_CITIES_MAJOR)} городов (как раньше)",
-            f"Все города и посёлки ({len(KZ_CITIES_ALL)})",
-            f"Аулы и сёла ({len(KZ_SETTLEMENTS)} НП: райцентры, аулы, придорожные)",
-            f"МАКСИМУМ: города + аулы ({len(KZ_PLACES_ALL)} НП)",
-        ],
-        allow_empty=True,
-    ) or f"Рабочие {len(KZ_CITIES_MAJOR)} городов (как раньше)"
-    cities_spec = {
-        f"Рабочие {len(KZ_CITIES_MAJOR)} городов (как раньше)": None,
-        f"Все города и посёлки ({len(KZ_CITIES_ALL)})": "all",
-        f"Аулы и сёла ({len(KZ_SETTLEMENTS)} НП: райцентры, аулы, придорожные)": "аулы",
-        f"МАКСИМУМ: города + аулы ({len(KZ_PLACES_ALL)} НП)": "макс",
-    }[cover]
+        "Какое покрытие? [1]:", list(labels), allow_empty=True,
+    ) or next(iter(labels))
+    cities_spec = labels[cover]
     cities = resolve_city_list(cities_spec)
     rural = cities_spec in ("аулы", "макс")
 
