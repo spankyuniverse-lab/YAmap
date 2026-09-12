@@ -97,6 +97,19 @@ chmod +x setup_mac.sh
 
 Точки вне границы Казахстана отрезаются автоматически.
 
+### Все сёла из Wikidata (данные Википедии)
+
+```bash
+.venv/bin/python fetch_wikidata_places.py --countries kz,uz,kg
+./watch_gt.sh --all-cities --cities wiki --category gt-село -o wiki.xlsx --workers 2 --api-intercept
+```
+
+Можно слить с выгрузкой OSM — источники дополняют друг друга:
+
+```bash
+.venv/bin/python fetch_wikidata_places.py --merge kz_osm_places.json
+```
+
 ### Три страны
 
 По умолчанию собираются все три — Казахстан, Узбекистан, Киргизия. Сузить:

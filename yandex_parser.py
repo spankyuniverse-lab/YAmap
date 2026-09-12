@@ -699,6 +699,9 @@ KZ_CITIES_MAJOR: dict[str, str] = {
 #: Куда fetch_osm_places.py кладёт выгрузку населённых пунктов из OSM.
 OSM_PLACES_FILE = "kz_osm_places.json"
 
+#: Куда fetch_wikidata_places.py кладёт выгрузку из Wikidata (данные Википедии).
+WIKI_PLACES_FILE = "wikidata_places.json"
+
 
 def load_osm_places(path: str | Path = OSM_PLACES_FILE) -> list[str]:
     """Подключить справочник НП из OSM (`--cities osm`) и вернуть их имена.
@@ -713,9 +716,11 @@ def load_osm_places(path: str | Path = OSM_PLACES_FILE) -> list[str]:
     """
     p = Path(path)
     if not p.exists():
+        script = ("fetch_wikidata_places.py" if "wikidata" in p.name
+                  else "fetch_osm_places.py")
         raise SystemExit(
-            f"Нет файла {p} — справочник OSM ещё не выкачан.\n"
-            f"Сделай это один раз:  python3 fetch_osm_places.py\n"
+            f"Нет файла {p} — справочник ещё не выкачан.\n"
+            f"Сделай это один раз:  python3 {script}\n"
             f"(скрипту нужен интернет; парсер сам туда не ходит)")
     try:
         data = json.loads(p.read_text(encoding="utf-8"))
@@ -776,6 +781,10 @@ def resolve_city_list(spec: str | None) -> list[str]:
     # Справочник из OpenStreetMap (тысячи сёл и аулов) — см. fetch_osm_places.py
     if key in ("osm", "осм", "овермап", "оsm"):
         return load_osm_places()
+    # Справочник из Wikidata — структурированных данных Википедии.
+    # См. fetch_wikidata_places.py.
+    if key in ("wiki", "вики", "wikidata", "викидата", "википедия"):
+        return load_osm_places(WIKI_PLACES_FILE)
     # Свой список из файла: --cities @places.txt (или @places.json)
     if spec.strip().startswith("@"):
         return _names_from_file(spec.strip()[1:])
@@ -8017,7 +8026,9 @@ def main() -> None:
         help="Какие НП берёт --all-cities: `major` — рабочие 19 (по "
              "умолчанию), `all` — все 96 городов и посёлков, `аулы` — "
              "сельские НП (райцентры, аулы, придорожные), `макс` — города и "
-             "сёла разом, либо свой список через запятую: "
+             "сёла разом, `osm` / `wiki` — выгрузки из OpenStreetMap и "
+             "Wikidata (см. fetch_osm_places.py / fetch_wikidata_places.py), "
+             "либо свой список через запятую: "
              "--cities \"Алматы,Астана,Шымкент\".",
     )
     parser.add_argument(

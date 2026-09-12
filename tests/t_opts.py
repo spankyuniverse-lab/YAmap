@@ -257,5 +257,62 @@ check("нумерация «(2)» одинакова при любом поря�
 check("дедуп по id: тот же объект с двух полос не даёт фантом «(2)»",
       len(osm.elements_to_places(_els + _els, kinds=["village"])) == 2)
 
+
+# --- 9. Разбор ответа Wikidata (офлайн, без сети) ------------------------
+import fetch_wikidata_places as wd
+
+check("координаты: WKT Point(lon lat) — долгота ПЕРВАЯ",
+      wd.parse_point("Point(71.4491 51.1694)") == (71.4491, 51.1694))
+check("координаты: пробелы и знак", wd.parse_point("  Point(-5.5 42.0) ") == (-5.5, 42.0))
+check("координаты: мусор — None", wd.parse_point("не координаты") is None)
+
+check("имя: русское важнее английского", wd.pick_name("Аршалы", "Arshaly") == "Аршалы")
+check("имя: латиница только когда русского нет", wd.pick_name("", "Arshaly") == "Arshaly")
+check("имя: пусто, если нет ничего", wd.pick_name("", "") == "")
+
+def _row(qid, ru, en, lon, lat):
+    return {"item": {"value": f"http://www.wikidata.org/entity/Q{qid}"},
+            "ruLabel": {"value": ru}, "enLabel": {"value": en},
+            "coord": {"value": f"Point({lon} {lat})"}}
+
+rows = [
+    _row(200, "Актоган", "", 75.0, 49.0),
+    _row(100, "Актоган", "", 70.0, 48.0),
+    _row(300, "", "", 71.0, 50.0),                 # без имени
+    _row(400, "Q999", "", 72.0, 50.0),             # метка-идентификатор
+    {"item": {"value": "http://www.wikidata.org/entity/Q500"},
+     "ruLabel": {"value": "Безкоординат"}, "coord": {"value": "мусор"}},
+]
+got = wd.rows_to_places(rows)
+check("одноимённые НП не затирают друг друга",
+      set(got) == {"Актоган", "Актоган (2)"}, sorted(got))
+check("нумерация по идентификатору Wikidata, а не по порядку ответа",
+      got["Актоган"] == "70.0000,48.0000", got)
+check("нумерация одинакова при любом порядке строк",
+      wd.rows_to_places(list(reversed(rows))) == got)
+check("строки без имени, с меткой-идентификатором и без координат отброшены",
+      len(got) == 2, got)
+
+check("фильтр границы применяется",
+      wd.rows_to_places(rows, inside=lambda lon, lat: lon > 72) == {"Актоган": "75.0000,49.0000"})
+
+q = wd.build_query(["kz"])
+check("запрос просит нужную страну и координаты",
+      all(k in q for k in ("Q232", "wdt:P625", "wdt:P17", 'LANG(?ruLabel) = "ru"')))
+check("неизвестная страна в CLI отвергается", "kz" in wd.COUNTRY_QID
+      and "uz" in wd.COUNTRY_QID and "kg" in wd.COUNTRY_QID)
+
+# результат годится как --cities @файл
+with tempfile.TemporaryDirectory() as td:
+    f = Path(td) / "wikidata_places.json"
+    f.write_text(json.dumps(got, ensure_ascii=False), encoding="utf-8")
+    names = y.resolve_city_list(f"@{f}")
+    check("выгрузка Wikidata читается парсером", set(names) == set(got), names)
+    y.set_viewport(city="Актоган (2)")
+    check("вьюпорт встаёт на координаты из выгрузки",
+          y.MAP_LL == got["Актоган (2)"], y.MAP_LL)
+    for n in got:
+        y.PLACES_ALL.pop(n, None)
+
 print("\n" + ("✅ ОПЦИИ ОК" if not fails else f"❌ ПРОВАЛЫ: {fails}"))
 sys.exit(1 if fails else 0)
