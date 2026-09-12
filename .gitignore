@@ -29,3 +29,6 @@ tests/out/
 crashy_worker.py
 fake_worker.py
 *.flag
+
+# списки НП, которые родитель передаёт воркерам
+*.cities.txt

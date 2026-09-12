@@ -46,7 +46,7 @@ goto menu
 set "ARGS=--all-cities --category gt -o kz_gt.xlsx"
 goto run
 
-rem Пресеты и спеки в .bat зовём латиницей (gt-fuel/gt-selo/aul/max) —
+rem Пресеты и спеки в .bat зовём латиницей (gt-fuel/gt-rural/aul/max) —
 rem кириллица в аргументах cmd.exe зависит от кодовой страницы и может побиться.
 :cities_azs
 set "ARGS=--all-cities --category gt-fuel -o kz_azs.xlsx"

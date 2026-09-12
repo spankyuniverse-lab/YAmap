@@ -778,7 +778,17 @@ def resolve_city_list(spec: str | None) -> list[str]:
     # Свой список из файла: --cities @places.txt (или @places.json)
     if spec.strip().startswith("@"):
         return _names_from_file(spec.strip()[1:])
-    return [c.strip() for c in spec.split(",") if c.strip()]
+    names = [c.strip() for c in spec.split(",") if c.strip()]
+    # Одиночное слово, которого нет ни среди спеков, ни среди известных НП —
+    # почти наверняка опечатка в спеке («аулу» вместо «аулы»). Своё название
+    # НП тоже возможно, поэтому не падаем, но говорим об этом громко: иначе
+    # вьюпорт молча встанет в центр страны и прогон даст мусор.
+    if len(names) == 1 and names[0] not in KZ_PLACES_ALL:
+        log.warning("«%s» — не спек и не известный парсеру НП. Спеки: "
+                    "major, all, аулы, макс, osm, @файл. Если это название "
+                    "населённого пункта, вьюпорт будет по центру страны — "
+                    "выдача может уехать не туда.", names[0])
+    return names
 
 KZ_COUNTRY_LL = "66.9237,48.0196"   # весь Казахстан (регион 159), использовать с z=5
 DEFAULT_CITY_Z = 12                 # зум для сбора по городу
@@ -2292,6 +2302,15 @@ def resolve_categories(names: list[str]) -> list[str]:
         elif key in PRESETS:
             for item in PRESETS[key]:
                 _add(item)
+        elif key.startswith(("gt-", "гт-")):
+            # Опечатка в имени пресета раньше уходила в Яндекс КАК ТЕКСТ
+            # ЗАПРОСА: «gt-selo Аршалы» ищется по всем НП, не находит ничего,
+            # и это выясняется через часы пустого прогона. Падаем сразу.
+            raise SystemExit(
+                f"Неизвестный пресет: «{name}».\n"
+                f"Есть такие: {', '.join(sorted(PRESETS))}.\n"
+                f"(если это и правда поисковый запрос, а не пресет — "
+                f"переименуй его так, чтобы он не начинался с «gt-»)")
         else:
             _add(name)
     return queries
@@ -4787,7 +4806,6 @@ def _create_browser_context(pw, headless: bool, proxy_url: str | None = None):
                             "(или ./google-chrome-stable_current_amd64.deb).")
             launch_args.pop("channel", None)   # bundled Chromium вместо channel="chrome"
             ctx = pw.chromium.launch_persistent_context(str(BROWSER_DATA_DIR), **launch_args)
-            need_stealth = True
             log.info("Браузер: bundled Chromium + persistent-профиль (%s)", BROWSER_DATA_DIR)
 
     # navigator-hardening — всегда (самокорректирующийся, на десктопе no-op).
@@ -4996,8 +5014,6 @@ def _search_and_collect(
     headless: bool = True,
 ) -> list[Organization]:
     """Выполнить поиск и собрать результаты (общая логика для всех режимов)."""
-    engine = get_selector_engine()
-
     # Прогрев при первом запросе
     _warmup(page, headless)
 
