@@ -38,8 +38,15 @@ ENDPOINTS = [
 #: Типы НП по убыванию людности. hamlet — это и есть «выебанные закоулки».
 ALL_KINDS = ["city", "town", "village", "hamlet"]
 
-#: Тот же bbox, что у парсера (lon_min, lat_min, lon_max, lat_max).
-KZ_BBOX = (46.4, 40.5, 87.4, 55.5)
+#: Те же bbox, что у парсера (lon_min, lat_min, lon_max, lat_max).
+#: Ключ — код страны; --countries выбирает, какие выкачивать.
+BBOXES = {
+    "kz": (46.4, 40.5, 87.4, 55.5),
+    "uz": (55.9, 37.1, 73.2, 45.7),
+    "kg": (69.15, 39.08, 80.40, 43.37),
+}
+#: Оставлено для обратной совместимости со старыми вызовами и тестами.
+KZ_BBOX = BBOXES["kz"]
 
 UA = "YAmap/1.0 (KZ settlements fetch; contact: local use)"
 
@@ -202,15 +209,30 @@ def elements_to_places(elements: list[dict],
     return out
 
 
-def _load_border_filter():
-    """Фильтр «точка внутри РК» из парсера. Нет парсера рядом — работаем без него."""
+def _load_border_filter(codes: list[str]):
+    """Фильтр «точка внутри выбранных стран» из парсера.
+
+    Берём полигоны прямо у парсера, чтобы выкачка и сбор резали территорию
+    одинаково. Нет парсера рядом или нет полигонов — работаем без фильтра.
+    """
     try:
         sys.path.insert(0, str(Path(__file__).resolve().parent))
         import yandex_parser as yp
-        if len(yp.KZ_BORDER) >= 3:
-            return yp._point_in_kz
+        polys = [yp.COUNTRIES[c].border for c in codes
+                 if c in yp.COUNTRIES and len(yp.COUNTRIES[c].border) >= 3]
+        if not polys:
+            print("  (полигонов границ нет — фильтр выключен)", file=sys.stderr)
+            return None
+        missing = [c for c in codes
+                   if c in yp.COUNTRIES and len(yp.COUNTRIES[c].border) < 3]
+        if missing:
+            print(f"  ВНИМАНИЕ: у {', '.join(missing)} полигон границы пуст — "
+                  f"их НП будут отброшены фильтром. Запусти с --no-clip, "
+                  f"если это не то, что нужно.", file=sys.stderr)
+        return lambda lon, lat: any(
+            yp._point_in_polygon(lon, lat, poly) for poly in polys)
     except Exception as exc:                             # noqa: BLE001
-        print(f"  (полигон границы не подключён: {exc})", file=sys.stderr)
+        print(f"  (полигоны границ не подключены: {exc})", file=sys.stderr)
     return None
 
 
@@ -246,6 +268,8 @@ def main() -> int:
                          "Overpass валится по таймауту)")
     ap.add_argument("--timeout", type=int, default=300,
                     help="таймаут HTTP-запроса, сек (по умолч. 300)")
+    ap.add_argument("--countries", default="kz,uz,kg",
+                    help="страны через запятую: kz, uz, kg (по умолчанию все три)")
     ap.add_argument("--no-clip", action="store_true",
                     help="не резать по полигону границы РК (быстрее, но "
                          "затащит приграничные сёла России и Узбекистана)")
@@ -257,22 +281,31 @@ def main() -> int:
         print(f"Неизвестные типы: {bad}. Доступны: {ALL_KINDS}", file=sys.stderr)
         return 2
 
-    inside = None if args.no_clip else _load_border_filter()
+    codes = [c.strip().lower() for c in args.countries.split(",") if c.strip()]
+    bad = [c for c in codes if c not in BBOXES]
+    if bad:
+        print(f"Неизвестные страны: {bad}. Доступны: {list(BBOXES)}",
+              file=sys.stderr)
+        return 2
+
+    inside = None if args.no_clip else _load_border_filter(codes)
     if inside is None and not args.no_clip:
         print("ВНИМАНИЕ: фильтр границы недоступен — в выгрузку попадут "
               "приграничные НП соседних стран.", file=sys.stderr)
 
-    lon_min, lat_min, lon_max, lat_max = KZ_BBOX
     boxes = []
-    if args.step and args.step > 0:
-        lat = lat_min
-        while lat < lat_max:
-            top = min(lat + args.step, lat_max)
-            boxes.append((lon_min, lat, lon_max, top))
-            lat = top
-    else:
-        boxes.append(KZ_BBOX)
+    for code in codes:
+        lon_min, lat_min, lon_max, lat_max = BBOXES[code]
+        if args.step and args.step > 0:
+            lat = lat_min
+            while lat < lat_max:
+                top = min(lat + args.step, lat_max)
+                boxes.append((lon_min, lat, lon_max, top))
+                lat = top
+        else:
+            boxes.append(BBOXES[code])
 
+    print(f"Страны: {', '.join(codes)}")
     print(f"Типы НП: {', '.join(kinds)}")
     print(f"Запросов к Overpass: {len(boxes)}")
 
@@ -303,7 +336,7 @@ def main() -> int:
     print(f"\nГотово: {len(places)} населённых пунктов → {out}")
     print(f"Теперь можно гнать парсер по ним:\n"
           f"  ./run.sh --all-cities --cities osm --category gt-село "
-          f"-o kz_osm.xlsx --workers 2 --api-intercept")
+          f"-o osm.xlsx --workers 2 --api-intercept")
     return 0
 
 

@@ -19,46 +19,63 @@ def _ll(s: str) -> tuple[float, float]:
 
 
 def t_border_present():
-    assert len(yp.KZ_BORDER) >= 40, (
-        f"полигон границы слишком грубый: {len(yp.KZ_BORDER)} вершин")
-    for lon, lat in yp.KZ_BORDER:
-        assert 40.0 <= lat <= 56.5 and 45.0 <= lon <= 88.5, (
-            f"вершина полигона вне разумного диапазона: {lon},{lat}")
+    for code in yp.ACTIVE_COUNTRIES:
+        c = yp.COUNTRIES[code]
+        if not c.border:
+            continue          # данные страны ещё не заполнены
+        assert len(c.border) >= 40, (
+            f"{c.name}: полигон слишком грубый ({len(c.border)} вершин)")
+        lon_min, lat_min, lon_max, lat_max = c.bbox
+        for lon, lat in c.border:
+            assert lat_min - 1 <= lat <= lat_max + 1 and \
+                   lon_min - 1 <= lon <= lon_max + 1, (
+                f"{c.name}: вершина {lon},{lat} далеко за своим bbox")
 
 
 def t_cities_inside():
     # Все известные города и сёла обязаны попадать в полигон (с полутайловым
     # буфером _tile_in_kz — как их реально видит сетка).
-    for name, ll in yp.KZ_PLACES_ALL.items():
+    for name, ll in yp.PLACES_ALL.items():
         lon, lat = _ll(ll)
-        assert yp._tile_in_kz(lon, lat, 0.25), (
+        assert yp._tile_in_region(lon, lat, 0.25), (
             f"«{name}» ({ll}) выпал за полигон границы — свип его потеряет")
 
 
 def t_foreign_outside():
-    # Чужие города внутри KZ_BBOX — их тайлы обязаны быть отрезаны.
+    # Города ЧУЖИХ стран не должны попадать внутрь зоны сбора. Ташкента,
+    # Бишкека, Нукуса, Ургенча и Таласа здесь больше нет: Узбекистан и
+    # Киргизия теперь свои, и их города обязаны быть ВНУТРИ (см. ниже).
     foreign = {
-        "Ташкент": (69.28, 41.31),
-        "Бишкек": (74.59, 42.87),
         "Омск": (73.37, 54.99),
         "Оренбург": (55.10, 51.77),
         "Самара": (50.15, 53.20),
         "Астрахань": (48.04, 46.35),
         "Новосибирск": (82.92, 55.03),
-        "Нукус": (59.60, 42.46),
-        "Ургенч": (60.63, 41.55),
-        "Талас (КР)": (72.24, 42.52),
-        "Иссык-Куль": (77.50, 42.50),
         "Середина Каспия": (49.50, 42.00),
     }
     for name, (lon, lat) in foreign.items():
-        assert not yp._point_in_kz(lon, lat), (
-            f"{name} ({lon},{lat}) оказался ВНУТРИ полигона границы РК")
+        assert not yp._point_in_region(lon, lat), (
+            f"{name} ({lon},{lat}) оказался ВНУТРИ зоны сбора")
+    # А столицы зоны сбора обязаны быть внутри.
+    ours = {"Алматы": (76.89, 43.24), "Астана": (71.45, 51.17)}
+    if yp.KG_BORDER:
+        ours.update({"Бишкек": (74.59, 42.87), "Ош": (72.80, 40.53)})
+    if yp.UZ_BORDER:
+        ours.update({"Ташкент": (69.28, 41.31), "Самарканд": (66.96, 39.65)})
+    for name, (lon, lat) in ours.items():
+        assert yp._point_in_region(lon, lat), (
+            f"{name} ({lon},{lat}) выпал ИЗ зоны сбора")
+    # Соседние страны не должны залезать друг в друга.
+    assert not yp._point_in_polygon(74.70, 43.08, yp.KG_BORDER or [[0, 0]] * 3), \
+        "казахстанский Кордай попал внутрь полигона Киргизии"
 
 
 def t_grid_clipped():
-    full = yp.country_grid(0.5, clip=False)
-    clipped = yp.country_grid(0.5, clip=True)
+    # Сетка считается по всем активным странам; для проверки клипа берём
+    # именно казахстанский прямоугольник, иначе доля отрезанного зависит от
+    # того, заполнены ли полигоны Узбекистана и Киргизии.
+    full = yp.country_grid(0.5, bbox=yp.KZ_BBOX, clip=False)
+    clipped = yp.country_grid(0.5, bbox=yp.KZ_BBOX, clip=True)
     assert len(clipped) < len(full) * 0.80, (
         f"клип почти ничего не отрезал: {len(clipped)}/{len(full)} — "
         "полигон не работает")
@@ -74,12 +91,12 @@ def t_grid_clipped():
     # КЗ), у приграничных столиц — норма: чужие адреса из них режет
     # _FOREIGN_ADDR_RE. А вот тайл, чей ЦЕНТР внутри КЗ и при этом совпал с
     # чужим городом, означал бы кривой полигон — вот это и ловим.
-    for t in yp.country_grid(0.25, clip=True):
+    for t in yp.country_grid(0.25, bbox=yp.KZ_BBOX, clip=True):
         lon, lat = _ll(t)
-        if not yp._point_in_kz(lon, lat):
+        if not yp._point_in_region(lon, lat):
             continue
-        for flon, flat in ((69.28, 41.31), (74.59, 42.87), (73.37, 54.99),
-                            (55.10, 51.77), (82.92, 55.03), (50.15, 53.20)):
+        for flon, flat in ((73.37, 54.99), (55.10, 51.77),
+                            (82.92, 55.03), (50.15, 53.20)):
             assert abs(lon - flon) > 0.125 or abs(lat - flat) > 0.125, (
                 f"тайл {t} центрирован на чужом городе {flon},{flat}")
 
@@ -87,9 +104,9 @@ def t_grid_clipped():
 def t_foreign_addr_filter():
     # Зарубежные адреса из приграничных вьюпортов должны отсеиваться.
     foreign = [
-        "Узбекистан, Ташкент, ул. Навои, 1",
-        "Кыргызстан, Бишкек, пр. Чуй, 10",
         "Россия, Омская обл, Омск, ул. Ленина, 5",
+        "Таджикистан, Худжанд, ул. Ленина",
+        "Туркменистан, Туркменабад",
         "Оренбургская обл, Орск",
         "Китай, Синьцзян, Инин",
     ]
@@ -98,6 +115,11 @@ def t_foreign_addr_filter():
     # Казахстанские адреса фильтр трогать не должен.
     ok = [
         "Казахстан, Алматы, ул. Абая, 1",
+        # Узбекистан и Киргизия — зона сбора, а не заграница.
+        "Узбекистан, Ташкент, ул. Навои, 1",
+        "Кыргызстан, Бишкек, пр. Чуй, 10",
+        "Ферганская обл., Коканд",
+        "Иссык-Кульская обл., Каракол",
         "Туркестанская обл, Сарыагаш, ул. Абая",
         "Жамбылская обл, Кордай",
         "Кордай, трасса А-2",
@@ -118,14 +140,36 @@ def t_foreign_addr_filter():
         assert not yp._FOREIGN_ADDR_RE.search(a), f"отсёк улицу в КЗ: {a}"
     # А зарубежные регионы, которых раньше не было в фильтре, теперь ловятся.
     more_foreign = [
-        "Ташкентская обл., Чирчик",
-        "Чуйская обл., Кара-Балта",
         "Алтайский край, Рубцовск",
-        "Респ. Каракалпакстан, Нукус",
-        "Хорезмская обл., Ургенч",
+        "Согдийская обл., Истаравшан",
+        "Хатлонская обл., Куляб",
+        "Синьцзян, Кашгар",
     ]
     for a in more_foreign:
         assert yp._FOREIGN_ADDR_RE.search(a), f"не отсёк зарубежный адрес: {a}"
+
+
+def t_countries():
+    # Реестр стран собран и переключается.
+    assert set(yp.COUNTRIES) == {"kz", "uz", "kg"}, sorted(yp.COUNTRIES)
+    assert yp.resolve_countries(None) == ["kz", "uz", "kg"]
+    assert yp.resolve_countries("kz") == ["kz"]
+    assert yp.resolve_countries("Киргизия,Казахстан") == ["kg", "kz"]
+    try:
+        yp.resolve_countries("нетакой")
+        assert False, "неизвестная страна должна ронять запуск"
+    except SystemExit:
+        pass
+    # Переключение пересобирает объединения и возвращается обратно.
+    full = len(yp.PLACES_ALL)
+    yp.set_countries(["kz"])
+    only_kz = len(yp.PLACES_ALL)
+    yp.set_countries(None)
+    assert len(yp.PLACES_ALL) == full, "переключение стран не восстановилось"
+    assert only_kz <= full, (only_kz, full)
+    # Одноимённые НП разных стран не затирают друг друга.
+    names = [n for n in yp.PLACES_ALL]
+    assert len(names) == len(set(names))
 
 
 def t_settlements():
@@ -146,7 +190,7 @@ def t_query_place_name():
     assert yp._query_place_name("Шелек") == "Шелек"
     assert yp._query_place_name("Отеген батыр") == "Отеген батыр"
     # Все имена справочника дают непустой чистый текст запроса
-    for name in yp.KZ_PLACES_ALL:
+    for name in yp.PLACES_ALL:
         q = yp._query_place_name(name)
         assert q and "(" not in q, f"кривое имя для запроса: {name!r} -> {q!r}"
 
@@ -166,11 +210,11 @@ def t_routes():
     # Коридор внутри страны (с буфером клипа)
     for t in tiles[::7]:
         lon, lat = _ll(t)
-        assert yp._tile_in_kz(lon, lat, 0.25)
+        assert yp._tile_in_region(lon, lat, 0.25)
     # Узкий коридор — строго меньше широкого
     assert len(yp.route_tiles(0.25, corridor=1)) < len(tiles)
     # Тайлы коридора лежат на решётке национальной сетки (дедуп между режимами)
-    grid = set(yp.country_grid(0.25, clip=False))
+    grid = set(yp.country_grid(0.25, bbox=yp.KZ_BBOX, clip=False))
     on_grid = sum(1 for t in tiles if t in grid)
     assert on_grid >= len(tiles) * 0.95, (
         f"тайлы коридора не на решётке: {on_grid}/{len(tiles)}")
@@ -182,7 +226,7 @@ def t_city_specs():
     aul = yp.resolve_city_list("аулы")
     assert set(aul) == set(yp.KZ_SETTLEMENTS)
     mx = yp.resolve_city_list("макс")
-    assert set(mx) == set(yp.KZ_PLACES_ALL)
+    assert set(mx) == set(yp.PLACES_ALL)
     assert len(mx) == len(set(mx))
 
 
@@ -199,7 +243,7 @@ def t_rural_preset():
 def main() -> int:
     fails = 0
     for fn in (t_border_present, t_cities_inside, t_foreign_outside,
-               t_grid_clipped, t_foreign_addr_filter, t_settlements,
+               t_grid_clipped, t_foreign_addr_filter, t_countries, t_settlements,
                t_query_place_name, t_routes, t_city_specs, t_rural_preset):
         try:
             fn()

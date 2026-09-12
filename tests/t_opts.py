@@ -62,15 +62,15 @@ with tempfile.TemporaryDirectory() as td:
         "Тестаул (2)": "70.5000,48.5000",      # одноимённый, с уточнением
     }, ensure_ascii=False), encoding="utf-8")
 
-    before = dict(y.KZ_PLACES_ALL)
+    before = dict(y.PLACES_ALL)
     names = y.resolve_city_list(f"@{osm}")
     check("@файл.json (словарь) читается как OSM-справочник",
           set(names) == {"Аршалы", "Тестаул", "Тестаул (2)"}, names)
     check("новые НП попали в справочник координат",
-          y.KZ_PLACES_ALL.get("Тестаул") == "70.0000,48.0000")
+          y.PLACES_ALL.get("Тестаул") == "70.0000,48.0000")
     check("свои выверенные координаты OSM не перетирает",
-          y.KZ_PLACES_ALL.get("Аршалы") == before.get("Аршалы"),
-          f"{y.KZ_PLACES_ALL.get('Аршалы')} vs {before.get('Аршалы')}")
+          y.PLACES_ALL.get("Аршалы") == before.get("Аршалы"),
+          f"{y.PLACES_ALL.get('Аршалы')} vs {before.get('Аршалы')}")
 
     # вьюпорт по новому НП ставится из его координат
     y.set_viewport(city="Тестаул (2)")
@@ -81,7 +81,7 @@ with tempfile.TemporaryDirectory() as td:
 
     # вернём справочник в исходное состояние для остальных проверок
     for k in ("Тестаул", "Тестаул (2)"):
-        y.KZ_PLACES_ALL.pop(k, None)
+        y.PLACES_ALL.pop(k, None)
 
     # --- 4. Отсутствующий OSM-файл: понятная ошибка, а не трейсбек -------
     try:
@@ -118,7 +118,11 @@ y.run_parallel = lambda base, shards, output, finalize=None: (
 with tempfile.TemporaryDirectory() as td:
     td = Path(td)
     many = [f"Аул{i}" for i in range(3000)]
-    y.KZ_PLACES_ALL.update({n: "70.0000,48.0000" for n in many})
+    # Кладём в справочник СТРАНЫ, а не в PLACES_ALL: main() зовёт
+    # set_countries(), и объединение пересобирается из реестра стран —
+    # записи, положенные прямо в PLACES_ALL, до воркеров бы не дожили.
+    y.COUNTRIES["kz"].settlements.update({n: "70.0000,48.0000" for n in many})
+    y.set_countries(None)
     out = td / "big.xlsx"
     sys.argv = ["yandex_parser.py", "--all-cities", "--cities", ",".join(many),
                 "--category", "gt-fuel", "-o", str(out), "--workers", "2",
@@ -156,7 +160,8 @@ with tempfile.TemporaryDirectory() as td:
           "--url-only" in base and "--fast-api" in base, base)
 
     for n in many:
-        y.KZ_PLACES_ALL.pop(n, None)
+        y.COUNTRIES["kz"].settlements.pop(n, None)
+    y.set_countries(None)
 
 y.run_parallel = real_run_parallel
 
@@ -206,7 +211,7 @@ elements = [
     {"lon": 72.00, "lat": 50.00, "tags": {"place": "village"}},
     {"center": {"lon": 68.0, "lat": 45.0}, "tags": {"place": "town", "name": "Полигонное"}},
 ]
-places = osm.elements_to_places(elements, inside=y._point_in_kz,
+places = osm.elements_to_places(elements, inside=y._point_in_region,
                                 kinds=["city", "town", "village", "hamlet"])
 check("одноимённые НП не затирают друг друга",
       "Актоган" in places and "Актоган (2)" in places, sorted(places))
@@ -227,10 +232,10 @@ with tempfile.TemporaryDirectory() as td:
     check("выгрузка OSM читается парсером как список НП",
           set(got) == set(places), got)
     check("координаты из выгрузки доступны вьюпорту",
-          all(y.KZ_PLACES_ALL.get(n) for n in got))
+          all(y.PLACES_ALL.get(n) for n in got))
     for n in places:
         if n not in ("Аршалы",):
-            y.KZ_PLACES_ALL.pop(n, None)
+            y.PLACES_ALL.pop(n, None)
 
 check("запрос Overpass содержит нужные типы и bbox",
       all(k in osm.build_query(["village", "hamlet"], osm.KZ_BBOX)
