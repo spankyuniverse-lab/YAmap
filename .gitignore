@@ -12,6 +12,7 @@ results/
 selectors_cache.json
 logs/
 reports/
+runs/
 *.json
 
 # PyCharm: делимся только готовыми конфигурациями запуска, остальное — личное

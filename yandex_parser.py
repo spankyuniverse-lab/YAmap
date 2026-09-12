@@ -37,6 +37,7 @@ import random
 import re
 import sys
 import time
+import unicodedata
 import urllib.parse
 from collections import deque
 from dataclasses import asdict, dataclass, field, fields, replace
@@ -696,6 +697,74 @@ KZ_CITIES_MAJOR: dict[str, str] = {
 }
 
 
+#: Корень, где лежат папки отдельных прогонов.
+RUNS_DIR = Path("runs")
+
+
+def run_output_path(output: str, new_run: bool = False,
+                    run_dir: str | None = None) -> str:
+    """Куда класть выгрузку и всё её хозяйство (части, прогресс, списки).
+
+    Каждый новый сбор получает свою папку `runs/<дата_время>__<имя>/`, чтобы
+    прогоны не перемешивались. Но докачка обязана попадать в ТУ ЖЕ папку:
+    перезапуск после Ctrl+C или подъём упавшего воркера — это продолжение, а
+    не новый старт. Поэтому по умолчанию берём самую свежую папку с этим
+    именем файла, а новую заводим только по `--new-run`.
+
+    Если рядом со скриптом уже лежит выгрузка от старой (бескаталожной)
+    раскладки — остаёмся там же, чтобы не осиротить собранное.
+    """
+    out = Path(_ensure_ext(output))
+    if run_dir:
+        d = Path(run_dir)
+    elif out.parent != Path("."):
+        return str(out)          # путь задан явно — не вмешиваемся
+    else:
+        stem = out.stem
+        legacy = out.exists() or any(
+            Path(".").glob(f"{glob.escape(stem)}.w*.cities.json"))
+        if legacy and not new_run:
+            log.info("Продолжаю прогон рядом со скриптом: %s "
+                     "(новую папку заведёт --new-run)", out)
+            return str(out)
+        # Сортируем по времени изменения, а не по имени: суффикс второго
+        # старта в ту же минуту («…09-28-2__kz») лексикографически встаёт
+        # ПЕРЕД основным («…09-28__kz»), и «продолжить» уводило не в ту папку.
+        # Время изменения заодно означает «где последняя активность».
+        # Сравниваем имена в NFC: macOS на старых томах отдаёт из listdir
+        # NFD (буква и диакритика раздельно), а наш паттерн — NFC. Глоб не
+        # совпадал, «продолжить» заводило новую папку на каждом перезапуске,
+        # и докачка начинала с нуля. Для кириллицы в `-o` это не теория.
+        suffix = "__" + unicodedata.normalize("NFC", stem)
+        existing = sorted(
+            (d for d in (RUNS_DIR.iterdir() if RUNS_DIR.exists() else [])
+             if d.is_dir()
+             and unicodedata.normalize("NFC", d.name).endswith(suffix)),
+            key=lambda d: d.stat().st_mtime)
+        if existing and not new_run:
+            d = existing[-1]
+            log.info("Продолжаю прогон в папке %s "
+                     "(новую заведёт --new-run)", d)
+        else:
+            stamp = time.strftime("%Y-%m-%d_%H-%M")
+            d = RUNS_DIR / f"{stamp}__{stem}"
+            # Два новых старта в одну минуту иначе попали бы в одну папку и
+            # смешались — ровно то, ради чего папки и заводятся.
+            n = 2
+            while d.exists():
+                d = RUNS_DIR / f"{stamp}-{n}__{stem}"
+                n += 1
+            log.info("Новый прогон — папка %s", d)
+    d.mkdir(parents=True, exist_ok=True)
+    return str(d / out.name)
+
+
+def _run_out(args, name: str) -> str:
+    """Имя выходного файла с учётом папки прогона. Идемпотентно."""
+    return run_output_path(name, getattr(args, "new_run", False),
+                           getattr(args, "run_dir", None))
+
+
 #: Куда fetch_osm_places.py кладёт выгрузку населённых пунктов из OSM.
 OSM_PLACES_FILE = "kz_osm_places.json"
 
@@ -787,18 +856,38 @@ def resolve_city_list(spec: str | None) -> list[str]:
         return load_osm_places(WIKI_PLACES_FILE)
     # Свой список из файла: --cities @places.txt (или @places.json)
     if spec.strip().startswith("@"):
-        return _names_from_file(spec.strip()[1:])
+        names = _names_from_file(spec.strip()[1:])
+        _warn_unknown_places(names, spec.strip())
+        return names
     names = [c.strip() for c in spec.split(",") if c.strip()]
-    # Одиночное слово, которого нет ни среди спеков, ни среди известных НП —
-    # почти наверняка опечатка в спеке («аулу» вместо «аулы»). Своё название
-    # НП тоже возможно, поэтому не падаем, но говорим об этом громко: иначе
-    # вьюпорт молча встанет в центр страны и прогон даст мусор.
-    if len(names) == 1 and names[0] not in PLACES_ALL:
+    _warn_unknown_places(names, "--cities")
+    return names
+
+
+def _warn_unknown_places(names: list[str], source: str) -> None:
+    """Сказать вслух про НП без координат — их вьюпорт уедет в центр страны.
+
+    Предупреждали только когда имя ОДНО. В списке из сорока сёл опечатки
+    молчали: вьюпорт вставал в центр страны на z=5, проверка «не уехали ли
+    мы от НП» отключалась (координат-то нет), а НП всё равно помечался
+    собранным — то есть дыра в покрытии, которую докачка не переберёт.
+    """
+    unknown = [n for n in names if n not in PLACES_ALL]
+    if not unknown:
+        return
+    if len(names) == 1:
         log.warning("«%s» — не спек и не известный парсеру НП. Спеки: "
                     "major, all, аулы, макс, osm, @файл. Если это название "
                     "населённого пункта, вьюпорт будет по центру страны — "
-                    "выдача может уехать не туда.", names[0])
-    return names
+                    "выдача может уехать не туда.", unknown[0])
+        return
+    log.warning("%s: у %d из %d НП нет координат (%s%s). Их вьюпорт встанет по "
+                "центру страны (z=5) — выдача будет случайной. Проверь "
+                "написание или возьми список из OSM/Wikidata.",
+                source, len(unknown), len(names), ", ".join(unknown[:5]),
+                "…" if len(unknown) > 5 else "")
+    record_error(f"{source}: {len(unknown)} НП без координат "
+                 f"({', '.join(unknown[:5])})")
 
 KZ_COUNTRY_LL = "66.9237,48.0196"   # весь Казахстан (регион 159), использовать с z=5
 DEFAULT_CITY_Z = 12                 # зум для сбора по городу
@@ -1947,7 +2036,17 @@ MAP_Z: int = DEFAULT_CITY_Z
 def set_domain(code: str | None) -> None:
     """Установить активный хост/язык по короткому коду TLD (kz/ru/com/…)."""
     global DOMAIN, LANG
-    host, lang, _, _ = DOMAIN_REGISTRY.get((code or "kz").lower(), DOMAIN_REGISTRY["kz"])
+    key = (code or "kz").lower()
+    # У --tld есть choices, а у ключа из конфига — нет: «tld: ua» или
+    # «domain: yandex.ru» молча откатывались на kz, и человек был уверен,
+    # что собирает другой домен.
+    if key not in DOMAIN_REGISTRY:
+        key = key.replace("yandex.", "").strip(". ")
+    if key not in DOMAIN_REGISTRY:
+        log.warning("Домен «%s» парсеру неизвестен — работаю на yandex.kz. "
+                    "Доступны: %s", code, ", ".join(DOMAIN_REGISTRY))
+        key = "kz"
+    host, lang, _, _ = DOMAIN_REGISTRY[key]
     DOMAIN, LANG = host, lang
 
 
@@ -2100,7 +2199,8 @@ def _has_more(data: dict) -> bool | None:
             if key in holder:
                 v = holder[key]
                 if isinstance(v, str):
-                    return v.strip().lower() not in ("false", "0", "")
+                    return v.strip().lower() not in (
+                        "false", "0", "", "no", "нет", "none", "null")
                 return bool(v)
     return None
 
@@ -2124,15 +2224,25 @@ def _api_template_for(collector: "_ApiCollector | None", query: str) -> str:
         return ""
     if m:
         try:
-            got = urllib.parse.unquote_plus(m.group(1)).strip().casefold()
+            got = _norm_query(urllib.parse.unquote_plus(m.group(1)))
         except Exception:
             got = ""
-        want = (query or "").strip().casefold()
-        if got and want and got not in want and want not in got:
+        want = _norm_query(query)
+        # Сравниваем ТОЧНО. Проверка «одно входит в другое» пропускала чужой
+        # шаблон на настоящих парах каталога: «бары» ⊂ «суши-бары», «школы» ⊂
+        # «автошколы», «театры» ⊂ «кинотеатры». Запросы одной группы идут
+        # подряд в одной вкладке, так что last_url помнит предыдущий — и в
+        # лист «бары» молча уезжали суши-бары.
+        if got and want and got != want:
             log.debug("fast-api: перехваченный шаблон про «%s», а мы ищем «%s» "
                       "— шаблон не беру", got, query)
             return ""
     return url
+
+
+def _norm_query(text: str) -> str:
+    """Запрос для сверки: регистр и лишние пробелы не считаются различием."""
+    return " ".join((text or "").split()).casefold()
 
 
 def _fast_api_fetch(page: Page, url: str) -> dict | None:
@@ -2206,7 +2316,7 @@ def _collect_via_api(page: Page, query: str, max_results: int,
                 # явное total=0 в ответе; всё остальное (чужая форма JSON,
                 # {"error": …} с кодом 200) — повод отдать запрос обычному
                 # сбору, а не записать пустоту как результат.
-                if total == "0":
+                if _explicit_zero(data):
                     log.info("fast-api: «%s» — API отвечает, что результатов нет", query)
                     return []
                 log.info("fast-api: ответ есть, но организаций в нём не видно "
@@ -2227,10 +2337,14 @@ def _collect_via_api(page: Page, query: str, max_results: int,
             orgs.append(org)
             added += 1
             if on_org is not None:
+                # Колбэк принимает (организация, номер). Раньше звали с одним
+                # аргументом, TypeError уходил в except — и промежуточные
+                # сохранения при --fast-api не срабатывали НИ РАЗУ. Ctrl+C или
+                # смерть Chrome стирали всё, собранное с прошлого сейва.
                 try:
-                    on_org(org)
-                except Exception:
-                    pass
+                    on_org(org, len(orgs))
+                except Exception as exc:
+                    log.warning("Промежуточное сохранение не сработало: %s", exc)
             if max_results and len(orgs) >= max_results:
                 log.info("fast-api: «%s» — %d организаций (лимит)", query, len(orgs))
                 return orgs
@@ -2499,6 +2613,10 @@ def _normalize_for_dedup(text: str) -> str:
     'ул. Ленина, 5' и 'улица Ленина, 5' → одинаковый ключ.
     """
     s = text.lower().strip()
+    # «Пятёрочка» из одного источника и «Пятерочка» из другого — одна и та же
+    # точка. В маркерах НП про это помнят (там и «посёлок», и «поселок»), а в
+    # ключе дедупа не помнили, и запись двоилась.
+    s = s.replace("ё", "е")
     # Стандартные сокращения
     s = re.sub(r'\bулица\b', 'ул', s)
     s = re.sub(r'\bпроспект\b', 'пр-т', s)
@@ -2512,6 +2630,14 @@ def _normalize_for_dedup(text: str) -> str:
     s = s.replace('.', '').replace(',', ' ')
     s = re.sub(r'\s+', ' ', s).strip()
     return s
+
+
+def _coord_key(v: str) -> str:
+    """Координата для ключа дедупа: округлённая, а не «как напечатали»."""
+    try:
+        return f"{round(float(str(v).replace(',', '.')), 5):.5f}"
+    except (TypeError, ValueError):
+        return str(v)
 
 
 def _dedup_key(org: Organization) -> str:
@@ -2535,7 +2661,11 @@ def _dedup_key(org: Organization) -> str:
     if addr:
         return f"{name}|{addr}"
     if org.latitude and org.longitude:
-        return f"{name}|{org.latitude},{org.longitude}"
+        # Округляем, а не сравниваем строки: из URL координата приходит как
+        # напечатана («43.238949»), из API — как repr float'а
+        # («43.23894900000001»). Одна точка давала два разных ключа ровно
+        # там, где дедуп и нужен — когда org_id нет. 5 знаков ≈ метр.
+        return f"{name}|{_coord_key(org.latitude)},{_coord_key(org.longitude)}"
     return f"{name}|"
 
 
@@ -2654,12 +2784,17 @@ class ProxyRotator:
         """Конвертировать URL прокси в формат Playwright."""
         result: dict[str, str] = {"server": proxy_url}
         parsed = urllib.parse.urlparse(proxy_url)
+        # unquote: «p%40ss» — это «p@ss». Без раскодирования логин/пароль
+        # уезжали в Playwright как есть, и прокси молча не пускал.
         if parsed.username:
-            result["username"] = parsed.username
+            result["username"] = urllib.parse.unquote(parsed.username)
         if parsed.password:
-            result["password"] = parsed.password
+            result["password"] = urllib.parse.unquote(parsed.password)
         if parsed.username or parsed.password:
-            result["server"] = f"{parsed.scheme}://{parsed.hostname}:{parsed.port}"
+            # Порт не всегда указан: f"…:{parsed.port}" давал «…:None»,
+            # то есть заведомо сломанный адрес вместо рабочего.
+            port = f":{parsed.port}" if parsed.port else ""
+            result["server"] = f"{parsed.scheme}://{parsed.hostname}{port}"
         return result
 
 
@@ -2678,11 +2813,14 @@ def get_proxy_rotator() -> ProxyRotator:
 # CAPTCHA detection
 # ---------------------------------------------------------------------------
 
+#: `#js-button` здесь нет намеренно: голый id без пространства имён слишком
+#: легко совпадает с чужой кнопкой на обычной выдаче, а цена ложного
+#: срабатывания — пустой сбор и троттлинг x8 при живом Яндексе. Для КЛИКА по
+#: чекбоксу он остался в `_try_click_captcha`: там мы уже знаем, что капча есть.
 _CAPTCHA_SELECTORS = [
     "[class*='captcha']",
     "[class*='Captcha']",
     "[class*='CheckboxCaptcha']",
-    "#js-button",
     "[class*='smartcaptcha']",
     "iframe[src*='captcha']",
     "[class*='AdvancedCaptcha']",
@@ -2690,14 +2828,31 @@ _CAPTCHA_SELECTORS = [
 
 
 def detect_captcha(page: Page) -> bool:
-    """Проверить, показала ли страница CAPTCHA."""
+    """Проверить, показала ли страница CAPTCHA.
+
+    Требуем ВИДИМОСТЬ, а не просто наличие в DOM. Яндекс подгружает виджет
+    SmartCaptcha заранее, скрытым контейнером, и на совершенно нормальной
+    выдаче `count() > 0` уже правда. Поверив ей, парсер уходил бы в «капча,
+    пауза 60 сек, троттлинг x8» на рабочем Яндексе и возвращал пустоту.
+    """
     for sel in _CAPTCHA_SELECTORS:
-        if page.locator(sel).count() > 0:
-            return True
-    # Дополнительно проверяем по URL
-    if "showcaptcha" in page.url or "captcha" in page.url.lower():
-        return True
-    return False
+        try:
+            loc = page.locator(sel).first
+            if loc.count() > 0 and loc.is_visible():
+                return True
+        except Exception:
+            # Страница ушла из-под ног (навигация/закрытие) — это не капча.
+            continue
+    # По URL: только путь, без query. Иначе слово «captcha» внутри самого
+    # поискового запроса выглядело бы как бан.
+    try:
+        path = page.url.split("?", 1)[0].lower()
+    except Exception:
+        return False
+    # Целым сегментом пути: подстрока ловила бы карточку организации
+    # /maps/org/anticaptcha/123/ и уводила прогон в «решение капчи».
+    segs = [x for x in path.split("/") if x]
+    return any(x in ("showcaptcha", "captcha", "checkcaptcha") for x in segs)
 
 
 def _bezier_mouse_move(page: Page, start_x: float, start_y: float,
@@ -2913,7 +3068,9 @@ class ResumeManager:
             norm = {}
             for k, v in row.items():
                 en_key = ru_to_en.get(k, k)
-                norm[en_key] = str(v) if v else ""
+                # `str(v) if v else ""` съедало НОЛЬ: «0 отзывов» при докачке
+                # становилось «нет данных», и покрытие в отчёте врало вверх.
+                norm[en_key] = "" if v is None else str(v)
 
             org = Organization(**{f: norm.get(f, "") for f in FIELDNAMES if f in norm})
             # Ключ — ТОТ ЖЕ _dedup_key, что и в живом сборе (org_id важнее
@@ -2978,6 +3135,18 @@ DEFAULT_CONFIG: dict[str, Any] = {
 }
 
 
+#: Имена ключей в конфиге не обязаны совпадать с dest'ами argparse. В нашем
+#: же примере конфига лежат «categories» (аргумент --category) и «headless»
+#: (аргумент --no-headless) — оба молча игнорировались.
+_CONFIG_ALIASES = {
+    "categories": "category",
+    "category": "category",
+    "cities": "cities",
+    "workers": "workers",
+    "domain": "tld",
+}
+
+
 def load_config(path: str) -> dict[str, Any]:
     """Загрузить конфиг из YAML или JSON файла."""
     p = Path(path)
@@ -2986,7 +3155,7 @@ def load_config(path: str) -> dict[str, Any]:
         return {}
 
     text = p.read_text(encoding="utf-8")
-    if p.suffix in (".yaml", ".yml"):
+    if p.suffix.lower() in (".yaml", ".yml"):
         try:
             import yaml
             return yaml.safe_load(text) or {}
@@ -3335,7 +3504,11 @@ class SelectorCache:
             try:
                 self._data = json.loads(self._path.read_text(encoding="utf-8"))
                 log.info("Загружен кеш селекторов: %s (%d записей)", self._path, len(self._data))
-            except Exception:
+            except Exception as exc:
+                # На сменившейся вёрстке это разница между «собрали всё» и
+                # «собрали ноль», а причина была не видна нигде.
+                log.warning("Кеш селекторов %s нечитаем (%s) — иду на "
+                            "встроенные селекторы", self._path, exc)
                 self._data = {}
 
     def save(self) -> None:
@@ -3734,13 +3907,25 @@ class SelectorEngine:
         """Получить селектор по ключу. Fallback: hardcoded."""
         return self._active.get(key) or _HARDCODED.get(key, "")
 
-    def probe_and_detect(self, page: Page, mode: str = "list") -> None:
+    def probe_and_detect(self, page: Page, mode: str = "list",
+                         force: bool = False) -> None:
         """Проверить селекторы на живой странице и при необходимости передетектить.
 
-        1. Проверяем кешированные селекторы
-        2. Проверяем hardcoded-селекторы
-        3. Если ключевые не работают — запускаем auto-detect
+        1. Проверяем hardcoded-селекторы (выверенные вручную)
+        2. Если не работают — пробуем кеш прошлого автодетекта
+        3. Если и он не работает — запускаем auto-detect
         4. Обновляем кеш
+
+        Порядок именно такой, а не «кеш вперёд». Кеш принимается по правилу
+        «селектор нашёл хоть один элемент», а неудачный автодетект легко
+        сохраняет туда общую обёртку — она находится ВСЕГДА. Раз попав в
+        `selectors_cache.json`, такая запись отравляла все дальнейшие прогоны:
+        верный hardcoded больше не пробовался никогда, а данные молча шли
+        полупустыми. Проба hardcoded стоит один `count()` — дешевле, чем
+        сутки сбора мусора.
+
+        force=True — пропустить проверки и передетектить сразу: зовётся, когда
+        карточки вообще не нашлись, то есть вёрстка заведомо сменилась.
         """
         # Ключевые селекторы, без которых парсинг невозможен
         critical_keys = (
@@ -3748,45 +3933,46 @@ class SelectorEngine:
             else ["detail_name"]
         )
 
-        # Шаг 1: пробуем кеш
-        cache_ok = True
-        for key in critical_keys:
-            cached = self._cache.get(key)
-            if cached and _probe_selector(page, cached):
-                self._active[key] = cached
-            else:
-                cache_ok = False
+        if not force:
+            # Шаг 1: пробуем hardcoded
+            hardcoded_ok = True
+            for key in critical_keys:
+                hc = _HARDCODED.get(key, "")
+                if hc and _probe_selector(page, hc):
+                    self._active[key] = hc
+                else:
+                    hardcoded_ok = False
 
-        if cache_ok:
-            # Загружаем остальные из кеша, fallback на hardcoded
-            for key in SELECTOR_KEYS:
-                if key not in self._active:
-                    cached = self._cache.get(key)
-                    if cached:
-                        self._active[key] = cached
-                    elif key in _HARDCODED:
+            if hardcoded_ok:
+                for key in SELECTOR_KEYS:
+                    if key not in self._active and key in _HARDCODED:
                         self._active[key] = _HARDCODED[key]
-            log.info("Селекторы загружены из кеша (все критичные работают)")
-            return
+                log.info("Используются hardcoded-селекторы (все критичные работают)")
+                # Сохраняем работающие в кеш
+                self._cache.update(self._active)
+                self._cache.save()
+                return
 
-        # Шаг 2: пробуем hardcoded
-        hardcoded_ok = True
-        for key in critical_keys:
-            hc = _HARDCODED.get(key, "")
-            if hc and _probe_selector(page, hc):
-                self._active[key] = hc
-            else:
-                hardcoded_ok = False
+            # Шаг 2: пробуем кеш
+            cache_ok = True
+            for key in critical_keys:
+                cached = self._cache.get(key)
+                if cached and _probe_selector(page, cached):
+                    self._active[key] = cached
+                else:
+                    cache_ok = False
 
-        if hardcoded_ok:
-            for key in SELECTOR_KEYS:
-                if key not in self._active and key in _HARDCODED:
-                    self._active[key] = _HARDCODED[key]
-            log.info("Используются hardcoded-селекторы (все критичные работают)")
-            # Сохраняем работающие в кеш
-            self._cache.update(self._active)
-            self._cache.save()
-            return
+            if cache_ok:
+                # Загружаем остальные из кеша, fallback на hardcoded
+                for key in SELECTOR_KEYS:
+                    if key not in self._active:
+                        cached = self._cache.get(key)
+                        if cached:
+                            self._active[key] = cached
+                        elif key in _HARDCODED:
+                            self._active[key] = _HARDCODED[key]
+                log.info("Селекторы загружены из кеша (все критичные работают)")
+                return
 
         # Шаг 3: auto-detect
         log.warning("Hardcoded-селекторы не работают — запускаю автодетект…")
@@ -4067,7 +4253,7 @@ def _collect_visible_snippets(page: Page) -> list[Organization]:
         org.rating = r.get("rating", "")
         raw_reviews = r.get("reviews", "")
         if raw_reviews:
-            org.reviews_count = re.sub(r"[^\d]", "", raw_reviews)
+            org.reviews_count = _parse_count(raw_reviews)
         org.working_hours = r.get("hours", "")
         org.yandex_url = r.get("href", "")
         org.seoname, org.org_id = _org_ids_from_url(org.yandex_url)
@@ -4235,7 +4421,7 @@ def parse_snippet(page: Page, index: int) -> Organization:
     if sel:
         raw_reviews = _safe_text(card.locator(sel))
         if raw_reviews:
-            org.reviews_count = re.sub(r"[^\d]", "", raw_reviews)
+            org.reviews_count = _parse_count(raw_reviews)
 
     # Часы работы
     sel = engine.get("snippet_hours")
@@ -4317,7 +4503,7 @@ def enrich_from_detail(page: Page, org: Organization, _detail_detected: list[boo
             if sel:
                 raw = _safe_text(page.locator(sel))
                 if raw:
-                    org.reviews_count = re.sub(r"[^\d]", "", raw)
+                    org.reviews_count = _parse_count(raw)
 
         # Часы работы
         if not org.working_hours:
@@ -4434,8 +4620,13 @@ def enrich_from_detail(page: Page, org: Organization, _detail_detected: list[boo
 
 def _extract_coords_from_url(url: str) -> tuple[str, str] | None:
     """Извлечь координаты из URL Яндекс.Карт (ll=lon,lat или pt=lon,lat)."""
+    # [?&] обязателен: без него «ll=» совпадало внутри «sll=» (центр карты),
+    # и в координаты организации писался центр вьюпорта. «-?» — на случай
+    # западного полушария: без него координата просто терялась.
     for param in ("ll", "pt"):
-        match = re.search(rf'{param}=([\d.]+)%2C([\d.]+)|{param}=([\d.]+),([\d.]+)', url)
+        match = re.search(
+            rf'[?&]{param}=(-?[\d.]+)%2C(-?[\d.]+)'
+            rf'|[?&]{param}=(-?[\d.]+),(-?[\d.]+)', url)
         if match:
             lon = match.group(1) or match.group(3)
             lat = match.group(2) or match.group(4)
@@ -4517,12 +4708,19 @@ def _is_business_item(d: dict) -> bool:
     strong = any(props.get(k) for k in (
         "coordinates", "fullAddress", "CompanyMetaData", "companyMetaData",
         "phones", "ratingData", "uri", "displayCoordinates", "compositeAddress",
+        # Синонимы гео-маркера: переименуй Яндекс «coordinates» в «point» — и
+        # эта функция отсекала бы ВСЕ карточки. А через неё проходят все три
+        # ветки разбора (быстрый путь тоже зовёт её на первых элементах), то
+        # есть один промах фильтра гасил весь API-слой разом.
+        "point", "geo", "location", "geoPoint",
+        "addressLine", "shortAddress", "phone", "businessId", "oid",
     ))
     if not strong and d.get("geometry"):
         strong = True
     if not strong:
-        a = props.get("address")
-        strong = isinstance(a, str) and bool(a.strip())
+        # Адрес бывает и объектом (Address.Components), не только строкой.
+        a = props.get("address") or props.get("Address")
+        strong = (isinstance(a, str) and bool(a.strip())) or isinstance(a, dict)
     return strong
 
 
@@ -4531,7 +4729,11 @@ def _deep_find_business_list(node: Any, depth: int = 0) -> list[dict] | None:
 
     Внутренний формат Яндекса меняется/варьируется — вместо жёсткого пути ищем
     список карточек по признакам (имя + координаты/адрес/id/рубрики)."""
-    if depth > 9:
+    # 9 уровней не хватало: реальный конверт Яндекса — это «config →
+    # stack → frame → results → …» плюс слои редюсера. Не дойдя до
+    # списка, функция возвращала None — неотличимо от «организаций в
+    # ответе нет», то есть отказ универсального запасного пути молчал.
+    if depth > 14:
         return None
     best: list[dict] | None = None
     if isinstance(node, list):
@@ -4594,9 +4796,32 @@ def _extract_total_count(data: dict) -> str:
     for key in ("totalResultCount", "total", "found", "count"):
         for holder in (data, inner):
             v = holder.get(key)
+            # bool — подкласс int: {"found": true} давало «да» в колонке
+            # «Всего найдено» и обнуляло признак насыщения тайла.
+            if isinstance(v, bool):
+                continue
             if isinstance(v, (int, str)) and _s(v):
                 return _s(v)
     return ""
+
+
+def _explicit_zero(data: dict) -> bool:
+    """Ответ ЯВНО говорит «результатов нет» — и это можно записать как итог.
+
+    Доверяем только точному `totalResultCount`. Общие `total`/`found`/`count`
+    в незнакомом конверте значат что угодно — счётчик баннеров, фильтров,
+    ошибок; поверив такому нулю, быстрый путь записывал бы пустоту как
+    честный результат, помечал запрос выполненным, и докачка его уже не
+    перебирала. Это молчаливая дыра в покрытии, а не экономия.
+    """
+    if not isinstance(data, dict):
+        return False
+    inner = data.get("data") if isinstance(data.get("data"), dict) else {}
+    for holder in (data, inner):
+        v = holder.get("totalResultCount")
+        if isinstance(v, (int, str)) and _s(v).isdigit():
+            return int(_s(v)) == 0
+    return False
 
 
 def _org_from_item(feat: dict, total_count: str = "") -> Organization | None:
@@ -4706,7 +4931,14 @@ def _org_from_item(feat: dict, total_count: str = "") -> Organization | None:
             nums.append(num)
             types.append(ph.get("type", ""))
     org.phone = _join_unique(nums)
-    org.phone_types = _join_unique(types)
+    # Типы идут ПАРАЛЛЕЛЬНО номерам — дедуплицировать их нельзя. На трёх
+    # номерах (phone, phone, fax) _join_unique оставлял «phone; fax», и
+    # пользователь, читая колонки по позиции, видел второй номер как факс.
+    # Выравниваем по тому же порядку и той же длине, что и org.phone.
+    kept = {}
+    for num, typ in zip(nums, types):
+        kept.setdefault(num, typ)
+    org.phone_types = "; ".join(kept.values())
 
     # --- сайты ---
     urls = props.get("urls")
@@ -4732,7 +4964,7 @@ def _org_from_item(feat: dict, total_count: str = "") -> Organization | None:
             emails.append(href.replace("mailto:", ""))
         elif t == "booking":
             booking.append(href)
-        elif any(p in href for p in SOCIAL_PATTERNS):
+        elif _is_social_link(href):
             socials.append(href)
     # Явный блок соцсетей внутреннего формата
     for s in (props.get("socialLinks") or []):
@@ -4967,11 +5199,85 @@ _STATIC_EXTS = (".css", ".js", ".mjs", ".png", ".jpg", ".jpeg", ".gif",
                 ".svg", ".webp", ".woff", ".woff2", ".ttf", ".ico", ".map")
 
 
+_unknown_shape_saved = False
+
+
+def _dump_unknown_shape(url: str, body: Any) -> None:
+    """Сохранить СЛЕПОК незнакомого ответа API — один раз за прогон.
+
+    Не полный дамп: верхние ключи, формы вложенных объектов и первые два
+    элемента самого длинного найденного списка. Этого хватает, чтобы дописать
+    экстрактор, и файл остаётся в килобайтах, а не в мегабайтах.
+    """
+    global _unknown_shape_saved
+    if _unknown_shape_saved:
+        return
+    _unknown_shape_saved = True
+
+    def outline(v: Any, depth: int = 0) -> Any:
+        if depth > 4:
+            return "…"
+        if isinstance(v, dict):
+            return {k: outline(x, depth + 1) for k, x in list(v.items())[:40]}
+        if isinstance(v, list):
+            return ([outline(v[0], depth + 1), f"…ещё {len(v) - 1}"]
+                    if len(v) > 1 else [outline(x, depth + 1) for x in v])
+        if isinstance(v, str):
+            return v[:120]
+        return v
+
+    def biggest_list(v: Any, depth: int = 0) -> list:
+        if depth > 14:
+            return []
+        best: list = []
+        if isinstance(v, list):
+            if any(isinstance(x, dict) for x in v):
+                best = v
+            for x in v[:50]:
+                cand = biggest_list(x, depth + 1)
+                if len(cand) > len(best):
+                    best = cand
+        elif isinstance(v, dict):
+            for x in v.values():
+                cand = biggest_list(x, depth + 1)
+                if len(cand) > len(best):
+                    best = cand
+        return best
+
+    try:
+        REPORTS_DIR.mkdir(exist_ok=True)
+        sample = biggest_list(body)[:2]
+        snapshot = {
+            "url": url.split("?", 1)[0],
+            "top_keys": (list(body.keys()) if isinstance(body, dict)
+                         else type(body).__name__),
+            "outline": outline(body),
+            "biggest_list_sample": sample,
+        }
+        path = REPORTS_DIR / "api_unknown_shape.json"
+        text = json.dumps(snapshot, ensure_ascii=False, indent=2)[:200_000]
+        path.write_text(text, encoding="utf-8")
+        log.warning("Форма незнакомого API-ответа сохранена: %s — пришлите "
+                    "этот файл, по нему чинится экстрактор", path)
+    except Exception as exc:
+        log.debug("Слепок формы API не сохранён: %s", exc)
+
+
 def _is_static_asset(url: str) -> bool:
-    """Ссылка на статику фронтенда, а не на данные."""
-    if any(h in url for h in _STATIC_HOSTS):
+    """Ссылка на статику фронтенда, а не на данные.
+
+    Хост сверяем именно с хостом: подстрокой «avatars.mds.yandex.net» нашлось
+    бы и в параметрах настоящего ответа API — и мы бы его выбросили.
+    """
+    try:
+        parts = urllib.parse.urlsplit(url)
+        host = (parts.hostname or "").lower()
+        path = parts.path.lower()
+    except Exception:
+        host = ""
+        path = url.split("?", 1)[0].split("#", 1)[0].lower()
+    if host and any(host == h or host.endswith("." + h) for h in _STATIC_HOSTS):
         return True
-    path = url.split("?", 1)[0].split("#", 1)[0].lower()
     return path.endswith(_STATIC_EXTS)
 
 # Глобальный счётчик дампов сырых API-ответов (для YAMAP_DEBUG_API).
@@ -4996,6 +5302,16 @@ _LOCALITY_MARKERS = (
     "село", "с.", "посёлок", "поселок", "пос.", "аул", "станция",
     "г.", "г ",
 )
+#: Те же маркеры, но с учётом МЕСТА в сегменте. Поиск подстрокой врал в обе
+#: стороны: «станция» находилась внутри «Автостанция», «город» — внутри «ТРЦ
+#: Город», и сегмент с названием объекта считался городом и отсекался.
+#: «Город Алматы» и «ТРЦ Город» различает только позиция: у типа населённого
+#: пункта дальше идёт имя, у названия объекта — тип стоит последним.
+_LOCALITY_PREFIX_RE = re.compile(
+    r"^\s*(?:город|село|посёлок|поселок|аул|деревня|станция|město"
+    r"|г|с|п|пос|ст|дер)\.?\s+\S", re.IGNORECASE)
+_LOCALITY_SUFFIX_RE = re.compile(
+    r"\S\s+(?:область|обл|район|р-н|окру?г)\.?\s*$", re.IGNORECASE)
 # Маркеры улицы/дома — такой сегмент НИКОГДА не отсекаем.
 _STREET_MARKERS = (
     "ул", "улица", "просп", "проспект", "пр-т", "пер", "переулок",
@@ -5008,6 +5324,14 @@ _STREET_RE = re.compile(
     + r")\.?(?![^\W\d_])", re.IGNORECASE)
 
 _KZ_CITIES_LOWER: set[str] = set()
+
+#: Сегмент адреса, который может быть ТОЛЬКО номером дома: «5», «12А»,
+#: «12/1», «д. 5», «дом 7Б». Если после голого имени стоит такое — имя было
+#: улицей, а не городом.
+_HOUSE_ONLY_RE = re.compile(
+    r"^(?:д\.?|дом|уч\.?|участок)?\s*\d+[а-яёa-z]?(?:\s*[/\-]\s*\d+[а-яёa-z]?)?"
+    r"(?:\s*(?:к|корп|корпус|стр|строение|пом|оф|офис)\.?\s*\d+[а-яёa-z]?)?$",
+    re.IGNORECASE)
 
 
 def _refresh_locality_index() -> None:
@@ -5029,6 +5353,49 @@ set_countries(ACTIVE_COUNTRIES)
 _KZ_PLACES_BUILTIN.update(PLACES_ALL)
 
 
+def _parse_count(raw: str) -> str:
+    """Число отзывов/оценок из подписи Яндекса.
+
+    Яндекс сокращает у самых популярных: «1,2 тыс. отзывов». Прежнее
+    `re.sub(r"[^\d]", "", ...)` склеивало цифры и давало 12 вместо 1200 —
+    занижение в сто раз, и ровно у топовых организаций.
+    """
+    t = (raw or "").strip().lower().replace("\u00a0", " ")
+    m = re.search(r"(\d+(?:[.,]\d+)?)\s*(тыс|тис|млн|k|m)\b", t)
+    if m:
+        try:
+            val = float(m.group(1).replace(",", "."))
+        except ValueError:
+            return ""
+        mult = 1_000_000 if m.group(2) in ("млн", "m") else 1_000
+        return str(int(round(val * mult)))
+    digits = re.sub(r"[^\d]", "", t)
+    return digits
+
+
+def _is_social_link(href: str) -> bool:
+    """Ссылка на соцсеть — по ХОСТУ, а не по подстроке во всём URL.
+
+    Поиск подстрокой уводил обычные сайты компаний в колонку «Соцсети»:
+    relax.com.kz → «x.com», vostok.ru → «ok.ru», viberi.kz → «viber».
+    """
+    try:
+        host = (urllib.parse.urlsplit(href if "//" in href else "//" + href)
+                .hostname or "").lower()
+    except Exception:
+        return False
+    if not host:
+        return False
+    host = host[4:] if host.startswith("www.") else host
+    for pat in SOCIAL_PATTERNS:
+        if "." in pat:
+            if host == pat or host.endswith("." + pat):
+                return True
+        elif pat in host.split("."):
+            return True
+    return False
+
+
 def _loose_addr(address: str) -> str:
     """Адрес без ведущих сегментов «город/область/район» — для устойчивого
     сопоставления DOM и API (в сниппете «Алматы, ул. Абая, 1», в API «ул. Абая, 1»)."""
@@ -5042,13 +5409,33 @@ def _loose_addr(address: str) -> str:
         is_street = bool(_STREET_RE.search(seg))
         if is_street:
             break
-        is_locality = (
-            seg in _KZ_CITIES_LOWER
-            or any(m in seg for m in _LOCALITY_MARKERS)
-        )
-        if not is_locality:
-            break
-        parts.pop(0)
+        has_marker = bool(_LOCALITY_PREFIX_RE.search(seg)
+                          or _LOCALITY_SUFFIX_RE.search(seg))
+        if has_marker:
+            # «г. Алматы», «Актюбинская область» — тип указан явно, режем.
+            parts.pop(0)
+            continue
+        if seg in _KZ_CITIES_LOWER:
+            # Голое имя без типа — самое двусмысленное место. Половина сёл
+            # называется так же, как знаменитые улицы: Достык, Байтерек,
+            # Кабанбай батыра. Решает КОЛИЧЕСТВО сегментов:
+            #   «Алматы, Достык, 5» — город, улица, дом → город режем;
+            #   «Достык, 5»         — улица и дом       → режем ТОЛЬКО дом,
+            #                                             то есть ничего.
+            # Ошибиться тут можно в две стороны, и цены разные: не срезав
+            # город, получим дубль строки (данные целы), а срезав улицу —
+            # схлопнем РАЗНЫЕ филиалы сети в одну запись, и второй пропадёт
+            # навсегда. Поэтому в спорном случае не режем.
+            rest = parts[1:]
+            if len(rest) >= 2 or _STREET_RE.search(", ".join(rest)):
+                parts.pop(0)
+                continue
+            # Осталось два сегмента. «Алматы, Абая 5» — это город и
+            # улица с домом; «Достык, 5» — улица и голый номер дома.
+            if rest and not _HOUSE_ONLY_RE.match(rest[0].strip()):
+                parts.pop(0)
+                continue
+        break
     return _normalize_for_dedup(", ".join(parts))
 
 
@@ -5091,7 +5478,14 @@ class _ApiCollector:
         # Шаблон для --fast-api берём ТОЛЬКО с поискового эндпоинта: ответ по
         # карточке организации сюда тоже попадает, и спагинировать его значит
         # собрать не то.
-        if "search" in url:
+        # Именно по ПУТИ: «search» встречается и в параметрах (source=serp_search,
+        # searchCtx, reqid), и тогда в пагинацию --fast-api уезжал бы ответ
+        # карточки организации вместо выдачи.
+        try:
+            api_path = urllib.parse.urlsplit(url).path.lower()
+        except Exception:
+            api_path = ""
+        if "search" in api_path:
             self.last_url = url
         orgs = _extract_orgs_from_api_response(body)
 
@@ -5103,6 +5497,12 @@ class _ApiCollector:
                             url.split("?")[0][-40:], shape)
             except Exception:
                 pass
+            # И сразу кладём слепок формы на диск — БЕЗ всякого флага. Разобрать
+            # незнакомый конверт можно только увидев его, а YAMAP_DEBUG_API надо
+            # знать и включить ЗАРАНЕЕ: когда расхождение всплывает, прогон уже
+            # прошёл, и включать поздно. Слепок маленький (ключи + два элемента)
+            # и пишется один раз за прогон.
+            _dump_unknown_shape(url, body)
 
         # Дамп сырого ответа для отладки (env YAMAP_DEBUG_API=1).
         # Глобальный счётчик — чтобы поймать РАЗНЫЕ ответы (бутстрап И item-ответ),
@@ -5159,36 +5559,42 @@ def run_api_intercept(
     all_orgs: list[Organization] = []
     seen_names: set[str] = set()
 
+    matched = 0        # сколько НАСТОЯЩИХ ответов API разобрали
+
     def on_response(response: Response) -> None:
-        url = response.url
-        # Ловим запросы к API поиска/бизнесов
-        api_patterns = [
-            "/maps/api/search",
-            "/maps/api/business",
-            "searchBusinesses",
-            "/search/",
-            "csrfToken",  # skip
-        ]
-        is_api = any(p in url for p in api_patterns[:4])
-        if not is_api:
-            return
-        if response.status != 200:
-            return
-
+        # Ровно те же правила, что и у _ApiCollector: свой список шаблонов
+        # здесь уже один раз стоил нам разбора CSS-бандла как JSON — паттерн
+        # «/search/» ловит «chunks/search/<хеш>.css». Держим ОДИН источник
+        # правды, иначе фикс чинит только половину кода.
+        nonlocal matched
+        # Playwright зовёт обработчик из своего цикла; исключение отсюда
+        # роняет прогон УЖЕ ПОСЛЕ сбора. Ловим BaseException: при закрытии
+        # контекста прилетает asyncio.CancelledError, а она не Exception.
         try:
-            body = response.json()
-        except Exception:
-            return
+            url = response.url
+            if not any(p in url for p in _API_URL_PATTERNS):
+                return
+            if _is_static_asset(url):
+                return
+            if response.status != 200:
+                return
+            try:
+                body = response.json()
+            except Exception:
+                return
+            matched += 1
 
-        orgs = _extract_orgs_from_api_response(body)
-        for org in orgs:
-            key = _dedup_key(org)
-            if key not in seen_names:
-                seen_names.add(key)
-                all_orgs.append(org)
+            orgs = _extract_orgs_from_api_response(body)
+            for org in orgs:
+                key = _dedup_key(org)
+                if key not in seen_names:
+                    seen_names.add(key)
+                    all_orgs.append(org)
 
-        if orgs:
-            log.info("API перехвачено: +%d (всего %d)", len(orgs), len(all_orgs))
+            if orgs:
+                log.info("API перехвачено: +%d (всего %d)", len(orgs), len(all_orgs))
+        except BaseException as exc:
+            log.debug("API-перехват: обработчик ответа упал (%s)", exc)
 
     page.on("response", on_response)
 
@@ -5217,6 +5623,15 @@ def run_api_intercept(
                     pbar.update(new_count)
             else:
                 stale_rounds += 1
+
+            # Живой Яндекс может вообще не слать XHR к API поиска — выдача
+            # приезжает в SSR. Тогда ждать нечего: каждый холостой раунд это
+            # прокрутка с паузой, а их 12 — до минуты на тайл, и всё ради
+            # гарантированного нуля. Плюс лишняя активность = лишняя капча.
+            if matched == 0 and stale_rounds >= 3:
+                log.info("API: страница не шлёт запросов к API поиска "
+                         "(разобрано ответов: 0) — доп. проход не нужен")
+                break
 
             if stale_rounds >= 12:
                 log.info("API: новые данные не поступают, завершаем (всего %d)", len(all_orgs))
@@ -5428,7 +5843,7 @@ def save_xlsx_by_categories(
         _write_sheet(ws_all, all_orgs)
 
         # Отдельный лист на каждую категорию
-        used_names: set[str] = {"Все результаты"}
+        used_names: set[str] = {"все результаты"}
         for query, orgs in results.items():
             if not orgs:
                 continue
@@ -5436,10 +5851,14 @@ def save_xlsx_by_categories(
             base = re.sub(r'[\\/*?\[\]:]', '', query)[:31] or "лист"
             sheet_name = base
             n = 2
-            while sheet_name in used_names:
-                sheet_name = f"{base[:28]}_{n}"
+            # Excel считает «Кафе» и «кафе» ОДНИМ листом, а обычный set —
+            # разными: книга не сохранялась вовсе. И суффикс «_100» вылезал
+            # за 31 символ, потому что обрезали до 28 под одну цифру.
+            while sheet_name.casefold() in used_names:
+                suffix = f"_{n}"
+                sheet_name = f"{base[:31 - len(suffix)]}{suffix}"
                 n += 1
-            used_names.add(sheet_name)
+            used_names.add(sheet_name.casefold())
             ws = wb.create_sheet(title=sheet_name)
             _write_sheet(ws, orgs)
 
@@ -5831,9 +6250,19 @@ def _warmup(page: Page, headless: bool) -> None:
         page.goto(f"{base_url()}/", wait_until="domcontentloaded", timeout=20000)
         page.wait_for_timeout(random.randint(2000, 4000))
 
-        # Проверяем капчу на главной
+        # Проверяем капчу на главной. Результат ВАЖЕН: нерешённая капча тут
+        # означает, что на карты мы приходим уже помеченной сессией, и весь
+        # дальнейший сбор будет пустым. Раньше возврат игнорировался, а лог
+        # бодро писал «Прогрев завершён».
         if detect_captcha(page):
-            handle_captcha(page, headless)
+            get_throttle().on_captcha()
+            if not handle_captcha(page, headless):
+                record_error("Капча на главной Яндекса не решена — сессия "
+                             "помечена ещё до начала сбора")
+                log.warning("Прогрев: капча на главной не решена. Дальше почти "
+                            "наверняка будет пусто — реши её в окне браузера "
+                            "(без --no-headless её не видно) или сбавь "
+                            "--workers.")
 
         # Двигаем мышку — «осматриваемся» на главной
         for _ in range(random.randint(2, 4)):
@@ -5852,7 +6281,11 @@ def _warmup(page: Page, headless: bool) -> None:
 
         # Проверяем капчу на картах
         if detect_captcha(page):
-            handle_captcha(page, headless)
+            get_throttle().on_captcha()
+            if not handle_captcha(page, headless):
+                record_error("Капча на Яндекс.Картах не решена при прогреве")
+                log.warning("Прогрев: капча на картах не решена — сбор, "
+                            "скорее всего, вернёт пустоту.")
 
         # Двигаем мышку случайно по карте
         for _ in range(random.randint(3, 6)):
@@ -6097,7 +6530,12 @@ def _collect_current_results(
         if not found:
             # Может быть CAPTCHA появилась после загрузки
             if detect_captcha(page):
+                # Капчу здесь раньше не считали: троттлинг не замедлялся, а в
+                # отчёте стояло «Капч поймано: 0» при живом бане. Пустой сбор
+                # выглядел как «просто ничего не нашлось».
+                get_throttle().on_captcha()
                 if not handle_captcha(page, headless):
+                    record_error(f"Капча на выдаче «{query}» не решена")
                     return []
                 try:
                     page.wait_for_selector(item_sel or ITEM_SEL, timeout=10000)
@@ -6106,7 +6544,29 @@ def _collect_current_results(
                     pass
 
         if not found:
+            # Последний шанс: возможно, Яндекс переименовал классы карточек.
+            # Автодетект стоял НИЖЕ выхода — то есть не запускался ровно в том
+            # случае, ради которого написан. Пробуем детект и ждём ещё раз.
+            try:
+                engine.probe_and_detect(page, mode="list", force=True)
+                fresh = engine.get("item")
+                if fresh and fresh not in candidates:
+                    page.wait_for_selector(fresh, timeout=5000)
+                    found = True
+                    log.info("Вёрстка сменилась: карточки найдены автодетектом (%s)",
+                             fresh)
+            except Exception:
+                pass
+
+        if not found:
             log.warning("Результаты не найдены для запроса: %s", query)
+            if not detect_captcha(page):
+                # Отличаем «пусто, потому что в ауле правда нет кафе» от
+                # «пусто, потому что мы больше не узнаём карточки».
+                record_error(
+                    f"«{query}»: карточки не найдены ни одним из "
+                    f"{len(candidates)} селекторов и автодетектом — "
+                    f"возможна смена вёрстки Яндекса")
             return []
 
         # Запускаем автодетект на живой странице с результатами
@@ -6154,10 +6614,21 @@ def _collect_current_results(
         log.info("API-обогащение: пойман %d ответ(ов), карточек из API %d; "
                  "организаций с телефоном/ID: %d → %d",
                  collector.matched, len(collector.by_key), before_rich, after_rich)
+    elif collector.matched:
+        log.info("API ответил %d раз(а), но организаций из ответов не извлечено "
+                 "— незнакомый формат. Данные из DOM (название/адрес/категория/"
+                 "рейтинг), без телефона и координат. Для отладки экстрактора: "
+                 "YAMAP_DEBUG_API=1, затем пришлите reports/api_raw_*.json.",
+                 collector.matched)
     else:
-        log.info("Организаций из API не извлечено (бутстрап/др. формат) — данные "
-                 "из DOM (название/адрес/категория/рейтинг). Для отладки экстрактора "
-                 "запустите с YAMAP_DEBUG_API=1 и пришлите reports/api_raw_*.json.")
+        # Раньше здесь писалось «бутстрап/др. формат» и предлагалось прислать
+        # reports/api_raw_*.json. Оба утверждения ложны, когда ответов НЕ БЫЛО:
+        # формат ни при чём, а дамп пишется внутри обработчика ответа, которого
+        # не было — пользователь шёл искать несуществующие файлы.
+        log.info("Ни одного ответа API за запрос — выдача приезжает в SSR. "
+                 "Данные из DOM (название/адрес/категория/рейтинг); телефон и "
+                 "координаты в этом режиме не собираются. --api-intercept и "
+                 "--fast-api тут ничего не добавят.")
 
     log.info("Извлечено организаций: %d", len(orgs))
     return orgs[:max_results] if (max_results and max_results > 0) else orgs
@@ -6444,6 +6915,23 @@ def print_stats(orgs: list[Organization], label: str = "Результаты") -
         for cat, cnt in stats["top_categories"]:
             print(f"    {cat}: {cnt}")
     print(f"{'=' * 50}\n")
+
+    # Телефон и координаты приходят ТОЛЬКО из API/SSR — из DOM-карточки их
+    # не достать. Ноль по обоим сразу на заметном объёме означает, что богатый
+    # слой не сработал вовсе: выгрузка не пустая, но урезана до 7 полей из ~60.
+    # Раньше это выглядело как безобидное «С телефоном: 0 (0%)» в общей
+    # простыне цифр — ни предупреждения, ни строки в отчёте.
+    cov = stats["coverage"]
+    if (stats["total"] >= 20
+            and cov.get("С телефоном", {}).get("count", 0) == 0
+            and cov.get("С координатами", {}).get("count", 0) == 0):
+        msg = (f"Ни у одной из {stats['total']} организаций нет ни телефона, "
+               f"ни координат: слой API/SSR не сработал, собраны только поля "
+               f"из DOM (название, адрес, категория, рейтинг, часы)")
+        log.warning("%s", msg)
+        record_error(msg)
+        print(f"  ⚠️  {msg}.\n      Проверка: ./run.sh --probe-api --city "
+              f"Алматы \"Заправки\"\n")
     return stats
 
 
@@ -6568,13 +7056,23 @@ def _merge_results_with_resume(
 def _is_browser_failure(exc: Exception) -> bool:
     """Похоже ли исключение на «браузер не запустился», а не на сбой поиска."""
     text = f"{type(exc).__name__}: {exc}".lower()
+    # Подстроки — ТОЧНЫЕ. «timeout.*waiting for browser» лежало здесь как
+    # регулярка и через `in` не совпадало никогда, а «profile» и «no such
+    # file or directory» срабатывали на чём попало (напр. на отсутствующем
+    # справочнике OSM) — воркер зря считался убитым.
     markers = (
         "executable doesn", "browsertype.launch", "launch_persistent_context",
-        "profile", "target page, context or browser has been closed",
-        "connection closed", "browser closed", "no such file or directory",
-        "failed to launch", "timeout.*waiting for browser",
+        "target page, context or browser has been closed",
+        "connection closed", "browser closed",
+        "failed to launch", "waiting for browser",
+        "profile directory", "profile is already in use",
+        "user data directory",
     )
-    return any(m in text for m in markers)
+    if any(m in text for m in markers):
+        return True
+    # «файла нет» считаем отказом браузера, только если это ИМЕННО браузер.
+    return ("no such file or directory" in text
+            and any(w in text for w in ("chrom", "browser", "playwright")))
 
 
 def run_category_parser(
@@ -7115,6 +7613,29 @@ def run_probe_api(query: str = "Заправки", headless: bool = True,
                         print(f"     ✅ пришло {len(items2)} организаций, из них "
                               f"новых {len(fresh)} — пагинация работает.")
                         print("     → --fast-api можно включать.")
+
+            # 5) Второй богатый источник. Телефон и координаты берутся ТОЛЬКО
+            # из API или из SSR-конфига страницы; если API молчит (а на живом
+            # Яндексе так и есть), весь вопрос в том, достаёт ли их SSR.
+            # Без этой строки «телефонов 0%» невозможно объяснить.
+            print("\n5) Организаций из inline-конфига страницы (SSR)…")
+            try:
+                ssr = _extract_orgs_from_page(page)
+            except Exception as exc:
+                ssr = []
+                print(f"     ❌ разбор не удался: {exc}")
+            with_phone = sum(1 for o in ssr if o.phone)
+            with_ll = sum(1 for o in ssr if o.latitude)
+            print(f"     найдено {len(ssr)}; с телефоном {with_phone}, "
+                  f"с координатами {with_ll}")
+            if not ssr and not collector.by_key:
+                print("     ⚠️  Ни API, ни SSR не дали карточек: в выгрузке")
+                print("     будут только поля из DOM — название, адрес,")
+                print("     категория, рейтинг, часы. Телефона и координат")
+                print("     не будет НИ В КАКОМ режиме, пока это не починено.")
+                shape = REPORTS_DIR / "api_unknown_shape.json"
+                if shape.exists():
+                    print(f"     Слепок ответа для разбора: {shape}")
     except Exception as exc:
         print(f"\nДиагностика упала: {exc}")
     finally:
@@ -7134,6 +7655,22 @@ def run_probe_api(query: str = "Заправки", headless: bool = True,
         except Exception:
             pass
     print("=" * 62)
+
+
+#: Строка лога с уровнем ERROR/CRITICAL, а не просто со словом «ERROR»
+#: где-нибудь в названии организации или в поисковом запросе. Формат строки —
+#: «ЧЧ:ММ:СС  УРОВЕНЬ    текст», поэтому уровень ищем в начале.
+_LOG_LEVEL_RE = re.compile(r"^\s*[\d:.\- ]{5,20}\s+(ERROR|CRITICAL|WARNING)\b")
+
+
+def _log_line_level(line: str) -> str:
+    """Уровень строки лога: ERROR / CRITICAL / WARNING / '' (не уровень)."""
+    m = _LOG_LEVEL_RE.match(line)
+    if m:
+        return m.group(1)
+    if line.lstrip().startswith("Traceback (most recent call last)"):
+        return "ERROR"
+    return ""
 
 
 def run_doctor() -> None:
@@ -7206,7 +7743,7 @@ def run_doctor() -> None:
     for lf in sorted(LOGS_DIR.glob("*.log")) if LOGS_DIR.exists() else []:
         try:
             for line in lf.read_text(encoding="utf-8", errors="replace").splitlines():
-                if "ERROR" in line or "Traceback" in line or "WARNING" in line:
+                if _log_line_level(line):
                     lines.append(f"    {lf.name}: {line.strip()[:150]}")
         except Exception:
             continue
@@ -7519,7 +8056,6 @@ def _tail(path: Path, limit: int = 64_000) -> list[str]:
 
 _RE_CITY = re.compile(r"Город (\d+)/(\d+): (.+?) ═══")
 _RE_QUERY = re.compile(r"━━━ \[(\d+)/(\d+)\] (.+?) ━━━")
-_RE_FOUND = re.compile(r"Категория «(.+?)»: (\d+) организаций")
 
 
 def _worker_state(idx: int) -> str:
@@ -7586,7 +8122,7 @@ def _print_health(parts: list[Path], n: int = 0) -> None:
     for lf in sorted(LOGS_DIR.glob("worker*.log")) if LOGS_DIR.exists() else []:
         try:
             for line in lf.read_text(encoding="utf-8", errors="replace").splitlines():
-                if "ERROR" in line or "Traceback" in line:
+                if _log_line_level(line) in ("ERROR", "CRITICAL"):
                     errors.append(f"{lf.name}: {line.strip()[:160]}")
         except Exception:
             continue
@@ -7623,7 +8159,17 @@ def _load_existing_orgs(out_path: Path, quiet: bool = False) -> list[Organizatio
     try:
         rm = ResumeManager(out_path)
         return rm.existing_orgs()
-    except Exception:
+    except Exception as exc:
+        # Молчать тут опасно: свип решит «раньше ничего не собирали», и первое
+        # же автосохранение перезапишет существующий файл только новыми
+        # данными. При quiet=True это штатная гонка с воркером — там тихо.
+        if not quiet:
+            log.error("Не смог прочитать уже собранное из %s (%s: %s). "
+                      "ОСТОРОЖНО: продолжение перезапишет файл заново — "
+                      "сделай копию, если там есть данные.",
+                      out_path, type(exc).__name__, exc)
+            record_error(f"Файл результатов {out_path} не прочитан — "
+                         f"докачка начнётся с нуля")
         return []
     finally:
         if quiet:
@@ -7716,7 +8262,12 @@ def run_country_sweep(
                 done = set(pdata)
             log.info("Resume: %d готовых единиц, %d в очереди из прошлого прогона",
                      len(done), len(saved_queue))
-        except Exception:
+        except Exception as exc:
+            # Раньше это молчало. А цена молчания — свип, в котором пройдены
+            # десятки тысяч тайлов, начинается с нуля, и понять почему нельзя.
+            log.warning("Прогресс свипа не прочитан (%s: %s) — начинаю заново. "
+                        "Файл: %s", type(exc).__name__, exc, progress_path)
+            record_error(f"Прогресс свипа {progress_path} нечитаем — сброс на ноль")
             done, saved_queue = set(), []
 
     all_orgs: list[Organization] = _load_existing_orgs(out_path)
@@ -8071,6 +8622,18 @@ def main() -> None:
              "--cities \"Алматы,Астана,Шымкент\".",
     )
     parser.add_argument(
+        "--new-run", action="store_true",
+        help="Начать НОВЫЙ сбор в отдельной папке runs/<дата_время>__<имя>/. "
+             "Без флага прогон продолжается в самой свежей папке с этим "
+             "именем файла — чтобы перезапуск после Ctrl+C и подъём упавшего "
+             "воркера не плодили новые папки, а доканчивали начатое.",
+    )
+    parser.add_argument(
+        "--run-dir", default=None,
+        help="Явная папка для всех файлов прогона (выгрузка, части, "
+             "прогресс). Переопределяет --new-run.",
+    )
+    parser.add_argument(
         "--countries", default=None,
         help="Страны сбора через запятую: kz, uz, kg (по умолчанию все три). "
              "Влияет на справочник НП, сетку --country и коридоры --routes.",
@@ -8337,8 +8900,16 @@ def main() -> None:
     if args.config:
         cfg = load_config(args.config)
         for k, v in cfg.items():
-            arg_key = k.replace("-", "_")
+            arg_key = _CONFIG_ALIASES.get(k.replace("-", "_"), k.replace("-", "_"))
+            if arg_key == "headless":
+                # В конфиге пишут «headless: true», а у argparse флаг обратный.
+                args.no_headless = args.no_headless or not bool(v)
+                continue
             if not hasattr(args, arg_key):
+                # Раньше неизвестный ключ просто пропускался молча — и
+                # «categories» из ШТАТНОГО config.example.yaml не применялся
+                # вообще: аргумент называется --category, dest 'category'.
+                log.warning("Конфиг: ключ «%s» парсеру неизвестен — пропускаю", k)
                 continue
             cur = getattr(args, arg_key)
             if cur is None or cur == parser.get_default(arg_key):
@@ -8430,7 +9001,7 @@ def main() -> None:
             queries = resolve_categories(cats)
         else:
             queries = resolve_categories(["gt-село"])
-        output = args.output or "kz_routes.xlsx"
+        output = _run_out(args, args.output or "kz_routes.xlsx")
         shard = _parse_shard(args.shard)
         tiles = route_tiles(args.step, args.corridor)
         n_tiles = len(tiles)
@@ -8475,7 +9046,8 @@ def main() -> None:
             queries = resolve_categories(cats)
         else:
             queries = ["АЗС"]
-        output = args.output or "kz_" + re.sub(r"[^\w]+", "_", queries[0])[:20] + ".xlsx"
+        output = _run_out(args, args.output or "kz_"
+                          + re.sub(r"[^\w]+", "_", queries[0])[:20] + ".xlsx")
         shard = _parse_shard(args.shard)
         n_tiles = len(country_grid(args.step))
         if shard:
@@ -8522,7 +9094,7 @@ def main() -> None:
             cats = ["gt"]
         cities = resolve_city_list(args.cities)
         queries = resolve_categories(cats)
-        output = args.output or "kz_cities.xlsx"
+        output = _run_out(args, args.output or "kz_cities.xlsx")
         print(f"\n🇰🇿 СБОР ПО ВСЕМ ГОРОДАМ КАЗАХСТАНА")
         print(f"   Города:    {len(cities)} ({', '.join(cities[:6])}, …)")
         print(f"   Запросы:   {', '.join(queries)}")
@@ -8555,7 +9127,7 @@ def main() -> None:
         else:
             cats = args.category
 
-        output = args.output or f"{args.city}_categories.xlsx"
+        output = _run_out(args, args.output or f"{args.city}_categories.xlsx")
 
         results = run_category_parser(
             city=args.city,
@@ -8583,7 +9155,7 @@ def main() -> None:
         interactive_menu()
         return
 
-    output = args.output or "results.xlsx"
+    output = _run_out(args, args.output or "results.xlsx")
     orgs = run_parser(
         query=args.query,
         max_results=max_results,
@@ -8623,6 +9195,9 @@ def _dispatch_parallel(args, workers: int, headless: bool,
         base.append("--api-intercept")
     if getattr(args, "countries", None):
         base += ["--countries", args.countries]
+    # --new-run воркерам НЕ передаём: папку уже завёл родитель, и каждый
+    # воркер завёл бы себе ещё одну. Путь к общей папке уезжает им в -o.
+    # --run-dir тоже не нужен по той же причине.
     if getattr(args, "url_only", False):
         base.append("--url-only")
     if getattr(args, "fast_api", False):
@@ -8648,7 +9223,7 @@ def _dispatch_parallel(args, workers: int, headless: bool,
 
     # --- трассы: режем тайлы коридора на шарды ---
     if args.routes:
-        output = args.output or "kz_routes.xlsx"
+        output = _run_out(args, args.output or "kz_routes.xlsx")
         base += ["--routes", "--step", str(args.step),
                  "--corridor", str(args.corridor)]
         if args.tile_z:
@@ -8665,7 +9240,7 @@ def _dispatch_parallel(args, workers: int, headless: bool,
 
     # --- вся страна: режем сетку тайлов на шарды ---
     if args.country:
-        output = args.output or "kz_country.xlsx"
+        output = _run_out(args, args.output or "kz_country.xlsx")
         base += ["--country", "--step", str(args.step)]
         if args.tile_z:
             base += ["--tile-z", str(args.tile_z)]
@@ -8681,7 +9256,7 @@ def _dispatch_parallel(args, workers: int, headless: bool,
 
     # --- все города: раздаём города вперемешку ---
     if args.all_cities:
-        output = args.output or "kz_cities.xlsx"
+        output = _run_out(args, args.output or "kz_cities.xlsx")
         cities = resolve_city_list(args.cities)
         # Что уже собрано прошлыми прогонами — заново не трогаем. Это делает
         # расширение списка городов дешёвым: доберутся только новые.
@@ -8794,7 +9369,7 @@ def _dispatch_parallel(args, workers: int, headless: bool,
         if len(queries) < 2:
             log.warning("Запрос всего один — параллелить нечего, иду в один браузер")
             return None
-        output = args.output or f"{args.city}_categories.xlsx"
+        output = _run_out(args, args.output or f"{args.city}_categories.xlsx")
         workers = min(workers, len(queries))
         base += ["--city", args.city]
         shards = [["--category", *chunk]
