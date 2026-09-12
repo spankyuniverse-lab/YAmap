@@ -35,6 +35,7 @@ import math
 import os
 import random
 import re
+import shutil
 import sys
 import time
 import unicodedata
@@ -724,8 +725,11 @@ def run_output_path(output: str, new_run: bool = False,
         legacy = out.exists() or any(
             Path(".").glob(f"{glob.escape(stem)}.w*.cities.json"))
         if legacy and not new_run:
-            log.info("Продолжаю прогон рядом со скриптом: %s "
-                     "(новую папку заведёт --new-run)", out)
+            log.info("Продолжаю прогон рядом со скриптом: %s. Папки с датой "
+                     "у него нет — это раскладка до появления runs/. "
+                     "Разложить по папкам с датой: --migrate-runs (перенесёт "
+                     "собранное, ничего не потеряв). Начать заново в новой "
+                     "папке: --new-run.", out)
             return str(out)
         # Сортируем по времени изменения, а не по имени: суффикс второго
         # старта в ту же минуту («…09-28-2__kz») лексикографически встаёт
@@ -757,6 +761,104 @@ def run_output_path(output: str, new_run: bool = False,
             log.info("Новый прогон — папка %s", d)
     d.mkdir(parents=True, exist_ok=True)
     return str(d / out.name)
+
+
+def _legacy_run_stems() -> dict[str, list[Path]]:
+    """Прогоны, лежащие рядом со скриптом (раскладка до папок runs/).
+
+    Возвращает {имя прогона: [его файлы]}. Имя прогона выводим из СПУТНИКОВ,
+    а не из книги: главная выгрузка может называться как угодно или вовсе
+    отсутствовать (её переименовали, унесли), а части воркеров и прогресс
+    всегда зовутся `<имя>.wN.xlsx`, `<имя>.wN.cities.json`, `<имя>.wN_parts`.
+    Ища только по книгам, мы пропустили бы ровно такой прогон.
+    Чужие книги без спутников не трогаем.
+    """
+    root = Path(".")
+    stems: set[str] = set()
+    pats = (
+        (r"^(.+)\.w\d+\.xlsx$", "*.w*.xlsx"),
+        (r"^(.+)\.finish\.xlsx$", "*.finish.xlsx"),
+        (r"^(.+?)(?:\.w\d+)?\.cities\.json$", "*.cities.json"),
+        (r"^(.+?)(?:\.w\d+)?\.places\.json$", "*.places.json"),
+        (r"^(.+?)\.progress\.json$", "*.progress.json"),
+        (r"^(.+?)(?:\.w\d+)?_parts$", "*_parts"),
+    )
+    for rx, glob_pat in pats:
+        for f in root.glob(glob_pat):
+            m = re.match(rx, f.name)
+            if m and m.group(1):
+                stems.add(m.group(1))
+
+    found: dict[str, list[Path]] = {}
+    for stem in sorted(stems):
+        esc = glob.escape(stem)
+        files = [
+            *root.glob(f"{esc}.xlsx"), *root.glob(f"{esc}.csv"),
+            *root.glob(f"{esc}.json"),
+            *root.glob(f"{esc}.w*.xlsx"), *root.glob(f"{esc}.finish*.xlsx"),
+            *root.glob(f"{esc}.cities.json"), *root.glob(f"{esc}.w*.cities.json"),
+            *root.glob(f"{esc}.w*.places.json"), *root.glob(f"{esc}*.progress.json"),
+            *(d for d in root.glob(f"{esc}*_parts") if d.is_dir()),
+        ]
+        files = [f for f in files if f.exists()]
+        if files:
+            found[stem] = files
+    return found
+
+
+def migrate_legacy_runs(only: str | None = None) -> int:
+    """Перенести прогоны из корня проекта в папки runs/<дата>__<имя>/.
+
+    Зачем: до появления папок всё складывалось рядом со скриптом, и понять,
+    когда какой прогон собран, можно было только по дате файла в Finder.
+    Дату берём с самой свежей выгрузки прогона — то есть папка называется
+    тем днём, когда прогон реально шёл, а не сегодняшним.
+
+    Ничего не перезаписываем: если целевая папка занята, прогон пропускаем.
+    """
+    runs = _legacy_run_stems()
+    if only:
+        only_stem = Path(_ensure_ext(only)).stem
+        runs = {k: v for k, v in runs.items() if k == only_stem}
+    if not runs:
+        print("\nРядом со скриптом прогонов старой раскладки не нашлось — "
+              "переносить нечего.")
+        return 0
+
+    moved_total = 0
+    for stem, files in runs.items():
+        newest = max(f.stat().st_mtime for f in files if f.exists())
+        stamp = time.strftime("%Y-%m-%d_%H-%M", time.localtime(newest))
+        dest = RUNS_DIR / f"{stamp}__{stem}"
+        if dest.exists():
+            print(f"  ПРОПУСК {stem}: папка {dest} уже есть — разберись руками")
+            continue
+        size = sum(f.stat().st_size for f in files if f.is_file())
+        print(f"\n{stem}: {len(files)} файлов, {size / 1024 / 1024:.1f} МБ "
+              f"→ {dest}")
+        dest.mkdir(parents=True)
+        for f in files:
+            if not f.exists():
+                continue
+            shutil.move(str(f), str(dest / f.name))
+            print(f"    {f.name}")
+            moved_total += 1
+    # Одинокие книги не трогаем — у них нет ни частей, ни прогресса, то есть
+    # это готовые выгрузки, а не прогоны. Но сказать о них надо: иначе
+    # выглядит как «перенос сработал не до конца».
+    lone = [b for b in sorted(Path(".").glob("*.xlsx"))
+            if b.stem not in runs and ".w" not in b.stem
+            and not b.stem.endswith("_parts")]
+    if lone:
+        print("\nОставлены как есть (нет частей и прогресса — это готовые "
+              "выгрузки, а не прогоны):")
+        for b in lone:
+            print(f"    {b.name}")
+
+    if moved_total:
+        print(f"\nПеренесено файлов: {moved_total}. Прогон продолжится в своей "
+              f"папке той же командой — путь парсер найдёт сам.")
+    return moved_total
 
 
 def _run_out(args, name: str) -> str:
@@ -9102,6 +9204,13 @@ def main() -> None:
              "--cities \"Алматы,Астана,Шымкент\".",
     )
     parser.add_argument(
+        "--migrate-runs", action="store_true",
+        help="Разложить прогоны, лежащие рядом со скриптом, по папкам "
+             "runs/<дата>__<имя>/. Дата берётся с самой свежей выгрузки "
+             "прогона, то есть папка называется днём, когда он реально шёл. "
+             "Ничего не перезаписывает; с -o переносит только этот прогон.",
+    )
+    parser.add_argument(
         "--new-run", action="store_true",
         help="Начать НОВЫЙ сбор в отдельной папке runs/<дата_время>__<имя>/. "
              "Без флага прогон продолжается в самой свежей папке с этим "
@@ -9224,6 +9333,11 @@ def main() -> None:
     # Список НП по ВЫБРАННЫМ странам. Раньше печатался Казахстан, что бы ни
     # стояло в --countries: справочник, по которому человек решает, что
     # запускать, показывал не ту страну.
+    if getattr(args, "migrate_runs", False):
+        print("\nПереношу прогоны старой раскладки в папки с датой…")
+        migrate_legacy_runs(args.output)
+        return
+
     if args.list_cities:
         set_countries(resolve_countries(getattr(args, "countries", None)))
         flag = {"kz": "🇰🇿", "uz": "🇺🇿", "kg": "🇰🇬"}
