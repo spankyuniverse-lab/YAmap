@@ -2113,9 +2113,15 @@ def _api_template_for(collector: "_ApiCollector | None", query: str) -> str:
     запрос — значит молча собрать не то, поэтому сверяем `text=`.
     """
     url = getattr(collector, "last_url", "") or ""
-    if not url:
+    if not url or _is_static_asset(url):
         return ""
     m = re.search(r"[?&]text=([^&]*)", url)
+    if not m:
+        # Настоящий поисковый запрос всегда несёт text=. Без него это что-то
+        # другое (кусок бандла, служебный вызов) — пагинировать его нельзя.
+        log.debug("fast-api: в шаблоне нет text= — не беру: %s",
+                  url.split("?")[0][-60:])
+        return ""
     if m:
         try:
             got = urllib.parse.unquote_plus(m.group(1)).strip().casefold()
@@ -4951,6 +4957,23 @@ _API_URL_PATTERNS = (
     "/api/search", "/search/", "fetchBusinessesInBbox",
 )
 
+#: Статика, которую широкий шаблон «/search/» ловил как API: фронтенд Яндекса
+#: раздаёт куски бандла по путям вида «chunks/search/<хеш>.css». Их пытались
+#: разобрать как JSON, они съедали бюджет отладочных дампов и попадали в
+#: шаблон запроса для --fast-api (диагностика на живом Яндексе показала
+#: ровно это: «запросы страницы к API» состояли из .css и .js).
+_STATIC_HOSTS = ("yastatic.net", "yandex.st", "avatars.mds.yandex.net")
+_STATIC_EXTS = (".css", ".js", ".mjs", ".png", ".jpg", ".jpeg", ".gif",
+                ".svg", ".webp", ".woff", ".woff2", ".ttf", ".ico", ".map")
+
+
+def _is_static_asset(url: str) -> bool:
+    """Ссылка на статику фронтенда, а не на данные."""
+    if any(h in url for h in _STATIC_HOSTS):
+        return True
+    path = url.split("?", 1)[0].split("#", 1)[0].lower()
+    return path.endswith(_STATIC_EXTS)
+
 # Глобальный счётчик дампов сырых API-ответов (для YAMAP_DEBUG_API).
 _API_DUMP_COUNTER = 0
 
@@ -5052,11 +5075,17 @@ class _ApiCollector:
         url = response.url
         if not any(p in url for p in _API_URL_PATTERNS):
             return
+        if _is_static_asset(url):
+            return
         if response.status != 200:
             return
         try:
             body = response.json()
-        except Exception:
+        except BaseException:
+            # Не Exception: при закрытии контекста Playwright бросает
+            # asyncio.CancelledError, которая наследует BaseException и
+            # проскакивала мимо обработчика — прогон падал трейсбеком уже
+            # после того, как всё собрано.
             return
         self.matched += 1
         # Шаблон для --fast-api берём ТОЛЬКО с поискового эндпоинта: ответ по
@@ -6994,14 +7023,16 @@ def run_probe_api(query: str = "Заправки", headless: bool = True,
     collector = _ApiCollector()
     seen_urls: list[str] = []
     ctx = None
+    page = None
+
+    def _watch(resp: "Response") -> None:
+        if (any(pat in resp.url for pat in _API_URL_PATTERNS)
+                and not _is_static_asset(resp.url)):
+            seen_urls.append(f"{resp.status} {resp.url}")
     try:
         with sync_playwright() as pw:
             _, ctx = _create_browser_context(pw, headless, proxy_url=proxy_url)
             page = _setup_page(ctx)
-
-            def _watch(resp: Response) -> None:
-                if any(pat in resp.url for pat in _API_URL_PATTERNS):
-                    seen_urls.append(f"{resp.status} {resp.url}")
 
             page.on("response", _watch)
             page.on("response", collector.on_response)
@@ -7087,6 +7118,14 @@ def run_probe_api(query: str = "Заправки", headless: bool = True,
     except Exception as exc:
         print(f"\nДиагностика упала: {exc}")
     finally:
+        # Слушателей снимаем ДО закрытия: иначе Playwright успевает прислать
+        # ответ уже закрывающемуся контексту, и прогон падает трейсбеком.
+        try:
+            if page is not None:
+                page.remove_listener("response", _watch)
+                page.remove_listener("response", collector.on_response)
+        except Exception:
+            pass
         # Контекст закрываем в любом случае: при persistent-профиле незакрытый
         # браузер оставляет профиль занятым, и следующий запуск не стартует.
         try:

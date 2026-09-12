@@ -258,6 +258,42 @@ check("дедуп по id: тот же объект с двух полос не 
       len(osm.elements_to_places(_els + _els, kinds=["village"])) == 2)
 
 
+# --- 8b. Статика фронтенда не должна приниматься за API -------------------
+# Найдено диагностикой на живом Яндексе: широкий шаблон «/search/» совпадал
+# с путями бандла вида «chunks/search/<хеш>.css», их пытались разобрать как
+# JSON, они съедали бюджет отладочных дампов и попадали в шаблон --fast-api.
+_STATIC = [
+    "https://maps.yastatic.net/s3/front-maps-static/build/client/desktop/chunks/search/0f78.css",
+    "https://maps.yastatic.net/s3/front-maps-static/build/chunks/search/6625.yandex.ru.js",
+    "https://avatars.mds.yandex.net/get-altay/search/orig.jpg",
+    "https://yandex.kz/maps/api/search/sprite.svg",
+]
+for u in _STATIC:
+    matched = any(p in u for p in y._API_URL_PATTERNS)
+    check(f"статика не принята за API: …{u[-34:]}",
+          matched and y._is_static_asset(u), u)
+
+_REAL = "https://yandex.kz/maps/api/search?text=%D0%97&ll=76.9,43.2&z=12"
+check("настоящий запрос к API проходит фильтр статики",
+      any(p in _REAL for p in y._API_URL_PATTERNS) and not y._is_static_asset(_REAL))
+
+
+# --- 8c. Шаблон для --fast-api обязан нести текст запроса ----------------
+class _Col:
+    def __init__(self, url): self.last_url = url
+
+check("шаблон-статика отвергается",
+      y._api_template_for(_Col("https://maps.yastatic.net/chunks/search/x.js"), "Заправки") == "")
+check("шаблон без text= отвергается (не поисковый запрос)",
+      y._api_template_for(_Col("https://yandex.kz/maps/api/search?ll=1,2"), "Заправки") == "")
+check("шаблон от ЧУЖОГО запроса отвергается",
+      y._api_template_for(_Col("https://yandex.kz/maps/api/search?text=Кафе"), "Заправки Алматы") == "")
+check("годный шаблон берётся",
+      y._api_template_for(
+          _Col("https://yandex.kz/maps/api/search?text=Заправки%20Алматы&page=0"),
+          "Заправки Алматы").endswith("page=0"))
+
+
 # --- 9. Разбор ответа Wikidata (офлайн, без сети) ------------------------
 import fetch_wikidata_places as wd
 
