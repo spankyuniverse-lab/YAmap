@@ -97,6 +97,16 @@ chmod +x setup_mac.sh
 
 Точки вне границы Казахстана отрезаются автоматически.
 
+### Три страны
+
+По умолчанию собираются все три — Казахстан, Узбекистан, Киргизия. Сузить:
+
+```bash
+./run.sh --list-cities                    # что есть по каждой стране
+./watch_gt.sh --all-cities --countries uz --category gt -o uz.xlsx --workers 2 --api-intercept
+./watch_gt.sh --all-cities --countries kz,kg --category gt-село -o kz_kg.xlsx --workers 2 --api-intercept
+```
+
 ### Ускорители (по желанию)
 
 ```bash

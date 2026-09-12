@@ -207,7 +207,9 @@ elements = [
     {"lon": 71.91, "lat": 50.85, "tags": {"place": "village", "name": "Аршалы"}},
     {"lon": 70.00, "lat": 48.00, "tags": {"place": "hamlet", "name:ru": "Актоган"}},
     {"lon": 75.00, "lat": 49.00, "tags": {"place": "hamlet", "name": "Актоган"}},
-    {"lon": 69.28, "lat": 41.31, "tags": {"place": "city", "name": "Ташкент"}},
+    # Настоящая заграница: Омск. Ташкент и Бишкек больше не подходят —
+    # Узбекистан и Киргизия теперь входят в зону сбора.
+    {"lon": 73.37, "lat": 54.99, "tags": {"place": "city", "name": "Омск"}},
     {"lon": 72.00, "lat": 50.00, "tags": {"place": "village"}},
     {"center": {"lon": 68.0, "lat": 45.0}, "tags": {"place": "town", "name": "Полигонное"}},
 ]
@@ -218,7 +220,7 @@ check("одноимённые НП не затирают друг друга",
 check("уточнённое имя ведёт на СВОИ координаты",
       places.get("Актоган") == "70.0000,48.0000"
       and places.get("Актоган (2)") == "75.0000,49.0000", places)
-check("чужой город отрезан полигоном границы", "Ташкент" not in places, sorted(places))
+check("чужой город отрезан полигоном границы", "Омск" not in places, sorted(places))
 check("НП без названия пропущен", len(places) == 4, sorted(places))
 check("way/relation по центру тоже попал", "Полигонное" in places)
 check("формат значения — 'lon,lat' как у KZ_CITIES",

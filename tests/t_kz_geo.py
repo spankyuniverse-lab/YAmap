@@ -213,8 +213,10 @@ def t_routes():
         assert yp._tile_in_region(lon, lat, 0.25)
     # Узкий коридор — строго меньше широкого
     assert len(yp.route_tiles(0.25, corridor=1)) < len(tiles)
-    # Тайлы коридора лежат на решётке национальной сетки (дедуп между режимами)
-    grid = set(yp.country_grid(0.25, bbox=yp.KZ_BBOX, clip=False))
+    # Тайлы коридора лежат на ОБЩЕЙ решётке (дедуп между --routes и --country).
+    # Решётка одна на все активные страны, поэтому и сверяем со всей сеткой,
+    # а не с казахстанским прямоугольником.
+    grid = set(yp.country_grid(0.25, clip=False))
     on_grid = sum(1 for t in tiles if t in grid)
     assert on_grid >= len(tiles) * 0.95, (
         f"тайлы коридора не на решётке: {on_grid}/{len(tiles)}")
