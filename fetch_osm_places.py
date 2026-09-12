@@ -55,7 +55,12 @@ def build_query(kinds: list[str], bbox: tuple[float, float, float, float],
         f'(node["place"~"^({kinds_re})$"]({box});'
         f' way["place"~"^({kinds_re})$"]({box});'
         f' relation["place"~"^({kinds_re})$"]({box}););'
-        f"out center tags;"
+        # ВАЖНО: «out center tags» — это verbosity=tags, то есть БЕЗ
+        # координат: узлы приезжали бы без lat/lon и молча отбрасывались,
+        # и в справочник попадали бы только НП, размеченные полигонами.
+        # «out center» = verbosity по умолчанию (body: теги + координаты)
+        # плюс центр для way/relation.
+        f"out center;"
     )
 
 
@@ -69,7 +74,19 @@ def fetch(query: str, timeout: int = 300, retries: int = 3) -> dict:
                 req = urllib.request.Request(url, data=data,
                                              headers={"User-Agent": UA})
                 with urllib.request.urlopen(req, timeout=timeout) as resp:
-                    return json.loads(resp.read().decode("utf-8"))
+                    data = json.loads(resp.read().decode("utf-8"))
+                # При таймауте или нехватке памяти Overpass отвечает 200,
+                # кладёт объяснение в «remark» и отдаёт УРЕЗАННЫЙ список.
+                # Принять его за полный — значит тихо построить справочник из
+                # огрызка и затереть им прошлый полный файл.
+                remark = str(data.get("remark") or "")
+                if remark:
+                    last_err = RuntimeError(f"Overpass: {remark[:200]}")
+                    print(f"  … {url.split('/')[2]}: частичный ответ "
+                          f"({remark[:120]}) — пробую другое зеркало",
+                          file=sys.stderr)
+                    continue
+                return data
             except Exception as exc:                     # noqa: BLE001
                 last_err = exc
                 print(f"  … {url.split('/')[2]}: {type(exc).__name__}: {exc}",
@@ -129,7 +146,26 @@ def elements_to_places(elements: list[dict],
     out: dict[str, str] = {}
     counts: dict[str, int] = {}
     kept_kinds: dict[str, int] = {}
-    skipped_outside = skipped_noname = 0
+    skipped_outside = skipped_noname = skipped_nocoord = 0
+    # Один и тот же объект приезжает дважды, если страна резалась на полосы
+    # (--step): bbox включает границу, и объект на стыке попадает в обе
+    # выборки. Без дедупа он становился фантомным «Имя (2)» с теми же
+    # координатами — парсер честно обходил его второй раз впустую.
+    seen_ids: set[tuple] = set()
+    unique: list[dict] = []
+    for el in elements:
+        ident = (el.get("type"), el.get("id"))
+        if ident != (None, None):
+            if ident in seen_ids:
+                continue
+            seen_ids.add(ident)
+        unique.append(el)
+    # Нумерация одноимённых НП обязана быть ОДИНАКОВОЙ между запусками:
+    # имена «Актоган (2)» уходят в резюме, и если после перевыкачки номер
+    # достанется другому селу, докачка пропустит одно и соберёт другое
+    # дважды. Порядок ответа Overpass не гарантирован — сортируем сами.
+    elements = sorted(unique, key=lambda e: (str(e.get("type") or ""),
+                                             int(e.get("id") or 0)))
     for el in elements:
         tags = el.get("tags") or {}
         if kinds and tags.get("place") not in kinds:
@@ -140,6 +176,7 @@ def elements_to_places(elements: list[dict],
             continue
         coords = element_coords(el)
         if not coords:
+            skipped_nocoord += 1
             continue
         lon, lat = coords
         if inside is not None and not inside(lon, lat):
@@ -150,9 +187,13 @@ def elements_to_places(elements: list[dict],
         key = name if n == 1 else f"{name} ({n})"
         out[key] = f"{lon:.4f},{lat:.4f}"
         kept_kinds[tags.get("place", "?")] = kept_kinds.get(tags.get("place", "?"), 0) + 1
-    if skipped_outside or skipped_noname:
+    if skipped_outside or skipped_noname or skipped_nocoord:
         print(f"  отброшено: вне границы РК {skipped_outside}, "
-              f"без названия {skipped_noname}", file=sys.stderr)
+              f"без названия {skipped_noname}, без координат {skipped_nocoord}",
+              file=sys.stderr)
+    if skipped_nocoord > len(out):
+        print("  ВНИМАНИЕ: без координат отброшено больше, чем сохранено — "
+              "похоже, Overpass вернул ответ без координат.", file=sys.stderr)
     if kept_kinds:
         print("  по типам: " + ", ".join(f"{k}={v}" for k, v in
                                           sorted(kept_kinds.items(),
@@ -171,6 +212,24 @@ def _load_border_filter():
     except Exception as exc:                             # noqa: BLE001
         print(f"  (полигон границы не подключён: {exc})", file=sys.stderr)
     return None
+
+
+def _dump(elements: list[dict], args, inside, kinds: list[str],
+          partial: bool = False) -> dict[str, str]:
+    """Собрать справочник и записать его атомарно. Возвращает записанное."""
+    places = elements_to_places(elements, inside=inside, kinds=kinds)
+    if not places:
+        return {}
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    tmp = out.with_suffix(out.suffix + ".tmp")
+    tmp.write_text(json.dumps(places, ensure_ascii=False, indent=1),
+                   encoding="utf-8")
+    tmp.replace(out)
+    if partial:
+        print(f"  промежуточно сохранено: {len(places)} НП → {out}",
+              file=sys.stderr)
+    return places
 
 
 def main() -> int:
@@ -221,23 +280,26 @@ def main() -> int:
     elements: list[dict] = []
     for i, box in enumerate(boxes, 1):
         print(f"[{i}/{len(boxes)}] полоса широт {box[1]:.1f}..{box[3]:.1f}° …")
-        data = fetch(build_query(kinds, box), timeout=args.timeout)
+        try:
+            data = fetch(build_query(kinds, box), timeout=args.timeout)
+        except RuntimeError as exc:
+            # Полосы копились только в памяти: отказ на последней терял всю
+            # выкачку целиком. Сохраняем то, что уже есть, и идём дальше.
+            print(f"  полоса не далась: {exc}", file=sys.stderr)
+            if elements:
+                _dump(elements, args, inside, kinds, partial=True)
+            continue
         got = data.get("elements") or []
         print(f"  получено элементов: {len(got)}")
         elements.extend(got)
         if i < len(boxes):
             time.sleep(2)          # вежливость к публичному инстансу
 
-    places = elements_to_places(elements, inside=inside, kinds=kinds)
+    places = _dump(elements, args, inside, kinds)
     if not places:
         print("Пусто — ничего не сохраняю.", file=sys.stderr)
         return 1
-
     out = Path(args.out)
-    tmp = out.with_suffix(out.suffix + ".tmp")
-    tmp.write_text(json.dumps(places, ensure_ascii=False, indent=1),
-                   encoding="utf-8")
-    tmp.replace(out)
     print(f"\nГотово: {len(places)} населённых пунктов → {out}")
     print(f"Теперь можно гнать парсер по ним:\n"
           f"  ./run.sh --all-cities --cities osm --category gt-село "

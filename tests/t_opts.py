@@ -134,15 +134,24 @@ with tempfile.TemporaryDirectory() as td:
     argline = " ".join(a for sh in shards for a in sh)
     check("длинный список передан файлом, а не простынёй в argv",
           "@" in argline and len(argline) < 500, argline[:120])
-    files = sorted(td.glob("*.cities.txt"))
+    files = sorted(td.glob("*.places.json"))
     check("файлы со списками созданы", len(files) == 2, [f.name for f in files])
+    check("имя файла не совпадает с прогрессом воркера (.cities.json)",
+          not list(td.glob("*.cities.json")), [f.name for f in td.glob("*")])
     if files:
-        got = files[0].read_text(encoding="utf-8").splitlines()
-        check("в файле — имена по строкам, половина списка",
-              len(got) == 1500 and got[0].startswith("Аул"), len(got))
-        # ровно те же имена парсер и прочтёт обратно
+        got = json.loads(files[0].read_text(encoding="utf-8"))
+        check("в файле — половина списка", len(got) == 1500, len(got))
+        # Главное: воркер должен получить КООРДИНАТЫ, иначе вьюпорт уедет
+        # в центр страны и село будет искаться по карте всего Казахстана.
+        check("в файле лежат координаты, а не только имена",
+              all("," in v for v in got.values()),
+              list(got.items())[:2])
+        names = y.resolve_city_list(f"@{files[0]}")
         check("файл читается обратно тем же resolve_city_list",
-              y.resolve_city_list(f"@{files[0]}") == got)
+              set(names) == set(got))
+        y.set_viewport(city=names[0])
+        check("после чтения файла вьюпорт встаёт на НП, а не на центр страны",
+              y.MAP_LL == got[names[0]], (y.MAP_LL, got[names[0]]))
     check("флаги --url-only и --fast-api уехали воркерам",
           "--url-only" in base and "--fast-api" in base, base)
 
@@ -225,7 +234,21 @@ with tempfile.TemporaryDirectory() as td:
 
 check("запрос Overpass содержит нужные типы и bbox",
       all(k in osm.build_query(["village", "hamlet"], osm.KZ_BBOX)
-          for k in ("village", "hamlet", "46.4", "55.5", "out center tags")))
+          for k in ("village", "hamlet", "46.4", "55.5")))
+check("запрос просит координаты узлов (out center, не out center tags)",
+      "out center;" in osm.build_query(["village"], osm.KZ_BBOX)
+      and "out center tags" not in osm.build_query(["village"], osm.KZ_BBOX))
+
+# нумерация одноимённых НП не зависит от порядка ответа Overpass
+_els = [{"type": "node", "id": 2, "lon": 75.0, "lat": 49.0,
+         "tags": {"place": "village", "name": "Актоган"}},
+        {"type": "node", "id": 1, "lon": 70.0, "lat": 48.0,
+         "tags": {"place": "village", "name": "Актоган"}}]
+_a = osm.elements_to_places(list(_els), kinds=["village"])
+_b = osm.elements_to_places(list(reversed(_els)), kinds=["village"])
+check("нумерация «(2)» одинакова при любом порядке ответа", _a == _b, (_a, _b))
+check("дедуп по id: тот же объект с двух полос не даёт фантом «(2)»",
+      len(osm.elements_to_places(_els + _els, kinds=["village"])) == 2)
 
 print("\n" + ("✅ ОПЦИИ ОК" if not fails else f"❌ ПРОВАЛЫ: {fails}"))
 sys.exit(1 if fails else 0)

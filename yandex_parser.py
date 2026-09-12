@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import glob
 import json
 import logging
 import math
@@ -163,7 +164,7 @@ KZ_CITIES_EXTRA: dict[str, str] = {
     "Приозёрск": "73.7000,46.0333",
     "Каражал": "70.8000,48.0333",
     "Каркаралинск": "75.4667,49.4000",
-    "Атасу": "71.6500,48.6833",
+    "Жанаарка": "71.6500,48.6833",
     # Павлодарская
     "Экибастуз": "75.3167,51.7244",
     "Аксу": "76.9167,52.0333",
@@ -279,10 +280,8 @@ KZ_SETTLEMENTS: dict[str, str] = {
     "Деркул": "51.2800,51.2500",
     "Хан Ордасы": "47.3600,48.6800",
     "Семиглавый Мар": "50.0800,51.1400",
-    "Федоровка": "51.7700,51.2200",
     "Январцево": "52.0000,51.2500",
-    "Акжаик": "51.1700,50.2000",
-    "Бударино": "51.2000,50.9000",
+    "Бударино": "50.9800,50.4800",
     "Актогай": "74.9800,48.3200",
     "Ботакара": "73.7100,50.0600",
     "Киевка": "71.5500,50.2600",
@@ -315,7 +314,7 @@ KZ_SETTLEMENTS: dict[str, str] = {
     "Егиндыбулак": "76.3900,49.7900",
     "Спасск": "73.2800,49.5400",
     "Токаревка": "73.1000,49.5500",
-    "Кызылжар": "73.0000,49.9000",
+    "Кызылжар": "72.4500,50.2100",
     "Жартас": "73.1000,49.6000",
     "Нура": "72.9700,50.4700",
     "Айтеке би": "62.1500,45.8500",
@@ -323,7 +322,7 @@ KZ_SETTLEMENTS: dict[str, str] = {
     "Жалагаш": "64.6800,45.0800",
     "Теренозек": "65.0500,44.8200",
     "Тасбогет": "65.5600,44.7800",
-    "Белкол": "65.3200,44.9500",
+    "Белколь": "65.5600,44.8500",
     "Саксаульск": "61.1000,47.0300",
     "Жаксыкылыш": "62.0000,46.8700",
     "Торетам": "63.3400,45.6300",
@@ -375,8 +374,6 @@ KZ_SETTLEMENTS: dict[str, str] = {
     "Зангар": "77.1900,52.4900",
     "Мичурино": "76.8200,52.4800",
     "Урлютюб": "75.0300,53.7200",
-    "Качиры": "76.0500,53.4800",
-    "Кашыр": "76.1000,53.2000",
     "Саумалколь": "68.1100,53.2900",
     "Талшик": "71.8700,53.6400",
     "Смирново": "69.4300,54.5100",
@@ -414,10 +411,8 @@ KZ_SETTLEMENTS: dict[str, str] = {
     "Карсакпай": "66.7500,47.8300",
     "Актас (Улытау)": "66.3700,48.0600",
     "Амангельды": "65.4500,48.1700",
-    "Киякты": "65.3300,47.8300",
     "Косколь": "64.5600,47.5800",
-    "Мибулак": "68.2300,46.9400",
-    "Сарысу": "67.1400,46.2700",
+    "Мыйбулак": "68.9800,47.3200",
     "Борсенгир": "68.5700,47.9000",
     "Теректы (Улытау)": "68.5400,48.0700",
     "Алгабас": "68.0500,48.8800",
@@ -425,7 +420,7 @@ KZ_SETTLEMENTS: dict[str, str] = {
     "Коргасын": "66.6600,49.2200",
     "Шенбер": "67.4200,49.7200",
     "Кызылжар (Улытау)": "69.6500,48.3000",
-    "Тугускен": "69.9900,48.3700",
+    "Тогускен": "69.9900,48.3700",
     "Ералиев": "70.3700,48.6500",
     "Актубек": "71.1100,48.5800",
     "Актау (Улытау)": "71.4500,47.7500",
@@ -514,7 +509,6 @@ KZ_SETTLEMENTS: dict[str, str] = {
     "Октябрьское": "65.6800,52.1100",
     "Силантьевка": "64.2500,53.0900",
     "Торгай": "63.5000,49.6300",
-    "Тарановское": "65.7300,52.7700",
     "Шаян": "69.3800,43.0300",
     "Жетысай": "68.3300,40.7800",
     "Казыгурт": "69.3800,41.7600",
@@ -680,6 +674,11 @@ KZ_SETTLEMENTS: dict[str, str] = {
 KZ_PLACES_ALL: dict[str, str] = {**KZ_SETTLEMENTS, **KZ_CITIES_ALL}
 
 
+#: Снимок справочника на момент импорта. Воркер-подпроцесс знает ровно его,
+#: поэтому родитель обязан передавать координаты всех НП, которых тут нет.
+_KZ_PLACES_BUILTIN: dict[str, str] = dict(KZ_PLACES_ALL)
+
+
 def _query_place_name(place: str) -> str:
     """Имя НП для ТЕКСТА поискового запроса: без скобочного уточнения области.
 
@@ -735,6 +734,8 @@ def load_osm_places(path: str | Path = OSM_PLACES_FILE) -> list[str]:
         if name not in KZ_PLACES_ALL:
             KZ_PLACES_ALL[name] = ll
             added += 1
+    if added:
+        _refresh_locality_index()
     log.info("OSM-справочник: %d НП из %s (новых для парсера: %d)",
              len(names), p, added)
     return names
@@ -918,16 +919,24 @@ def _tile_in_kz(lon: float, lat: float, span: float) -> bool:
     return False
 
 
-def _zoom_for_span(span_deg: float, overlap: float = 1.35) -> int:
-    """Подобрать зум карты так, чтобы видимое окно (bbox) ≈ размеру тайла.
+def _zoom_for_span(span_deg: float, lat: float = 48.0,
+                   overlap: float = 1.35) -> int:
+    """Подобрать зум карты так, чтобы видимое окно накрыло тайл целиком.
 
-    Выдача Яндекса ограничена тем, что попало в видимый bbox — значит зум и
-    размер тайла должны быть согласованы: span(z) ≈ step (× запас на перекрытие,
-    чтобы не было дыр между тайлами). Калибровка span(z) ≈ 1500/2^z° взята из
-    реального URL Яндекс.Карт (z=5.57 → sspn≈31.7°). Смещаем в сторону БОльшего
-    окна (floor) — перекрытие безопасно (дедуп уберёт), дыры недопустимы.
+    Калибровка span(z) ≈ 1500/2^z° снята с реального URL Яндекс.Карт и
+    описывает охват ПО ДОЛГОТЕ. По широте окно накрывает меньше: в проекции
+    Меркатора градус широты «дороже» градуса долготы в cos(lat) раз, а окно
+    браузера вдобавок шире, чем выше. Раньше это не учитывалось совсем, и при
+    дефолтном шаге между рядами тайлов оставались непросмотренные полосы —
+    тем шире, чем севернее.
+
+    Поправку берём по cos(lat): точных пропорций окна мы не знаем, но
+    направление ошибки известно, и эта поправка расширяет окно ровно на один
+    уровень зума. Лишнее перекрытие безвредно — дедуп уберёт; пропущенная
+    полоса необратима.
     """
-    target = max(0.01, span_deg * overlap)
+    lat_scale = max(0.3, math.cos(math.radians(max(-85.0, min(85.0, lat)))))
+    target = max(0.01, span_deg * overlap / lat_scale)
     z = int(math.floor(math.log2(1500.0 / target)))
     return max(4, min(17, z))
 
@@ -1023,7 +1032,7 @@ KZ_ROUTES: list[tuple[str, list[tuple[float, float]]]] = [
         (71.43, 51.17), (72.2, 51.35), (73.1, 51.62), (74, 51.6),
         (74.8, 51.66), (75.32, 51.72), (76, 51.95), (76.95, 52.29),
     ]),
-    ("Караганда—Атасу—Жезказган—Кызылорда", [
+    ("Караганда—Жанаарка—Жезказган—Кызылорда", [
         (73.09, 49.8), (72.4, 49.55), (72, 49.1), (71.64, 48.68),
         (70.8, 48.45), (70, 48.2), (69.1, 48), (68.4, 47.9),
         (67.71, 47.78), (67.3, 47.1), (66.9, 46.4), (66.4, 45.7),
@@ -1075,11 +1084,7 @@ KZ_ROUTES: list[tuple[str, list[tuple[float, float]]]] = [
         (51.92, 47.11), (51.17, 47.02), (50.4, 46.9), (49.8, 46.75),
         (49.27, 46.6), (48.85, 46.62),
     ]),
-    ("Семей—Усть-Каменогорск", [
-        (80.23, 50.41), (80.9, 50.2), (81.55, 49.96), (82.1, 49.95),
-        (82.61, 49.95),
-    ]),
-    ("Семей—Ауыл (граница РФ, на Рубцовск/Барнаул)", [
+        ("Семей—Ауыл (граница РФ, на Рубцовск/Барнаул)", [
         (80.23, 50.41), (80.6, 50.8), (80.97, 51.2),
     ]),
     ("Усть-Каменогорск—Шемонаиха—Убинка (граница РФ, на Змеиногорск)", [
@@ -1156,11 +1161,23 @@ def route_tiles(step_deg: float = COUNTRY_STEP_DEG, corridor: int = 3,
 # Яндекс у организаций вне страны поиска пишет страну/регион в адресе — по ним
 # и режем. Казахстанские адреса этих маркеров не содержат.
 _FOREIGN_ADDR_RE = re.compile(
-    r"(?:\bУзбекистан\b|\bТашкент|\bКыргызстан\b|\bКиргизия\b|\bБишкек|"
-    r"\bТуркменистан\b|\bРоссия\b|\bОмская обл|\bНовосибирская обл|"
-    r"\bОренбургская обл|\bАстраханская обл|\bСамарская обл|\bСаратовская обл|"
-    r"\bВолгоградская обл|\bЧелябинская обл|\bКурганская обл|\bТюменская обл|"
-    r"\bАлтайский край|\bКитай\b|\bСиньцзян)",
+    r"(?:\bУзбекистан\b|\bКыргызстан\b|\bКиргизия\b|\bТуркменистан\b"
+    r"|\bРоссия\b|\bКитай\b|\bСиньцзян"
+    # Города пишем С ПРАВОЙ ГРАНИЦЕЙ СЛОВА. Без неё «Ташкент» совпадал с
+    # «Ташкентская улица» (такая есть в Алматы, Шымкенте, Таразе), а «Бишкек»
+    # — с «Бишкекская»: казахстанские адреса молча выбрасывались, причём
+    # гуще всего именно в приграничных тайлах, ради которых фильтр и писан.
+    r"|\bТашкент\b|\bБишкек\b|\bНукус\b|\bУргенч\b|\bИнин\b"
+    # Зарубежные регионы — по слову «обл/край/велаят/автономн»: так они не
+    # цепляют казахстанские улицы «Омская», «Самарская» и т.п.
+    r"|\bТашкентская обл|\bСырдарьинская обл|\bДжизакская обл"
+    r"|\bНавоийская обл|\bХорезмская обл|\bКаракалпакстан"
+    r"|\bЧуйская обл|\bТаласская обл|\bИссык-Кульская обл|\bНарынская обл"
+    r"|\bОмская обл|\bНовосибирская обл|\bОренбургская обл"
+    r"|\bАстраханская обл|\bСамарская обл|\bСаратовская обл"
+    r"|\bВолгоградская обл|\bЧелябинская обл|\bКурганская обл"
+    r"|\bТюменская обл|\bАлтайский край|\bРеспублика Алтай|\bРесп\. Алтай"
+    r"|\bИли-Казахская|\bвелаят)",
     re.IGNORECASE,
 )
 
@@ -1260,8 +1277,10 @@ URL_ONLY = False
 #: при этом настоящие — для Яндекса это запрос его собственного фронтенда.
 FAST_API = False
 
-#: Сколько страниц API просить максимум на один запрос (страховка от цикла).
-FAST_API_MAX_PAGES = 40
+#: Жёсткий потолок страниц на запрос — страховка от бесконечного цикла.
+#: Рабочее число страниц считается из запрошенного лимита (-n), так что при
+#: обычных лимитах сюда не упираемся.
+FAST_API_MAX_PAGES = 400
 
 #: fetch выполняется В КОНТЕКСТЕ СТРАНИЦЫ: тот же origin, те же куки.
 _FAST_API_JS = """
@@ -1299,15 +1318,75 @@ def _bump_page(url: str, page_no: int, page_size: int = 20) -> str:
 
     Яндекс листает то `page`, то `skip`/`offset` — подменяем тот, что есть,
     а если нет ни одного, дописываем `page`.
+
+    Строку запроса разбираем ВРУЧНУЮ по верхнеуровневым «&», а не регуляркой
+    по всему URL и не через urlencode: регулярка правила «page=» внутри
+    вложенного URL в значении параметра, а urlencode перекодировал бы
+    значения — для подписанного запроса Яндекса это смерть. Значения при
+    таком разборе остаются байт в байт.
     """
-    for key in ("page", "p"):
-        if re.search(rf"[?&]{key}=\d+", url):
-            return re.sub(rf"([?&]{key}=)\d+", rf"\g<1>{page_no}", url)
-    for key in ("skip", "offset"):
-        if re.search(rf"[?&]{key}=\d+", url):
-            return re.sub(rf"([?&]{key}=)\d+", rf"\g<1>{page_no * page_size}", url)
-    sep = "&" if "?" in url else "?"
-    return f"{url}{sep}page={page_no}"
+    head, sep, query = url.partition("?")
+    if not sep:
+        return f"{url}?page={page_no}"
+    pairs = query.split("&")
+
+    def _set(key: str, value: int) -> str | None:
+        out, done = [], False
+        for pair in pairs:
+            if not done and pair.split("=", 1)[0] == key:
+                out.append(f"{key}={value}")
+                done = True
+            else:
+                out.append(pair)
+        return f"{head}?{'&'.join(out)}" if done else None
+
+    for key, mult in (("page", 1), ("p", 1),
+                      ("skip", page_size), ("offset", page_size)):
+        got = _set(key, page_no * mult)
+        if got is not None:
+            return got
+    return f"{url}&page={page_no}"
+
+
+def _has_more(data: dict) -> bool | None:
+    """Флаг «есть ещё страницы», если он вообще есть в ответе.
+
+    Ищем и на верхнем уровне, и во вложенном `data` (items лежат то там, то
+    там), и принимаем не только настоящий False, но и строку/ноль.
+    """
+    inner = data.get("data") if isinstance(data.get("data"), dict) else {}
+    for holder in (data, inner):
+        for key in ("hasMore", "has_more", "hasNextPage"):
+            if key in holder:
+                v = holder[key]
+                if isinstance(v, str):
+                    return v.strip().lower() not in ("false", "0", "")
+                return bool(v)
+    return None
+
+
+def _api_template_for(collector: "_ApiCollector | None", query: str) -> str:
+    """Шаблон запроса к API из перехвата — если он ТОЧНО про наш запрос.
+
+    `last_url` перезаписывается любым подходящим ответом, включая карточку
+    организации и запрос по ещё недопечатанному тексту. Спагинировать чужой
+    запрос — значит молча собрать не то, поэтому сверяем `text=`.
+    """
+    url = getattr(collector, "last_url", "") or ""
+    if not url:
+        return ""
+    m = re.search(r"[?&]text=([^&]*)", url)
+    if m:
+        try:
+            got = urllib.parse.unquote_plus(m.group(1)).strip().casefold()
+        except Exception:
+            got = ""
+        want = (query or "").strip().casefold()
+        if got and want and got not in want and want not in got:
+            log.debug("fast-api: перехваченный шаблон про «%s», а мы ищем «%s» "
+                      "— шаблон не беру", got, query)
+            return ""
+    return url
 
 
 def _fast_api_fetch(page: Page, url: str) -> dict | None:
@@ -1326,54 +1405,112 @@ def _fast_api_fetch(page: Page, url: str) -> dict | None:
 
 
 def _collect_via_api(page: Page, query: str, max_results: int,
-                     collector: "_ApiCollector | None" = None) -> list[Organization] | None:
+                     collector: "_ApiCollector | None" = None,
+                     on_org: Any = None) -> list[Organization] | None:
     """Собрать выдачу постраничными запросами к API. None — путь не сработал.
 
-    None (а не пустой список) означает «откатись на обычный сбор»: пустой
-    список — это законный ответ «тут ничего нет», и путать их нельзя, иначе
-    пустые тайлы свипа каждый раз прокручивались бы браузером впустую.
+    None (а не пустой список) означает «откатись на обычный сбор». Пустой
+    список возвращаем ТОЛЬКО когда API прямо сказал, что тут ноль результатов:
+    перепутать эти два случая — значит принять молчание сломанного API за
+    честное «здесь ничего нет» и оставить дыру в покрытии, которую докачка
+    уже не закроет.
+
+    Поэтому откатываемся всегда, когда собранное может оказаться неполным:
+    ответ не разобрался, оборвался в середине, пагинация не двигается.
     """
-    template = getattr(collector, "last_url", "") if collector else ""
+    template = _api_template_for(collector, query)
     if template:
         log.debug("fast-api: шаблон из перехвата: %s", template.split("?")[0])
 
     orgs: list[Organization] = []
     seen: set[str] = set()
     total_expected = 0
-    for page_no in range(FAST_API_MAX_PAGES):
-        url = _bump_page(template, page_no) if template else api_search_url(query, page_no)
+    page_size = 0
+    # Сколько страниц может понадобиться под запрошенный лимит. Раньше потолок
+    # был жёстким (40 страниц ≈ 800 организаций) и срабатывал молча: при
+    # `-n 5000` быстрый путь отдавал 800 и рапортовал об успехе.
+    want = max_results if max_results and max_results > 0 else DEFAULT_MAX_RESULTS
+    max_pages = max(2, min(FAST_API_MAX_PAGES, math.ceil(want / 20) + 2))
+
+    def _incomplete() -> bool:
+        """Есть основания считать, что собрано не всё."""
+        return bool(total_expected) and len(orgs) < min(total_expected, want)
+
+    for page_no in range(max_pages):
+        url = (_bump_page(template, page_no, page_size or 20) if template
+               else api_search_url(query, page_no))
         data = _fast_api_fetch(page, url)
+
         if data is None:
-            if page_no == 0:
-                return None                    # API не дался — обычный путь
-            break                              # часть собрали — отдаём что есть
-        items = _find_api_items(data)
-        if not items:
+            if page_no == 0 or _incomplete():
+                log.info("fast-api: ответ не получен на стр. %d (собрано %d"
+                         "%s) — отдаю запрос обычному сбору", page_no, len(orgs),
+                         f" из {total_expected}" if total_expected else "")
+                return None
             break
+
         total = _extract_total_count(data)
         if total.isdigit():
             total_expected = max(total_expected, int(total))
+        items = _find_api_items(data)
+
+        if not items:
+            if page_no == 0:
+                # Ноль на первой же странице. «Честный ноль» — это только
+                # явное total=0 в ответе; всё остальное (чужая форма JSON,
+                # {"error": …} с кодом 200) — повод отдать запрос обычному
+                # сбору, а не записать пустоту как результат.
+                if total == "0":
+                    log.info("fast-api: «%s» — API отвечает, что результатов нет", query)
+                    return []
+                log.info("fast-api: ответ есть, но организаций в нём не видно "
+                         "(форма JSON незнакомая) — отдаю запрос обычному сбору")
+                return None
+            break
+
+        page_size = max(page_size, len(items))
         added = 0
-        for it in items:
-            org = _org_from_item(it, total)
+        for item in items:
+            org = _org_from_item(item, total)
             if not org or not org.name:
                 continue
             key = _dedup_key(org)
             if key in seen:
                 continue
             seen.add(key)
-            org.search_query = org.search_query or query
             orgs.append(org)
             added += 1
+            if on_org is not None:
+                try:
+                    on_org(org)
+                except Exception:
+                    pass
             if max_results and len(orgs) >= max_results:
                 log.info("fast-api: «%s» — %d организаций (лимит)", query, len(orgs))
                 return orgs
+
         if not added:
-            break                              # страница без новых — конец
-        if data.get("hasMore") is False:
+            # Страница вернула ровно то же, что прошлая: сервер не понял наш
+            # параметр страницы. Если по его же счётчику собрано не всё —
+            # это обрезка, а не конец выдачи.
+            if _incomplete():
+                log.info("fast-api: пагинация не двигается (стр. %d повторяет "
+                         "предыдущую, собрано %d из %d) — отдаю запрос обычному "
+                         "сбору", page_no, len(orgs), total_expected)
+                return None
+            break
+
+        if _has_more(data) is False:
             break
         if total_expected and len(orgs) >= total_expected:
             break
+    else:
+        # Потолок страниц исчерпан, а выдача, похоже, не кончилась.
+        if _incomplete():
+            log.warning("fast-api: упёрся в потолок %d страниц, собрано %d из "
+                        "%d — остальное недобрано", max_pages, len(orgs),
+                        total_expected)
+
     log.info("fast-api: «%s» — %d организаций за %d стр.", query, len(orgs),
              page_no + 1)
     return orgs
@@ -1678,7 +1815,18 @@ def _finalize_orgs(orgs: list["Organization"]) -> list["Organization"]:
             alias = f"{_normalize_for_dedup(o.name)}|{addr}"
         pos = index.get(k)
         if pos is None and alias:
-            pos = index.get(alias)
+            cand = index.get(alias)
+            # Alias («имя|адрес») — запасной ключ для склейки записи БЕЗ id с
+            # записью С id. Но две РАЗНЫЕ организации с одинаковым именем и
+            # адресом (сетевые АЗС и магазины в одном селе — типичный случай,
+            # а в сёлах Яндекс часто отдаёт адресом одно лишь название НП)
+            # имеют разные org_id, и склеивать их нельзя: вторая точка молча
+            # исчезала из выгрузки. Берём alias, только если id не спорят.
+            if cand is not None:
+                other = out[cand].org_id or ""
+                mine = o.org_id or ""
+                if not mine or not other or mine == other:
+                    pos = cand
         if pos is None:
             pos = len(out)
             index[k] = pos
@@ -1706,7 +1854,16 @@ class ProxyRotator:
 
     def __init__(self, proxies: list[str] | None = None):
         self._proxies = proxies or []
-        self._index = 0
+        # Стартовая позиция разная у разных воркеров. Иначе все N процессов
+        # независимо создавали ротатор, брали next() и садились на ПЕРВУЮ
+        # строку файла: пользователь дал десять прокси, а с точки зрения
+        # Яндекса запросы шли с одного IP — то есть ровно то, от чего прокси
+        # и заводили.
+        try:
+            worker = int(os.environ.get("YAMAP_WORKER") or 0)
+        except ValueError:
+            worker = 0
+        self._index = (worker - 1) % len(proxies) if proxies and worker > 0 else 0
         self._fail_counts: dict[str, int] = {}
 
     @classmethod
@@ -3683,8 +3840,13 @@ def _extract_total_count(data: dict) -> str:
     if not isinstance(data, dict):
         return ""
     inner = data.get("data") if isinstance(data.get("data"), dict) else {}
-    for holder in (data, inner):
-        for key in ("totalResultCount", "total", "found", "count"):
+    # Ключ перебираем ВНЕШНИМ циклом: точный `totalResultCount`, где бы он ни
+    # лежал, важнее общего `count` на верхнем уровне. Раньше было наоборот, и
+    # конверт {"count": 20, "data": {"totalResultCount": 500}} давал 20 —
+    # пагинация быстрого пути обрывалась на первой странице, а свип считал
+    # тайл ненасыщенным и не дробил его.
+    for key in ("totalResultCount", "total", "found", "count"):
+        for holder in (data, inner):
             v = holder.get(key)
             if isinstance(v, (int, str)) and _s(v):
                 return _s(v)
@@ -4077,7 +4239,24 @@ _STREET_MARKERS = (
     "бульвар", "б-р", "шоссе", "ш.", "тракт", "проезд", "наб",
     "микрорайон", "мкр", "дом", "здание", "квартал", "кв-л",
 )
+#: Маркеры улиц как целые слова (с необязательной точкой сокращения).
+_STREET_RE = re.compile(
+    r"(?<![^\W\d_])(?:" + "|".join(re.escape(m.rstrip(". ")) for m in _STREET_MARKERS)
+    + r")\.?(?![^\W\d_])", re.IGNORECASE)
+
 _KZ_CITIES_LOWER = {_query_place_name(c).lower() for c in KZ_PLACES_ALL}
+
+
+def _refresh_locality_index() -> None:
+    """Пересобрать набор известных НП для `_loose_addr`.
+
+    Нужен после `load_osm_places`: множество считается на импорте, а
+    справочник пополняется в рантайме. Без пересчёта адреса вида
+    «Актоган, ул. Абая, 1» переставали распознаваться как «НП + улица»,
+    и дедуп DOM↔API по таким сёлам разъезжался.
+    """
+    global _KZ_CITIES_LOWER
+    _KZ_CITIES_LOWER = {_query_place_name(c).lower() for c in KZ_PLACES_ALL}
 
 
 def _loose_addr(address: str) -> str:
@@ -4086,7 +4265,11 @@ def _loose_addr(address: str) -> str:
     parts = [p.strip() for p in (address or "").split(",")]
     while len(parts) > 1:
         seg = parts[0].lower()
-        is_street = any(m in seg for m in _STREET_MARKERS)
+        # Маркер улицы ищем ЦЕЛЫМ СЛОВОМ. По подстроке «ул» находилось внутри
+        # «аул Достык» и «Аулиеколь» — сегмент с названием села считался
+        # улицей, не срезался, и та же точка из сниппета (с селом) и из API
+        # (без села) давала два разных ключа, то есть дубль в выгрузке.
+        is_street = bool(_STREET_RE.search(seg))
         if is_street:
             break
         is_locality = (
@@ -4129,7 +4312,11 @@ class _ApiCollector:
         except Exception:
             return
         self.matched += 1
-        self.last_url = url
+        # Шаблон для --fast-api берём ТОЛЬКО с поискового эндпоинта: ответ по
+        # карточке организации сюда тоже попадает, и спагинировать его значит
+        # собрать не то.
+        if "search" in url:
+            self.last_url = url
         orgs = _extract_orgs_from_api_response(body)
 
         # Диагностика: ответ пойман, но ничего не извлекли — покажем форму JSON.
@@ -4288,6 +4475,7 @@ def _atomic_write_text(path: Path, text: str) -> None:
     который все читатели молча считали пустым — и следующая запись затирала
     его уже без старых данных. os.replace атомарен на всех трёх ОС.
     """
+    path.parent.mkdir(parents=True, exist_ok=True)
     tmp = _tmp_path(path)
     tmp.write_text(text, encoding="utf-8")
     os.replace(tmp, path)
@@ -5096,11 +5284,18 @@ def _collect_current_results(
     # получилось (нет доступа, чужой формат) — молча идём обычным путём ниже.
     if FAST_API:
         try:
-            fast = _collect_via_api(page, query, max_results, collector)
+            fast = _collect_via_api(page, query, max_results, collector, on_org)
         except Exception as exc:
             log.debug("fast-api упал (%s) — обычный сбор", exc)
             fast = None
         if fast is not None:
+            # Всё, что страница успела запросить сама, тоже идёт в дело:
+            # иначе быстрый путь молча терял организации, которые попали в
+            # перехват, но не попали в нашу постраничную выборку.
+            try:
+                fast = collector.enrich(fast)
+            except Exception as exc:
+                log.debug("fast-api: обогащение перехватом не вышло: %s", exc)
             if owns_collector:
                 try:
                     page.remove_listener("response", collector.on_response)
@@ -5594,6 +5789,18 @@ def _merge_results_with_resume(
     return grouped
 
 
+def _is_browser_failure(exc: Exception) -> bool:
+    """Похоже ли исключение на «браузер не запустился», а не на сбой поиска."""
+    text = f"{type(exc).__name__}: {exc}".lower()
+    markers = (
+        "executable doesn", "browsertype.launch", "launch_persistent_context",
+        "profile", "target page, context or browser has been closed",
+        "connection closed", "browser closed", "no such file or directory",
+        "failed to launch", "timeout.*waiting for browser",
+    )
+    return any(m in text for m in markers)
+
+
 def run_category_parser(
     city: str,
     categories: list[str],
@@ -5760,6 +5967,14 @@ def run_category_parser(
     except Exception as exc:
         record_error(f"Критическая ошибка прогона: {exc}")
         log.error("Прогон прерван ошибкой: %s", exc)
+        # Браузер не поднялся вообще (занятый профиль, убитый Chrome, нет
+        # дисплея) — это НЕ «в городе ничего не нашлось». Раньше разница
+        # съедалась: функция возвращала пустой результат, вызывающий помечал
+        # НП собранным, воркер пробегал свою половину страны за минуты и
+        # выходил с кодом 0. Родитель его не перезапускал, добор считал всё
+        # собранным, и дыра не находилась никогда. Пробрасываем наверх.
+        if not results and _is_browser_failure(exc):
+            raise
 
     # Финальное сохранение: текущие результаты + resume, финализированные
     grouped = _merge_results_with_resume(results, resume)
@@ -5817,6 +6032,29 @@ def _safe_name(text: str) -> str:
     return cleaned[:60] or "city"
 
 
+#: Насколько далеко от центра поиска организация считается «не отсюда».
+#: Порог грубый (примерно 130 км по широте): цель — не тонкая фильтрация
+#: пригородов, а отсев знаменитого тёзки через полстраны.
+MAX_VIEWPORT_DRIFT_DEG = 1.2
+
+
+def _too_far_from_viewport(org: "Organization", center_ll: str) -> bool:
+    """Организация уехала от центра поиска так далеко, что это чужой тёзка."""
+    if not center_ll:
+        return False
+    try:
+        clon, clat = (float(x) for x in center_ll.split(","))
+        olon, olat = float(org.longitude), float(org.latitude)
+    except (ValueError, AttributeError, TypeError):
+        return False                      # координат нет — судить не по чему
+    if not (-90 <= olat <= 90 and -180 <= olon <= 180):
+        return False
+    # По долготе на северных широтах градус короче — поправка, чтобы порог
+    # означал примерно одно и то же расстояние по всей стране.
+    dlon = abs(olon - clon) * max(0.3, math.cos(math.radians(clat)))
+    return max(abs(olat - clat), dlon) > MAX_VIEWPORT_DRIFT_DEG
+
+
 def run_cities_parser(
     cities: list[str],
     categories: list[str],
@@ -5863,8 +6101,11 @@ def run_cities_parser(
                  len(done), len(seen))
 
     todo = [c for c in cities if c not in done]
-    log.info("Города: %d к сбору (всего %d) | категорий: %d",
-             len(todo), len(cities), len(resolve_categories(categories)))
+    # Как часто перезаписывать общую книгу (см. коммент у сохранения ниже).
+    save_every = 1 if len(todo) <= 60 else 25
+    log.info("Города: %d к сбору (всего %d) | категорий: %d%s",
+             len(todo), len(cities), len(resolve_categories(categories)),
+             f" | общий файл пишу раз в {save_every} НП" if save_every > 1 else "")
 
     for idx, city in enumerate(todo, 1):
         log.info("═══ Город %d/%d: %s ═══", idx, len(todo), city)
@@ -5888,9 +6129,32 @@ def run_cities_parser(
             continue
 
         added = 0
+        foreign = 0
+        far = 0
+        center_ll = KZ_PLACES_ALL.get(city, "")
         for query, orgs in per_city.items():
             bucket = merged.setdefault(query, [])
             for o in orgs:
+                # Приграничные НП (Сарыагаш, Кордай, Жибек жолы) видят чужие
+                # города во вьюпорте. В национальном свипе такие адреса
+                # отсеивались, а здесь нет — и одна и та же ташкентская точка
+                # попадала в выгрузку из режима городов и выбрасывалась из
+                # режима страны, то есть слияние двух файлов давало разное
+                # число строк в зависимости от порядка.
+                if (DOMAIN == "yandex.kz" and o.address
+                        and _FOREIGN_ADDR_RE.search(o.address)):
+                    foreign += 1
+                    continue
+                # Название НП может совпадать с известным городом за тысячу
+                # километров: «Актау» есть и в Карагандинской области, и на
+                # Каспии; «Кызылжар» — это ещё и казахское имя Петропавловска.
+                # Яндекс в таких случаях отдаёт знаменитого тёзку, игнорируя
+                # вьюпорт. Порог намеренно грубый: отсекаем только явный
+                # промах через полстраны, не трогая нормальный разброс по
+                # окрестностям.
+                if _too_far_from_viewport(o, center_ll):
+                    far += 1
+                    continue
                 key = _dedup_key(o)
                 if key in seen:
                     continue
@@ -5898,16 +6162,32 @@ def run_cities_parser(
                 bucket.append(o)
                 added += 1
         done.add(city)
-        log.info("%s: +%d новых (всего %d)", city, added, len(seen))
+        notes = []
+        if foreign:
+            notes.append(f"зарубежных {foreign}")
+        if far:
+            notes.append(f"из чужого региона {far}")
+        log.info("%s: +%d новых (всего %d)%s", city, added, len(seen),
+                 (", отсеяно: " + ", ".join(notes)) if notes else "")
 
         # Инкрементальное сохранение — прерывание не теряет данные.
-        save_xlsx_by_categories(merged, out_path)
+        # Но полная перезапись книги после КАЖДОГО НП квадратична: на 19
+        # городах это копейки, а на справочнике OSM (тысячи НП) — десятки
+        # часов чистой записи Excel. Поэтому на длинных списках сохраняем
+        # пачками. Данные при этом не рискуют: погородная часть в
+        # `<файл>_parts/` пишется всегда, и докачка поднимает НП именно из
+        # частей, а не из общей книги.
+        if idx % save_every == 0 or idx == len(todo):
+            save_xlsx_by_categories(merged, out_path)
         try:
             _atomic_write_text(done_file,
                                  json.dumps(sorted(done), ensure_ascii=False))
         except Exception as exc:
             log.warning("Не сохранил прогресс по городам: %s", exc)
 
+    # Досохраняем, если цикл прервали между пачками.
+    if todo:
+        save_xlsx_by_categories(merged, out_path)
     return merged
 
 
@@ -5967,6 +6247,7 @@ def run_probe_api(query: str = "Заправки", headless: bool = True,
 
     collector = _ApiCollector()
     seen_urls: list[str] = []
+    ctx = None
     try:
         with sync_playwright() as pw:
             _, ctx = _create_browser_context(pw, headless, proxy_url=proxy_url)
@@ -5994,28 +6275,79 @@ def run_probe_api(query: str = "Заправки", headless: bool = True,
                   f"{len(collector.by_key)}")
 
             print("\n3) Пробую наш запрос к API из вкладки…")
-            template = collector.last_url
+            template = _api_template_for(collector, query)
             url = _bump_page(template, 0) if template else api_search_url(query, 0)
             print(f"     {url[:150]}")
             data = _fast_api_fetch(page, url)
             if data is None:
                 print("     ❌ ответ не получен или не JSON")
                 print("     → --fast-api тут НЕ поможет, оставь обычный сбор.")
+                ok_first = False
+                items = []
+                total = ""
             else:
                 items = _find_api_items(data)
                 total = _extract_total_count(data)
+                ok_first = bool(items)
                 print(f"     ✅ JSON получен: организаций в ответе {len(items)}"
                       + (f", всего по запросу {total}" if total else ""))
                 if items:
                     org = _org_from_item(items[0], total)
                     if org:
                         print(f"     Первая: {org.name} | {org.address}")
-                    print("     → --fast-api можно включать.")
                 else:
-                    print("     Ответ пустой — проверь запрос и вьюпорт.")
-            ctx.close()
+                    print("     Организаций в ответе не видно — форма JSON "
+                          "незнакомая; парсер такой ответ не примет.")
+
+            # 4) Главная проверка. Первая страница почти всегда отдаётся: её
+            # только что загрузила сама вкладка. Ломается --fast-api на
+            # ВТОРОЙ странице — там слетает подпись запроса или сервер не
+            # понимает подменённый параметр. Без этой проверки диагностика
+            # обещала «можно включать» ровно в тех случаях, где путь молча
+            # терял выдачу.
+            print("\n4) Проверяю, listается ли вторая страница…")
+            if not ok_first:
+                print("     — пропускаю: первая страница не далась.")
+            else:
+                ids_0 = {(_org_from_item(i, total) or Organization()).org_id
+                         for i in items}
+                url2 = (_bump_page(template, 1, len(items)) if template
+                        else api_search_url(query, 1))
+                print(f"     {url2[:150]}")
+                data2 = _fast_api_fetch(page, url2)
+                if data2 is None:
+                    print("     ❌ вторая страница не отдалась (подпись запроса "
+                          "или сессия привязаны к странице).")
+                    print("     → --fast-api соберёт только первую страницу и "
+                          "сам откатится на обычный сбор. Выигрыша не будет.")
+                else:
+                    items2 = _find_api_items(data2)
+                    ids_1 = {(_org_from_item(i, total) or Organization()).org_id
+                             for i in items2}
+                    fresh = ids_1 - ids_0
+                    if not items2:
+                        print("     Вторая страница пустая — вся выдача "
+                              "помещается в одну. Это нормально.")
+                        print("     → --fast-api можно включать.")
+                    elif not fresh:
+                        print("     ⚠️  Вторая страница повторяет первую — "
+                              "сервер игнорирует наш параметр страницы.")
+                        print("     → --fast-api соберёт только первую страницу "
+                              "и откатится. Выигрыша не будет.")
+                    else:
+                        print(f"     ✅ пришло {len(items2)} организаций, из них "
+                              f"новых {len(fresh)} — пагинация работает.")
+                        print("     → --fast-api можно включать.")
     except Exception as exc:
         print(f"\nДиагностика упала: {exc}")
+    finally:
+        # Контекст закрываем в любом случае: при persistent-профиле незакрытый
+        # браузер оставляет профиль занятым, и следующий запуск не стартует.
+        try:
+            if ctx is not None:
+                ctx.close()
+        except Exception:
+            pass
     print("=" * 62)
 
 
@@ -6111,7 +6443,10 @@ def _done_cities(out_path: Path) -> set[str]:
     бы w2 и был бы собран повторно.
     """
     done: set[str] = set()
-    stem = out_path.stem
+    # Имя файла может содержать глоб-метасимволы (-o "kz[gt].xlsx"), и тогда
+    # паттерн читался как класс символов, прогресс не находился, а НП
+    # собирались заново.
+    stem = glob.escape(out_path.stem)
     # Только формы, которые генерирует сам код (сам файл, части воркеров,
     # добор): глоб stem* цеплял и kz_gt2.cities.json от ДРУГОГО прогона,
     # после чего свежий kz_gt.xlsx честно рапортовал «всё уже собрано».
@@ -6158,11 +6493,25 @@ def _merge_parts(parts: list[Path], out_path: Path) -> list[Organization]:
     """Слить файлы воркеров в один итоговый (с дедупликацией между ними)."""
     merged: list[Organization] = []
     seen: set[str] = set()
+    seen_files: set[Path] = set()
     # Уже существующий итоговый файл тоже подхватываем — иначе повторный запуск
     # с меньшим числом воркеров затёр бы ранее собранное.
-    for src in [out_path, *parts]:
+    # И части ЧУЖИХ прогонов: прогресс `.wN.cities.json` читался со всех
+    # воркеров, а данные — только с воркеров текущего запуска. Убитый
+    # родитель при `--workers 3` + перезапуск с `--workers 2` оставлял
+    # `.w3.xlsx` вечным сиротой: его НП числились собранными, а строки в
+    # итог не попадали никогда.
+    stem = glob.escape(out_path.stem)
+    orphans = sorted(
+        set(out_path.parent.glob(f"{stem}.w*{out_path.suffix}"))
+        | set(out_path.parent.glob(f"{stem}.finish*{out_path.suffix}"))
+    )
+    for src in [out_path, *parts, *orphans]:
         if not src.exists():
             continue
+        if src in seen_files:
+            continue
+        seen_files.add(src)
         for o in _load_existing_orgs(src):
             key = _dedup_key(o)
             if key in seen:
@@ -6306,7 +6655,7 @@ def run_parallel(base_argv: list[str], shards: list[list[str]], output: str,
                 rows.append(f"     w{i}  собрано {cnt}{mark}"
                             + (f"   —   {state}" if state else ""))
                 total += cnt
-            caps = _count_captchas()
+            caps = _count_captchas(len(procs))
             cap_note = f"   ⚠ капч: {caps}" if caps else ""
             print(f"   [{time.strftime('%H:%M:%S')}]  всего ~{total}{cap_note}")
             for row in rows:
@@ -6366,7 +6715,7 @@ def run_parallel(base_argv: list[str], shards: list[list[str]], output: str,
             log.error("Добор не удался: %s", exc)
 
     print_stats(merged, label="Статистика (все воркеры)")
-    _print_health(parts)
+    _print_health(parts, len(parts))
     return len(merged)
 
 
@@ -6417,10 +6766,25 @@ def _worker_state(idx: int) -> str:
     return " · ".join(parts) if parts else "стартует…"
 
 
-def _count_captchas() -> int:
+def _worker_logs(n: int = 0) -> list[Path]:
+    """Логи воркеров ТЕКУЩЕГО прогона (worker1…workerN).
+
+    Глоб `worker*.log` цеплял и логи прошлых шестипоточных запусков: их капчи
+    и ошибки приплюсовывались к сводке текущего, и родитель советовал
+    «уменьши --workers» по завышенной цифре.
+    """
+    if not LOGS_DIR.exists():
+        return []
+    if n and n > 0:
+        return [p for p in (LOGS_DIR / f"worker{i}.log" for i in range(1, n + 1))
+                if p.exists()]
+    return sorted(LOGS_DIR.glob("worker*.log"))
+
+
+def _count_captchas(n: int = 0) -> int:
     """Сколько капч суммарно словили воркеры (по их логам)."""
     total = 0
-    for lf in sorted(LOGS_DIR.glob("worker*.log")) if LOGS_DIR.exists() else []:
+    for lf in _worker_logs(n):
         try:
             text = lf.read_text(encoding="utf-8", errors="replace")
         except Exception:
@@ -6430,9 +6794,9 @@ def _count_captchas() -> int:
     return total
 
 
-def _print_health(parts: list[Path]) -> None:
+def _print_health(parts: list[Path], n: int = 0) -> None:
     """Короткая сводка здоровья прогона: что собралось, что болело."""
-    caps = _count_captchas()
+    caps = _count_captchas(n or len(parts))
     errors: list[str] = []
     for lf in sorted(LOGS_DIR.glob("worker*.log")) if LOGS_DIR.exists() else []:
         try:
@@ -6531,6 +6895,11 @@ def run_country_sweep(
     out_path = Path(output)
     progress_path = out_path.with_name(out_path.name + ".progress.json")
 
+    # Шаг клампим ЗДЕСЬ, до всего остального: country_grid/route_tiles и так
+    # поднимают его до 0.03, а зум и размер тайла в очереди раньше считались
+    # по сырому значению — при `--step 0.005` сетка шла с шагом 0.03, а окно
+    # подбиралось под 0.005, то есть втрое мельче шага (дыры уже по долготе).
+    step_deg = max(0.03, float(step_deg))
     # Зум базового тайла: авто по шагу (span окна ≈ размер тайла), либо явный --tile-z.
     base_z = tile_z if tile_z and tile_z > 0 else _zoom_for_span(step_deg)
 
@@ -6710,7 +7079,7 @@ def run_country_sweep(
                 if saturated:
                     subdivided += 1
                     sub_span = span / 2.0
-                    sub_z = _zoom_for_span(sub_span)   # зум под меньший тайл
+                    sub_z = _zoom_for_span(sub_span, lat)   # зум под меньший тайл (с поправкой на широту)
                     for slon, slat in _subtile_centers(lon, lat, span):
                         # Деление не должно уползать за границу: насыщенный
                         # приграничный тайл (Кордай ↔ Бишкек) иначе дробился
@@ -7182,6 +7551,18 @@ def main() -> None:
     # Имя выходного файла без расширения ломает ВСЮ цепочку частей:
     # `-o 1` даёт части `1.w1` (не читаются как книга) и прогресс `1.cities.json`
     # вместо `1.w1.cities.json`. В итоге воркеры собирают, а слияние даёт ноль.
+    # Значения, при которых сетка получалась бессмысленной, раньше молча
+    # проглатывались: `--step 0` давало 392 тысячи тайлов, `--corridor 4` был
+    # неотличим от 3 (ширина считается нечётными блоками).
+    if args.step is not None and args.step <= 0:
+        raise SystemExit(f"--step должен быть больше нуля (получено {args.step}). "
+                         f"Разумные значения: 0.15 — плотно, {COUNTRY_STEP_DEG} — "
+                         f"по умолчанию, 0.3 — быстрее.")
+    if getattr(args, "corridor", 0) and args.corridor % 2 == 0:
+        log.warning("--corridor %d равен %d: ширина коридора считается "
+                    "нечётными блоками (1, 3, 5). Беру %d.",
+                    args.corridor, args.corridor - 1, args.corridor - 1)
+
     if args.output:
         args.output = _ensure_ext(args.output)
 
@@ -7226,7 +7607,8 @@ def main() -> None:
         if workers < args.workers:
             log.warning("Ограничил до %d браузеров: больше с одного IP почти "
                         "гарантированно даёт капчу на всех сразу", MAX_WORKERS)
-        rc = _dispatch_parallel(args, workers, headless=headless)
+        rc = _dispatch_parallel(args, workers, headless=headless,
+                                proxy_url=proxy_url)
         if rc is not None:
             return
 
@@ -7415,7 +7797,8 @@ def main() -> None:
     print(f"\nГотово! Собрано {len(orgs)} организаций -> {output}")
 
 
-def _dispatch_parallel(args, workers: int, headless: bool) -> int | None:
+def _dispatch_parallel(args, workers: int, headless: bool,
+                       proxy_url: str | None = None) -> int | None:
     """Разложить работу на N воркеров и запустить их. None = делить нечего.
 
     Аргументы воркерам передаём той же командной строкой, что пришла родителю,
@@ -7502,7 +7885,14 @@ def _dispatch_parallel(args, workers: int, headless: bool) -> int | None:
         if already:
             log.info("Уже собрано ранее: %d город(ов) — пропускаю их", len(already))
         if not todo:
-            print(f"\n✅ Все {len(cities)} город(ов) уже собраны в {output} — работы нет.")
+            # Слияние всё равно делаем: части прошлых прогонов могли остаться
+            # не слитыми (убитый родитель), и без этого шага их строки не
+            # попали бы в итог никогда — при том что НП числятся собранными.
+            merged = _merge_parts([], Path(output))
+            print(f"\n✅ Все {len(cities)} город(ов) уже собраны в {output} — "
+                  f"нового сбора нет.")
+            if merged:
+                print(f"   Части прошлых прогонов слиты: {len(merged)} организаций.")
             print("   Хочешь пересобрать заново — удали *.cities.json рядом с файлом.")
             return 0
         cities = todo
@@ -7510,25 +7900,46 @@ def _dispatch_parallel(args, workers: int, headless: bool) -> int | None:
             log.warning("Городов меньше двух — параллелить нечего, иду в один браузер")
             return None
         workers = min(workers, len(cities))
-        cats = list(CATEGORIES.keys()) if args.all_categories else (args.category or ["gt"])
+        # Позиционный запрос раньше сюда не доезжал: воркеры стартовали без
+        # него, попадали в дефолт `["gt"]` и сутки собирали GT-сегмент вместо
+        # того, что просил пользователь.
+        cats = (list(CATEGORIES.keys()) if args.all_categories
+                else (args.category or ([args.query] if args.query else ["gt"])))
         base.append("--all-cities")
         if args.all_categories:
             base.append("--all-categories")
         elif args.category:
             base += ["--category", *args.category]
-        # Список городов уезжает воркерам командной строкой. Для 19-96 городов
-        # это пара килобайт, а вот справочник OSM — тысячи имён, и Windows
-        # обрубает командную строку на ~32 КБ. Длинные списки поэтому кладём
-        # в файл рядом с выгрузкой и передаём «--cities @файл».
+        elif args.query:
+            base.append(args.query)
+        # Список НП уезжает воркерам командной строкой — но ТОЛЬКО если воркер
+        # сам знает их координаты (встроенный справочник). Для НП из OSM
+        # координаты живут лишь в памяти родителя: передав голые имена, мы
+        # получали в воркере вьюпорт «вся страна, z=5», то есть поиск села по
+        # карте всего Казахстана. Поэтому такие списки отдаём файлом СО
+        # СКОБКАМИ И КООРДИНАТАМИ (`{"имя": "lon,lat"}`), который воркер
+        # читает тем же `--cities @файл` и подхватывает координаты.
+        # Заодно файл решает вторую проблему: Windows рубит командную строку
+        # на ~32 КБ, а в справочнике OSM тысячи имён.
         shards = []
         for i, chunk in enumerate(_split_round_robin(cities, workers), 1):
             joined = ",".join(chunk)
-            if len(joined) <= 6000:
+            unknown = [c for c in chunk if c not in _KZ_PLACES_BUILTIN]
+            if not unknown and len(joined) <= 6000:
                 shards.append(["--cities", joined])
                 continue
-            lst = Path(output).with_name(f"{Path(output).stem}.w{i}.cities.txt")
-            _atomic_write_text(lst, "\n".join(chunk))
-            log.info("Воркер %d: %d НП — список передан файлом %s",
+            # ВАЖНО: имя НЕ должно совпадать с прогрессом воркера
+            # («<файл>.wN.cities.json») — иначе воркер затрёт им свой список,
+            # а `_done_cities` прочитает список как «эти НП уже собраны».
+            lst = Path(output).with_name(f"{Path(output).stem}.w{i}.places.json")
+            payload = {c: KZ_PLACES_ALL.get(c, "") for c in chunk}
+            missing = [c for c, ll in payload.items() if not ll]
+            if missing:
+                log.warning("Воркер %d: у %d НП нет координат (%s…) — их "
+                            "вьюпорт будет по центру страны",
+                            i, len(missing), ", ".join(missing[:3]))
+            _atomic_write_text(lst, json.dumps(payload, ensure_ascii=False))
+            log.info("Воркер %d: %d НП — список с координатами передан файлом %s",
                      i, len(chunk), lst.name)
             shards.append(["--cities", f"@{lst}"])
 
@@ -7560,6 +7971,9 @@ def _dispatch_parallel(args, workers: int, headless: bool) -> int | None:
                 max_results_per_category=max_results, headless=headless,
                 detail=args.detail, scroll_pause=args.scroll_pause,
                 api_intercept=args.api_intercept, grid=args.grid,
+                # Прокси добор раньше терял: остальной прогон шёл через него,
+                # а финальный добор выходил с настоящего IP и ловил бан.
+                proxy_url=proxy_url,
                 cooldown_every=args.cooldown_every, cooldown_sec=args.cooldown_sec,
             )
             parts.append(fin_out)

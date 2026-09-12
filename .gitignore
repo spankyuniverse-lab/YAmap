@@ -32,3 +32,4 @@ fake_worker.py
 
 # списки НП, которые родитель передаёт воркерам
 *.cities.txt
+*.places.json
