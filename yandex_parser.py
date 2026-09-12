@@ -4187,6 +4187,33 @@ _JS_SCROLL_STATE = """(sel) => {
 }"""
 
 
+_JS_CARD_COUNT = """(sel) => document.querySelectorAll(sel).length"""
+
+
+def _wait_for_growth(page: Page, item_sel: str, before: int,
+                     budget_ms: int, step_ms: int = 120) -> bool:
+    """Подождать, пока карточек станет больше. True — дождались.
+
+    Раньше тут просто спали фиксированную паузу. Выдача дорисовывается за
+    200-400 мс, а спали мы около секунды — и так на КАЖДОМ круге прокрутки
+    каждого запроса. Ждём по факту: как только карточек прибавилось, идём
+    дальше. Если не прибавилось — выстаиваем тот же бюджет, что и раньше,
+    то есть медленнее не станет никогда.
+    """
+    waited = 0
+    while waited < budget_ms:
+        page.wait_for_timeout(step_ms)
+        waited += step_ms
+        try:
+            if page.evaluate(_JS_CARD_COUNT, item_sel) > before:
+                return True
+        except Exception:
+            # Страница перерисовывается — это не повод считать, что роста
+            # нет; просто досыпаем бюджет.
+            continue
+    return False
+
+
 def _scroll_state(page: Page, container_sel: str | None) -> dict:
     """Высота списка, докрутились ли до низа, можно ли крутить дальше."""
     try:
@@ -4196,7 +4223,8 @@ def _scroll_state(page: Page, container_sel: str | None) -> dict:
         return {}
 
 
-def _human_scroll(page: Page, container_sel: str | None) -> None:
+def _human_scroll(page: Page, container_sel: str | None,
+                  brief: bool = False) -> None:
     """Плавный скролл с имитацией поведения человека.
 
     - Случайная дельта прокрутки (200–700 px)
@@ -4215,13 +4243,13 @@ def _human_scroll(page: Page, container_sel: str | None) -> None:
     total_delta = random.randint(200, 700)
 
     # Иногда (15%) скроллим немного вверх — как будто пересматриваем
-    if random.random() < 0.15:
+    if not brief and random.random() < 0.15:
         up_delta = random.randint(50, 150)
         _do_scroll_step(page, container_sel, -up_delta)
         page.wait_for_timeout(random.randint(300, 800))
 
     # Разбиваем на микро-шаги
-    steps = random.randint(3, 6)
+    steps = random.randint(1, 2) if brief else random.randint(3, 6)
     for i in range(steps):
         step_delta = total_delta // steps
         # Добавляем немного шума к каждому шагу
@@ -4234,7 +4262,7 @@ def _human_scroll(page: Page, container_sel: str | None) -> None:
         page.wait_for_timeout(random.randint(50, 150))
 
     # Иногда (10%) «задумываемся» — длинная пауза
-    if random.random() < 0.10:
+    if not brief and random.random() < 0.10:
         think_ms = random.randint(1500, 3500)
         log.debug("Имитация паузы: %d мс", think_ms)
         page.wait_for_timeout(think_ms)
@@ -4318,7 +4346,18 @@ def _click_show_more(page: Page) -> bool:
     if not label:
         return False
     log.debug("Клик «Показать ещё»: %s", label)
-    page.wait_for_timeout(1200)
+    # Ждём, пока карточек станет больше, а не спим фиксированные 1.2 с.
+    # Бюджет тот же, так что медленнее не станет; быстрее — всегда, когда
+    # порция дорисовалась раньше.
+    item_sel = engine.get("item") or ITEM_SEL
+    if item_sel:
+        try:
+            before = page.evaluate(_JS_CARD_COUNT, item_sel)
+            _wait_for_growth(page, item_sel, before, 1200)
+        except Exception:
+            page.wait_for_timeout(1200)
+    else:
+        page.wait_for_timeout(1200)
     return True
 
 
@@ -4425,11 +4464,16 @@ def _collect_visible_snippets_fallback(page: Page) -> list[Organization]:
 # ---------------------------------------------------------------------------
 
 #: Сколько холостых кругов терпим, пока выдача ЕЩЁ может догрузиться.
+#: Сколько времени запроса НЕ засчитывается как пауза перед следующим.
+#: Загрузка страницы и прокрутка выдачи — это работа, а не выдержка; частоту
+#: обращений к Яндексу снижает только то, что дольше этого.
+QUERY_BASELINE_MS = 10_000
+
 SCROLL_STALE_MAX = 10
 #: …и сколько — когда грузить уже нечего: список целиком виден или мы у
 #: самого низа, высота не меняется, кнопки «Показать ещё» нет. Каждый круг
 #: стоит ~2 с, а таких запросов в прогоне тысячи.
-SCROLL_STALE_FAST = 3
+SCROLL_STALE_FAST = 2
 
 
 def scroll_and_parse(
@@ -4453,6 +4497,7 @@ def scroll_and_parse(
         Список собранных Organization.
     """
     container_sel = _find_scroll_container(page)
+    engine_item_sel = get_selector_engine().get("item") or ITEM_SEL
 
     if container_sel:
         log.info("Скролл-контейнер: %s", container_sel)
@@ -4545,12 +4590,34 @@ def scroll_and_parse(
             log.info("Новые результаты не появляются, завершаем (всего %d)", len(orgs))
             break
 
-        # Плавный человеческий скролл
-        _human_scroll(page, container_sel)
+        # Плавный человеческий скролл. В хвосте (список не растёт, низ
+        # достигнут, кнопки нет) маскировку упрощаем: человек, долиставший до
+        # конца и не увидевший нового, не ёрзает мышью — он уходит. Так
+        # честнее и заодно дешевле.
+        # Считаем карточки В DOM до прокрутки. Сравнивать с числом
+        # организаций нельзя: селектор карточки матчит и вложенные обёртки,
+        # так что в DOM элементов в 2-3 раза больше — «рост» был бы виден
+        # всегда, и пауза схлопнулась бы в ноль.
+        cards_before = -1
+        if engine_item_sel:
+            try:
+                cards_before = page.evaluate(_JS_CARD_COUNT, engine_item_sel)
+            except Exception:
+                cards_before = -1
 
-        # Рандомизированная пауза (±30% от базовой)
-        jitter = scroll_pause * random.uniform(0.7, 1.3)
-        page.wait_for_timeout(int(jitter * 1000))
+        _human_scroll(page, container_sel, brief=settled_rounds > 0)
+
+        # Ждём ПОЯВЛЕНИЯ карточек, а не просто спим. Бюджет тот же, что и
+        # раньше, так что хуже не станет; лучше станет всегда, когда выдача
+        # дорисовывается быстрее паузы.
+        jitter_ms = int(scroll_pause * random.uniform(0.7, 1.3) * 1000)
+        if settled_rounds > 0:
+            # Нечего ждать: мы уже дважды видели, что список не растёт.
+            jitter_ms = min(jitter_ms, 500)
+        if engine_item_sel and cards_before >= 0:
+            _wait_for_growth(page, engine_item_sel, cards_before, jitter_ms)
+        else:
+            page.wait_for_timeout(jitter_ms)
 
     if pbar:
         pbar.close()
@@ -6616,7 +6683,13 @@ def _search_and_collect(
 
         # Вводим запрос через строку поиска (как человек)
         _do_search(page, query, headless)
-        page.wait_for_timeout(random.randint(2500, 4500))
+        # Короткая «человеческая» задержка — и всё. Раньше здесь стояли
+        # плоские 2.5-4.5 секунды, а сразу за ними идёт wait_for_selector,
+        # который ЖДЁТ выдачу по-настоящему: ожидание было продублировано, и
+        # три с половиной секунды на каждый запрос уходили в никуда.
+        # Ритм запросов держат pre_pause выше и пауза между рубриками ниже —
+        # частота обращений к Яндексу не изменилась.
+        page.wait_for_timeout(random.randint(400, 900))
 
         # Один результат Яндекс иногда открывает сразу карточкой — на ней
         # нет списка, и парсер зря решил бы «пусто». Прямой URL поиска
@@ -7503,6 +7576,7 @@ def run_category_parser(
                 continue
 
             log.info("━━━ [%d/%d] %s ━━━", q_idx, total_queries, full_query)
+            q_started = time.time()
 
             orgs = _search_with_retry(
                 page, full_query, max_results_per_category,
@@ -7558,11 +7632,28 @@ def run_category_parser(
                          cooldown_sec, q_idx)
                 page.wait_for_timeout(cooldown_sec * 1000)
 
-            # Адаптивная пауза между категориями (увеличивается при капчах)
+            # Пауза между категориями — до ЗАДАННОГО интервала между
+            # запросами, а не поверх него. Анти-фрод считает частоту
+            # обращений; если сам запрос занял полминуты, Яндекс уже получил
+            # свою паузу, и досыпать сверху нечего. А вот пустая рубрика
+            # отрабатывает за пять секунд — там пауза нужна целиком, и она
+            # остаётся. Пол в 1.2 с держим всегда: совсем без зазора
+            # запросы идут слишком ровно, и это само по себе заметно.
             if q_idx < total_queries:
                 throttle = get_throttle()
-                pause = throttle.get_pause(base_ms=random.randint(3000, 6000))
-                log.debug("Пауза между категориями: %d мс (x%.1f)", pause, throttle.multiplier)
+                want = throttle.get_pause(base_ms=random.randint(3000, 6000))
+                spent_ms = int((time.time() - q_started) * 1000)
+                # Вычитаем не всё время запроса, а только то, что сверх
+                # QUERY_BASELINE_MS. Первые секунды — это загрузка страницы,
+                # они частоту обращений не снижают. Иначе пустая рубрика
+                # (отрабатывает за пять секунд) начала бы уходить каждые
+                # шесть вместо десяти — рост частоты ровно в том сценарии,
+                # где её и надо держать: в ауле пустых рубрик большинство.
+                idle_credit = max(0, spent_ms - QUERY_BASELINE_MS)
+                pause = max(int(want * 0.3), want - idle_credit)
+                log.debug("Пауза между категориями: %d мс (цель %d, запрос "
+                          "занял %d, x%.1f)", pause, want, spent_ms,
+                          throttle.multiplier)
                 page.wait_for_timeout(pause)
 
                 # Иногда (20%) «гуляем» по карте между запросами — выглядит естественно

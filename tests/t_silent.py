@@ -446,6 +446,54 @@ def main() -> int:
         finally:
             os.chdir(start2)
 
+
+    # ============ четвёртая пачка: ускорение не должно снимать защиту ============
+
+    # Пауза между рубриками: быстрый запрос обязан сохранять ПРЕЖНИЙ ритм,
+    # иначе на сельском прогоне (там пустых рубрик большинство) частота
+    # обращений к Яндексу вырастет — то есть капча.
+    def pause_for(spent_ms, want=4500):
+        credit = max(0, spent_ms - y.QUERY_BASELINE_MS)
+        return max(int(want * 0.3), want - credit)
+
+    check("пустая рубрика (5 с) держит прежнюю паузу целиком",
+          pause_for(5000) == 4500, pause_for(5000))
+    check("запрос ровно по базе (10 с) — пауза тоже целиком",
+          pause_for(10000) == 4500, pause_for(10000))
+    check("долгий запрос (25 с) не досыпает сверху — он уже дал зазор",
+          pause_for(25000) < 2000, pause_for(25000))
+    check("пауза никогда не обнуляется — зазор есть всегда",
+          pause_for(10**7) >= 1000, pause_for(10**7))
+    check("цикл быстрой рубрики не стал короче прежнего",
+          5000 + pause_for(5000) >= 9500)
+
+    # Плоское ожидание после ввода запроса убрано — его дублировал
+    # wait_for_selector, который ждёт выдачу по-настоящему.
+    coll3 = src.split("def _search_and_collect(", 1)[1].split("\ndef ", 1)[0]
+    check("после ввода запроса нет плоских 2.5-4.5 с",
+          "random.randint(2500, 4500)" not in coll3)
+    check("короткая человеческая задержка осталась",
+          "random.randint(400, 900)" in coll3)
+
+    # Ожидание по факту появления карточек, а не по таймеру.
+    grow = src.split("def _wait_for_growth(", 1)[1].split("\ndef ", 1)[0]
+    check("ожидание роста выходит досрочно, когда карточек прибавилось",
+          "return True" in grow)
+    check("не дождавшись, выстаивает ВЕСЬ прежний бюджет — медленнее не станет",
+          "while waited < budget_ms" in grow)
+    more = src.split("def _click_show_more(", 1)[1].split("\ndef ", 1)[0]
+    check("«Показать ещё» ждёт подгрузку, а не спит 1.2 с",
+          "_wait_for_growth" in more)
+    check("если селектора карточки нет — старое поведение сохраняется",
+          "page.wait_for_timeout(1200)" in more)
+
+    # Маскировка упрощается ТОЛЬКО в хвосте, когда грузить уже нечего.
+    hs = src.split("def _human_scroll(", 1)[1].split("\ndef ", 1)[0]
+    check("в хвосте не «задумываемся» и не листаем вверх",
+          hs.count("not brief and random.random()") == 2)
+    check("в рабочей прокрутке маскировка прежняя",
+          "random.randint(1, 2) if brief else random.randint(3, 6)" in hs)
+
     print("\n" + ("✅ МОЛЧАЛИВЫЕ БАГИ ЗАКРЫТЫ" if not fails else f"❌ ПРОВАЛЫ: {fails}"))
     return 1 if fails else 0
 
