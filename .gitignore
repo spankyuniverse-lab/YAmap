@@ -2,9 +2,38 @@ __pycache__/
 *.pyc
 .env
 venv/
+.venv/
 results/
+*_parts/
 *.xlsx
 *.csv
-.browser_profile/
+.browser_profile*/
 .yandex_cookies.json
 selectors_cache.json
+logs/
+reports/
+runs/
+*.json
+
+# PyCharm: делимся только готовыми конфигурациями запуска, остальное — личное
+.idea/*
+!.idea/runConfigurations/
+*.iml
+.DS_Store
+
+# артефакты сквозного теста
+tests/e2e*
+tests/logs/
+tests/out/
+tests/speed*
+
+# тестовые артефакты
+crashy_worker.py
+fake_worker.py
+*.flag
+
+# списки НП, которые родитель передаёт воркерам
+*.cities.txt
+*.places.json
+
+wikidata_places.json
