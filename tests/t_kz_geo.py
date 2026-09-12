@@ -5,7 +5,10 @@
 (потерянный тайл = потерянные сёла), ни метать тайлы по чужим столицам
 (Ташкент/Бишкек/Омск внутри KZ_BBOX!).
 """
+import math
+import re
 import sys
+import unicodedata
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -311,6 +314,55 @@ def t_uz_kg_ready():
     assert not dup, f"разные НП с одинаковыми координатами: {dup}"
 
 
+def _km(a: str, b: str) -> float:
+    lon1, lat1 = _ll(a)
+    lon2, lat2 = _ll(b)
+    dx = (lon1 - lon2) * 111 * math.cos(math.radians((lat1 + lat2) / 2))
+    return math.hypot(dx, (lat1 - lat2) * 111)
+
+
+def _base_name(n: str) -> str:
+    """Имя без уточнения области, ё/е и дефисов — для поиска дублей."""
+    s = unicodedata.normalize("NFC", n).lower().replace("ё", "е")
+    s = re.sub(r"\s*\([^)]*\)", "", s).strip()
+    return re.sub(r"[\s\-–—]+", "", s)
+
+
+#: Пары НП, которые правда стоят вплотную. Список именно белый, а не порог
+#: пошире: каждая такая пара должна быть осознанной, потому что один вьюпорт
+#: (z=12, ~20 км) накрывает обе, и вторая — лишний запрос к Яндексу.
+_KNOWN_ADJACENT = {
+    frozenset(("Ахунбабаев", "Джалакудук")),   # оба райцентра Андижанской обл.
+}
+
+
+def t_no_duplicate_places():
+    """Один и тот же НП не должен лежать в справочнике дважды.
+
+    Ловится именно расстоянием, а не сравнением имён: дубль приходит с
+    уточнением области («Дангара» и «Дангара (Ферганская)» — один кишлак),
+    и проверка по точному имени его пропускает. Цена дубля — лишний прогон
+    по той же точке и завышенное число НП, по которому считают сроки.
+    """
+    for code in ("kz", "uz", "kg"):
+        c = yp.COUNTRIES[code]
+        items = list({**c.cities, **c.settlements}.items())
+        for i in range(len(items)):
+            n1, l1 = items[i]
+            for j in range(i + 1, len(items)):
+                n2, l2 = items[j]
+                d = _km(l1, l2)
+                if _base_name(n1) == _base_name(n2):
+                    assert d >= 25, (
+                        f"{code}: «{n1}» и «{n2}» — один и тот же НП "
+                        f"({d:.1f} км)")
+                elif d < 2.0:
+                    assert frozenset((n1, n2)) in _KNOWN_ADJACENT, (
+                        f"{code}: «{n1}» и «{n2}» в {d:.1f} км друг от друга "
+                        f"— один вьюпорт накрывает обе; это либо дубль, либо "
+                        f"ошибка в координатах")
+
+
 def t_single_country_uses_own_domain():
     """Одна страна — её домен и её центр карты.
 
@@ -377,7 +429,7 @@ def main() -> int:
                t_grid_clipped, t_foreign_addr_filter, t_countries, t_settlements,
                t_query_place_name, t_routes, t_city_specs, t_rural_preset,
                t_specs_follow_countries, t_uz_kg_ready,
-               t_single_country_uses_own_domain,
+               t_single_country_uses_own_domain, t_no_duplicate_places,
                t_osm_follows_countries):
         try:
             fn()
