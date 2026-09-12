@@ -82,6 +82,14 @@ def _html(query: str, city: str, page: int, total: int) -> str:
                  href="/maps/org/{o["seoname"]}/{o["id"]}/"></a>
             </li>''' for o in items)
 
+    # Пустая выдача у Яндекса — это не пустая страница, а сообщение. Парсер
+    # обязан отличать его от «выдача не отрисовалась»: в первом случае
+    # повторять запрос незачем, во втором — обязательно.
+    nothing = ("" if items else
+               '<div class="_1x_search-nothing-found-view">'
+               '<h2 class="search-nothing-found-view__header">Ничего не найдено</h2>'
+               '<p>По вашему запросу ничего не нашлось</p></div>')
+
     more = ""
     if has_more:
         more = f'''
@@ -110,6 +118,7 @@ def _html(query: str, city: str, page: int, total: int) -> str:
 <div class="_x_search-list-view">
   <div class="scroll__container"><ul id="list">{snippets}</ul></div>
   {more}
+  {nothing}
 </div>
 
 <script>

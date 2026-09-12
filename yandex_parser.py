@@ -2473,10 +2473,16 @@ def _report_to_md(r: dict) -> str:
     return "\n".join(lines) + "\n"
 
 
-def save_run_report(meta: dict, stats: dict) -> Path | None:
+def save_run_report(meta: dict, stats: dict, files: bool = True) -> Path | None:
     """Сохранить отчёт о прогоне (JSON + Markdown) и дописать history.jsonl.
 
     Вызывается автоматически в конце каждого прогона (даже при частичном сборе).
+
+    files=False — записать только строку в history.jsonl, без пары файлов.
+    Нужно для --all-cities: там «прогон» это каждый населённый пункт, и на
+    пятистах аулах папка reports/ обрастала тысячей файлов, среди которых
+    ничего не найти. Строка в истории от каждого НП остаётся — по ней видно,
+    где было пусто и где ловилась капча.
     """
     try:
         REPORTS_DIR.mkdir(exist_ok=True)
@@ -2489,9 +2495,11 @@ def save_run_report(meta: dict, stats: dict) -> Path | None:
             "stats": stats,
             "errors": list(_RUN_ERRORS),
         }
-        (REPORTS_DIR / f"{stem}.json").write_text(
-            json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
-        (REPORTS_DIR / f"{stem}.md").write_text(_report_to_md(report), encoding="utf-8")
+        if files:
+            (REPORTS_DIR / f"{stem}.json").write_text(
+                json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+            (REPORTS_DIR / f"{stem}.md").write_text(_report_to_md(report),
+                                                    encoding="utf-8")
         with open(REPORTS_DIR / "history.jsonl", "a", encoding="utf-8") as f:
             f.write(json.dumps({
                 "timestamp": report["timestamp"],
@@ -2504,8 +2512,12 @@ def save_run_report(meta: dict, stats: dict) -> Path | None:
                 "output": meta.get("output"),
                 "errors": len(_RUN_ERRORS),
             }, ensure_ascii=False) + "\n")
-        log.info("Отчёт сохранён: reports/%s.json (+ .md), история → reports/history.jsonl", stem)
-        return REPORTS_DIR / f"{stem}.json"
+        if files:
+            log.info("Отчёт сохранён: reports/%s.json (+ .md), история → "
+                     "reports/history.jsonl", stem)
+            return REPORTS_DIR / f"{stem}.json"
+        log.debug("История прогона дописана: reports/history.jsonl (%s)", stem)
+        return None
     except Exception as exc:
         log.debug("Не удалось сохранить отчёт: %s", exc)
         return None
@@ -4052,6 +4064,25 @@ def _find_scroll_container(page: Page) -> str | None:
     return container_sel
 
 
+_JS_SCROLL_STATE = """(sel) => {
+    const el = (sel && document.querySelector(sel))
+               || document.scrollingElement || document.body;
+    const h = el.scrollHeight, c = el.clientHeight, t = el.scrollTop;
+    return {height: h,
+            canScroll: h > c + 4,
+            atBottom: t + c >= h - 8};
+}"""
+
+
+def _scroll_state(page: Page, container_sel: str | None) -> dict:
+    """Высота списка, докрутились ли до низа, можно ли крутить дальше."""
+    try:
+        st = page.evaluate(_JS_SCROLL_STATE, container_sel)
+        return st if isinstance(st, dict) else {}
+    except Exception:
+        return {}
+
+
 def _human_scroll(page: Page, container_sel: str | None) -> None:
     """Плавный скролл с имитацией поведения человека.
 
@@ -4280,6 +4311,14 @@ def _collect_visible_snippets_fallback(page: Page) -> list[Organization]:
 # Streaming scroll + parse: скроллим и парсим на лету
 # ---------------------------------------------------------------------------
 
+#: Сколько холостых кругов терпим, пока выдача ЕЩЁ может догрузиться.
+SCROLL_STALE_MAX = 10
+#: …и сколько — когда грузить уже нечего: список целиком виден или мы у
+#: самого низа, высота не меняется, кнопки «Показать ещё» нет. Каждый круг
+#: стоит ~2 с, а таких запросов в прогоне тысячи.
+SCROLL_STALE_FAST = 3
+
+
 def scroll_and_parse(
     page: Page,
     max_results: int,
@@ -4310,8 +4349,10 @@ def scroll_and_parse(
     orgs: list[Organization] = []
     seen_keys: set[str] = set()   # дедуп по содержимому (имя+адрес)
     stale_rounds = 0
-    max_stale = 10
+    max_stale = SCROLL_STALE_MAX
     unlimited = max_results <= 0   # max_results<=0 → без лимита
+    last_height = -1
+    settled_rounds = 0            # подряд: список не растёт И мы у самого низа
 
     # Прогресс-бар (если tqdm установлен)
     pbar = None
@@ -4347,8 +4388,31 @@ def scroll_and_parse(
             # НЕ сбрасываем stale_rounds по факту клика: реальный прогресс
             # проверится в следующем проходе (new_parsed>0). Иначе кнопка,
             # которая ничего не подгружает, зациклила бы сбор навсегда.
-            _click_show_more(page)
+            clicked = _click_show_more(page)
             stale_rounds += 1
+
+            # Ранний выход. Полные 10 холостых кругов (≈19 с на КАЖДЫЙ
+            # запрос) нужны, только пока есть куда крутить: выдача
+            # догружается по мере прокрутки. Если список уже целиком на
+            # экране или мы упёрлись в низ, высота не растёт и кнопки
+            # «Показать ещё» нет — грузить физически нечего.
+            st = _scroll_state(page, container_sel)
+            height = st.get("height", -1)
+            exhausted = (not st.get("canScroll", True)) or st.get("atBottom", False)
+            if exhausted and not clicked and height == last_height:
+                settled_rounds += 1
+            else:
+                settled_rounds = 0
+            last_height = height
+            if settled_rounds >= SCROLL_STALE_FAST:
+                if detect_captcha(page):
+                    get_throttle().on_captcha()
+                    raise RuntimeError(
+                        f"Капча посреди скролла — собрано лишь {len(orgs)}, "
+                        "запрос надо повторить")
+                log.info("Выдача кончилась: список не растёт, низ достигнут, "
+                         "кнопки «ещё» нет (всего %d)", len(orgs))
+                break
 
         # Проверяем лимиты
         if not unlimited and len(orgs) >= max_results:
@@ -6520,15 +6584,23 @@ def _collect_current_results(
         candidates = [s for s in (item_sel, ITEM_SEL, "[class*='search-snippet']",
                                   "[class*='serp-item']") if s]
         combined = ", ".join(dict.fromkeys(candidates))
+        # Ждём ЛИБО карточки, ЛИБО сообщение «ничего не найдено». Раньше
+        # ждали только карточки и на каждой пустой рубрике выстаивали весь
+        # таймаут, хотя ответ уже был на экране с первой секунды.
+        race = ", ".join(dict.fromkeys([*candidates, *_EMPTY_RESULT_SELECTORS]))
         found = False
         try:
-            page.wait_for_selector(combined, timeout=7000)
-            found = True
+            page.wait_for_selector(race, timeout=7000)
+            found = bool(page.locator(combined).count())
         except Exception:
             found = False
 
         if not found:
-            # Может быть CAPTCHA появилась после загрузки
+            # Может быть CAPTCHA появилась после загрузки.
+            # ВАЖНО: капчу проверяем ДО «ничего не найдено». Иначе бан, на
+            # странице которого попадётся похожая фраза, был бы записан как
+            # честный ноль — запрос помечен выполненным, докачка его больше
+            # не переберёт.
             if detect_captcha(page):
                 # Капчу здесь раньше не считали: троттлинг не замедлялся, а в
                 # отчёте стояло «Капч поймано: 0» при живом бане. Пустой сбор
@@ -6542,6 +6614,12 @@ def _collect_current_results(
                     found = True
                 except Exception:
                     pass
+
+        if not found and _results_say_empty(page):
+            # Честный ноль: страница отрисовалась и сказала, что тут пусто.
+            # Ни автодетекта, ни записи об ошибке — это не поломка.
+            log.info("«%s»: Яндекс ответил «ничего не найдено»", query)
+            return []
 
         if not found:
             # Последний шанс: возможно, Яндекс переименовал классы карточек.
@@ -6593,7 +6671,14 @@ def _collect_current_results(
         except Exception as exc:
             log.debug("SSR-извлечение не удалось: %s", exc)
 
-        if api_intercept:
+        if api_intercept and collector.matched == 0:
+            # Полная прокрутка выдачи только что прошла, и за неё не прилетело
+            # НИ ОДНОГО ответа API. Второй такой же проход их не родит —
+            # значит это чистые 8 секунд прокрутки на каждый запрос ради
+            # гарантированного нуля, да ещё и лишняя активность под капчу.
+            log.info("Доп. проход API пропущен: за прокрутку не было ни одного "
+                     "ответа API (выдача приезжает в SSR)")
+        elif api_intercept:
             # Доп. проход API-скролла — вдруг подтянет ещё страниц с богатыми данными.
             extra = run_api_intercept(page, max_results, scroll_pause)
             if extra:
@@ -6705,6 +6790,54 @@ def _grid_search(
     return all_orgs[:max_results] if max_results else all_orgs
 
 
+#: Яндекс, когда в точке действительно ничего нет, рисует не пустоту, а
+#: сообщение. Отличать «честный ноль» от «выдача не отрисовалась» обязательно:
+#: на сельском прогоне пустых рубрик БОЛЬШИНСТВО, и каждая стоила трёх полных
+#: попыток с паузами — 48 секунд на запрос, в котором нечего собирать.
+_EMPTY_RESULT_SELECTORS = (
+    "[class*='nothing-found']",
+    "[class*='NothingFound']",
+    "[class*='nothing-found-view']",
+    "[class*='search-empty']",
+    "[class*='no-results']",
+)
+#: Текстовый запасной путь — на случай, если классы переименуют (а их
+#: переименовывают). Ищем только внутри панели выдачи, не по всей странице.
+_EMPTY_RESULT_TEXTS = (
+    "ничего не найдено",
+    "нет результатов",
+    "ештеңе табылмады",
+    "ештеңе табылған жоқ",
+)
+
+_JS_PANEL_TEXT = """() => {
+    const p = document.querySelector(
+        "[class*='search-list-view'], [class*='sidebar'], [class*='panel'], aside");
+    return p ? (p.innerText || "").slice(0, 600) : "";
+}"""
+
+
+def _results_say_empty(page: Page) -> bool:
+    """Яндекс ЯВНО ответил «ничего не найдено» — повторять запрос незачем.
+
+    Только видимое сообщение: скрытый в вёрстке шаблон есть всегда. Ошибка в
+    эту сторону дороже ошибки в другую — приняв флак за честный ноль, мы
+    пометили бы запрос выполненным, и докачка его уже не перебрала бы.
+    """
+    for sel in _EMPTY_RESULT_SELECTORS:
+        try:
+            loc = page.locator(sel).first
+            if loc.count() > 0 and loc.is_visible():
+                return True
+        except Exception:
+            continue
+    try:
+        text = (page.evaluate(_JS_PANEL_TEXT) or "").lower()
+    except Exception:
+        return False
+    return any(t in text for t in _EMPTY_RESULT_TEXTS)
+
+
 def _search_with_retry(
     page: Page,
     query: str,
@@ -6733,6 +6866,15 @@ def _search_with_retry(
             )
             if orgs:
                 return orgs
+            # Пустой результат. Но пустота пустоте рознь: если Яндекс НАПИСАЛ
+            # «ничего не найдено» — повторять нечего, в этой точке правда нет
+            # такой рубрики. Три попытки по 12-13 секунд на каждый пустой
+            # запрос — это 48 секунд, и на сельском прогоне таких запросов
+            # большинство.
+            if _results_say_empty(page) and not detect_captcha(page):
+                log.info("«%s»: Яндекс ответил «ничего не найдено» — "
+                         "повторы не нужны", query)
+                return []
             # Пустой результат — может стоит попробовать ещё
             if attempt < max_retries:
                 log.warning("Пустой результат для «%s», попытка %d/%d…",
@@ -7075,6 +7217,86 @@ def _is_browser_failure(exc: Exception) -> bool:
             and any(w in text for w in ("chrom", "browser", "playwright")))
 
 
+class BrowserSession:
+    """Один браузер на весь прогон вместо нового на каждый НП.
+
+    Поднять Chrome и прогреться — это ~15 секунд. Делать это на КАЖДЫЙ
+    населённый пункт значит подарить час на пятистах аулах и полсуток на
+    выгрузке OSM, где их тысячи. Свежести сессии это не даёт: профиль
+    persistent, куки всё равно переживают перезапуск.
+
+    Браузер смертен — Chrome падает, профиль отваливается. Поэтому есть
+    `revive()`: вызывающий ловит сбой на одном НП, поднимает браузер заново
+    и идёт дальше, а не теряет весь прогон.
+    """
+
+    def __init__(self, headless: bool, proxy_url: str | None = None):
+        self._headless = headless
+        self._proxy = proxy_url
+        self._pw_cm = None
+        self._pw = None
+        self._ctx = None
+        self._page = None
+
+    # Открываем ЛЕНИВО, на первом обращении. Если докачка обнаружит, что все
+    # НП из списка уже собраны, Chrome не поднимется вообще — а поднявшись,
+    # он на машине без браузера ещё и уронил бы прогон, который на самом деле
+    # ничего не должен делать.
+    @property
+    def ctx(self) -> Any:
+        if self._ctx is None:
+            self._open()
+        return self._ctx
+
+    @property
+    def page(self) -> Any:
+        if self._page is None:
+            self._open()
+        return self._page
+
+    @property
+    def opened(self) -> bool:
+        return self._ctx is not None
+
+    def _open(self) -> None:
+        global _warmed_up
+        _warmed_up = False          # новый контекст — прогрев заново
+        if self._pw is None:
+            # Даже пустой `with sync_playwright()` поднимает драйвер-процесс.
+            # На доборе, где все НП уже собраны, это лишний старт и шум в
+            # логе при выходе — держим и его ленивым.
+            self._pw_cm = sync_playwright()
+            self._pw = self._pw_cm.__enter__()
+        _, self._ctx = _create_browser_context(self._pw, self._headless,
+                                               proxy_url=self._proxy)
+        self._page = _setup_page(self._ctx)
+
+    def revive(self) -> bool:
+        """Поднять браузер заново после падения. True — получилось."""
+        self.close()
+        try:
+            self._open()
+            log.info("Браузер поднят заново — продолжаю с текущего НП")
+            return True
+        except Exception as exc:
+            log.error("Браузер не поднимается: %s", exc)
+            return False
+
+    def close(self, stop_driver: bool = False) -> None:
+        try:
+            if self._ctx is not None:
+                self._ctx.close()
+        except Exception:
+            pass
+        self._ctx = self._page = None
+        if stop_driver and self._pw_cm is not None:
+            try:
+                self._pw_cm.__exit__(None, None, None)
+            except Exception:
+                pass
+            self._pw_cm = self._pw = None
+
+
 def run_category_parser(
     city: str,
     categories: list[str],
@@ -7089,10 +7311,16 @@ def run_category_parser(
     cooldown_every: int = 0,
     cooldown_sec: int = 90,
     grid: int = 1,
+    session: "BrowserSession | None" = None,
 ) -> dict[str, list[Organization]]:
-    """Парсер по категориям: для каждой категории запускает поиск «категория город»."""
+    """Парсер по категориям: для каждой категории запускает поиск «категория город».
+
+    session — уже открытый браузер. Передаётся из --all-cities, чтобы не
+    поднимать Chrome и не прогреваться заново на каждый населённый пункт.
+    """
     global _warmed_up
-    _warmed_up = False  # Сброс для нового контекста браузера
+    if session is None:
+        _warmed_up = False  # свой контекст браузера — прогрев заново
     tiles = viewport_grid(MAP_LL, grid) if (grid > 1 and MAP_LL) else None
     if tiles:
         log.info("Grid-свип: %d вьюпортов (%dx%d) на каждую категорию", len(tiles), grid, grid)
@@ -7145,9 +7373,8 @@ def run_category_parser(
         cat_iter_tqdm = None
 
     try:
-      with sync_playwright() as pw:
-        _, ctx = _create_browser_context(pw, headless, proxy_url=proxy_url)
-        page = _setup_page(ctx)
+      def _collect_on(ctx: Any, page: Any) -> None:
+        """Пройти все категории города на уже открытой вкладке."""
 
         for q_idx, cat_query in (cat_iter_tqdm if cat_iter_tqdm else enumerate(queries, 1)):
             # Скобочное уточнение области («Кабанбай (Абай)») в текст запроса
@@ -7236,8 +7463,17 @@ def run_category_parser(
                     page.mouse.wheel(0, random.randint(-100, 100))
                     page.wait_for_timeout(random.randint(500, 1500))
 
-        # Persistent context сохраняет всё автоматически при закрытии
-        ctx.close()
+
+      if session is not None:
+        # Браузер общий на весь прогон — не поднимаем и не закрываем свой.
+        _collect_on(session.ctx, session.page)
+      else:
+        with sync_playwright() as pw:
+          _, ctx = _create_browser_context(pw, headless, proxy_url=proxy_url)
+          page = _setup_page(ctx)
+          _collect_on(ctx, page)
+          # Persistent context сохраняет всё автоматически при закрытии
+          ctx.close()
     except Exception as exc:
         record_error(f"Критическая ошибка прогона: {exc}")
         log.error("Прогон прерван ошибкой: %s", exc)
@@ -7279,7 +7515,7 @@ def run_category_parser(
         "duration_sec": round(time.time() - _t_start, 1),
         "captchas": get_throttle().captcha_count - _captchas_before,
         "per_query": {q: len(v) for q, v in results.items()},
-    }, stats)
+    }, stats, files=session is None)
     # Возвращаем СЛИТОЕ (текущее + resume): вызывающий --all-cities пишет это
     # в общий файл, и город, доделанный с середины, должен попасть туда целиком,
     # а не только доделанными категориями.
@@ -7345,6 +7581,8 @@ def run_cities_parser(
     перезаписываются в общий файл — прогон можно прерывать без потери данных.
     """
     out_path = Path(output)
+    _cities_t0 = time.time()
+    _cities_captchas = get_throttle().captcha_count
     parts_dir = out_path.parent / (out_path.stem + "_parts")
     merged: dict[str, list[Organization]] = {}
     seen: set[str] = set()
@@ -7381,86 +7619,124 @@ def run_cities_parser(
              len(todo), len(cities), len(resolve_categories(categories)),
              f" | общий файл пишу раз в {save_every} НП" if save_every > 1 else "")
 
-    for idx, city in enumerate(todo, 1):
-        log.info("═══ Город %d/%d: %s ═══", idx, len(todo), city)
-        set_viewport(city=city)
-        part = parts_dir / f"{_safe_name(city)}.xlsx"
-        try:
-            per_city = run_category_parser(
-                city=city,
-                categories=categories,
-                output=str(part),
-                # Часть города как resume-файл: если прошлый запуск оборвался
-                # ПОСЕРЕДИНЕ города, уже собранные категории не переспрашиваем.
-                resume_path=part if part.exists() else None,
-                **kwargs,
-            )
-        except KeyboardInterrupt:
-            log.warning("Прервано пользователем на городе %s", city)
-            break
-        except Exception as exc:
-            log.error("Город %s упал (%s) — иду дальше", city, exc)
-            continue
+    # Один браузер на ВЕСЬ прогон. Раньше Chrome поднимался и прогревался
+    # заново на каждый НП: ~15 секунд × 504 аула = час впустую на воркер, а на
+    # выгрузке OSM с тысячами сёл — полсуток. Свежести сессии перезапуск не
+    # давал: профиль persistent, куки переживают его всё равно.
+    session = BrowserSession(kwargs.get("headless", True),
+                             proxy_url=kwargs.get("proxy_url"))
+    try:
+        for idx, city in enumerate(todo, 1):
+            log.info("═══ Город %d/%d: %s ═══", idx, len(todo), city)
+            set_viewport(city=city)
+            part = parts_dir / f"{_safe_name(city)}.xlsx"
+            try:
+                per_city = run_category_parser(
+                    city=city,
+                    categories=categories,
+                    output=str(part),
+                    # Часть города как resume-файл: если прошлый запуск оборвался
+                    # ПОСЕРЕДИНЕ города, уже собранные категории не переспрашиваем.
+                    resume_path=part if part.exists() else None,
+                    session=session,
+                    **kwargs,
+                )
+            except KeyboardInterrupt:
+                log.warning("Прервано пользователем на городе %s", city)
+                break
+            except Exception as exc:
+                log.error("Город %s упал (%s) — иду дальше", city, exc)
+                # Общий браузер: если умер он, «иду дальше» означало бы, что
+                # все оставшиеся НП тоже упадут, а воркер выйдет с кодом 0 и
+                # родитель его не перезапустит. Поднимаем Chrome заново.
+                if _is_browser_failure(exc) and not session.revive():
+                    raise
+                continue
 
-        added = 0
-        foreign = 0
-        far = 0
-        center_ll = PLACES_ALL.get(city, "")
-        for query, orgs in per_city.items():
-            bucket = merged.setdefault(query, [])
-            for o in orgs:
-                # Приграничные НП (Сарыагаш, Кордай, Жибек жолы) видят чужие
-                # города во вьюпорте. В национальном свипе такие адреса
-                # отсеивались, а здесь нет — и одна и та же ташкентская точка
-                # попадала в выгрузку из режима городов и выбрасывалась из
-                # режима страны, то есть слияние двух файлов давало разное
-                # число строк в зависимости от порядка.
-                if o.address and _FOREIGN_ADDR_RE.search(o.address):
-                    foreign += 1
-                    continue
-                # Название НП может совпадать с известным городом за тысячу
-                # километров: «Актау» есть и в Карагандинской области, и на
-                # Каспии; «Кызылжар» — это ещё и казахское имя Петропавловска.
-                # Яндекс в таких случаях отдаёт знаменитого тёзку, игнорируя
-                # вьюпорт. Порог намеренно грубый: отсекаем только явный
-                # промах через полстраны, не трогая нормальный разброс по
-                # окрестностям.
-                if _too_far_from_viewport(o, center_ll):
-                    far += 1
-                    continue
-                key = _dedup_key(o)
-                if key in seen:
-                    continue
-                seen.add(key)
-                bucket.append(o)
-                added += 1
-        done.add(city)
-        notes = []
-        if foreign:
-            notes.append(f"зарубежных {foreign}")
-        if far:
-            notes.append(f"из чужого региона {far}")
-        log.info("%s: +%d новых (всего %d)%s", city, added, len(seen),
-                 (", отсеяно: " + ", ".join(notes)) if notes else "")
+            added = 0
+            foreign = 0
+            far = 0
+            center_ll = PLACES_ALL.get(city, "")
+            for query, orgs in per_city.items():
+                bucket = merged.setdefault(query, [])
+                for o in orgs:
+                    # Приграничные НП (Сарыагаш, Кордай, Жибек жолы) видят чужие
+                    # города во вьюпорте. В национальном свипе такие адреса
+                    # отсеивались, а здесь нет — и одна и та же ташкентская точка
+                    # попадала в выгрузку из режима городов и выбрасывалась из
+                    # режима страны, то есть слияние двух файлов давало разное
+                    # число строк в зависимости от порядка.
+                    if o.address and _FOREIGN_ADDR_RE.search(o.address):
+                        foreign += 1
+                        continue
+                    # Название НП может совпадать с известным городом за тысячу
+                    # километров: «Актау» есть и в Карагандинской области, и на
+                    # Каспии; «Кызылжар» — это ещё и казахское имя Петропавловска.
+                    # Яндекс в таких случаях отдаёт знаменитого тёзку, игнорируя
+                    # вьюпорт. Порог намеренно грубый: отсекаем только явный
+                    # промах через полстраны, не трогая нормальный разброс по
+                    # окрестностям.
+                    if _too_far_from_viewport(o, center_ll):
+                        far += 1
+                        continue
+                    key = _dedup_key(o)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    bucket.append(o)
+                    added += 1
+            done.add(city)
+            notes = []
+            if foreign:
+                notes.append(f"зарубежных {foreign}")
+            if far:
+                notes.append(f"из чужого региона {far}")
+            log.info("%s: +%d новых (всего %d)%s", city, added, len(seen),
+                     (", отсеяно: " + ", ".join(notes)) if notes else "")
 
-        # Инкрементальное сохранение — прерывание не теряет данные.
-        # Но полная перезапись книги после КАЖДОГО НП квадратична: на 19
-        # городах это копейки, а на справочнике OSM (тысячи НП) — десятки
-        # часов чистой записи Excel. Поэтому на длинных списках сохраняем
-        # пачками. Данные при этом не рискуют: погородная часть в
-        # `<файл>_parts/` пишется всегда, и докачка поднимает НП именно из
-        # частей, а не из общей книги.
-        if idx % save_every == 0 or idx == len(todo):
-            save_xlsx_by_categories(merged, out_path)
-        try:
-            _atomic_write_text(done_file,
-                                 json.dumps(sorted(done), ensure_ascii=False))
-        except Exception as exc:
-            log.warning("Не сохранил прогресс по городам: %s", exc)
+            # Инкрементальное сохранение — прерывание не теряет данные.
+            # Но полная перезапись книги после КАЖДОГО НП квадратична: на 19
+            # городах это копейки, а на справочнике OSM (тысячи НП) — десятки
+            # часов чистой записи Excel. Поэтому на длинных списках сохраняем
+            # пачками. Данные при этом не рискуют: погородная часть в
+            # `<файл>_parts/` пишется всегда, и докачка поднимает НП именно из
+            # частей, а не из общей книги.
+            if idx % save_every == 0 or idx == len(todo):
+                save_xlsx_by_categories(merged, out_path)
+            try:
+                _atomic_write_text(done_file,
+                                     json.dumps(sorted(done), ensure_ascii=False))
+            except Exception as exc:
+                log.warning("Не сохранил прогресс по городам: %s", exc)
+    finally:
+        session.close(stop_driver=True)
+
 
     # Досохраняем, если цикл прервали между пачками.
     if todo:
         save_xlsx_by_categories(merged, out_path)
+
+    # ОДИН отчёт на весь прогон вместо тысячи по-НП-шных файлов.
+    # Только если реально что-то делали: при полностью собранном списке
+    # (todo пуст) отчёт «собрано 0» — это ложь про пустой прогон.
+    if not todo:
+        return merged
+    all_orgs = [o for v in merged.values() for o in v]
+    stats = print_stats(all_orgs, label=f"Итог по {len(done)} НП")
+    save_run_report({
+        "mode": "cities",
+        "label": f"{out_path.stem}_{len(done)}НП",
+        "cities": len(cities), "cities_done": len(done),
+        "categories": categories,
+        "domain": DOMAIN, "lang": LANG,
+        "api_intercept": kwargs.get("api_intercept"),
+        "headless": kwargs.get("headless", True),
+        "proxy": bool(kwargs.get("proxy_url")),
+        "output": str(out_path),
+        "duration_sec": round(time.time() - _cities_t0, 1),
+        "captchas": get_throttle().captcha_count - _cities_captchas,
+        "per_query": {q: len(v) for q, v in merged.items()},
+    }, stats)
     return merged
 
 

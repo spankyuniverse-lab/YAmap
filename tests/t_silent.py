@@ -346,6 +346,106 @@ def main() -> int:
           len(got.phone.split(";")) == len(got.phone_types.split(";")),
           (got.phone, got.phone_types))
 
+
+    # ============ третья пачка: ускорители не должны врать ============
+
+    class PanelPage(FakePage):
+        """Страница с панелью выдачи: текст панели отдаёт через evaluate."""
+
+        def __init__(self, panel_text="", hits=None, url="https://yandex.kz/maps/"):
+            super().__init__(url=url, hits=hits)
+            self.panel_text = panel_text
+
+        def evaluate(self, js, *a):
+            return self.panel_text
+
+    check("«ничего не найдено» текстом в панели — честный ноль",
+          y._results_say_empty(PanelPage("Ничего не найдено\nПопробуйте иначе")))
+    check("обычная выдача честным нулём не считается",
+          not y._results_say_empty(PanelPage("АЗС Гелиос\nул. Абая, 1")))
+    check("видимый блок «nothing-found» — честный ноль",
+          y._results_say_empty(PanelPage("", {"[class*='nothing-found']": (1, True)})))
+    check("СКРЫТЫЙ блок «nothing-found» честным нулём не считается",
+          not y._results_say_empty(PanelPage("", {"[class*='nothing-found']": (1, False)})))
+
+    class DeadPanel(PanelPage):
+        def evaluate(self, js, *a):
+            raise RuntimeError("страница закрыта")
+
+    check("упавшая страница не выдаётся за честный ноль",
+          not y._results_say_empty(DeadPanel()))
+
+    # Порядок проверок: бан не должен притвориться честным нулём.
+    coll2 = src.split("def _collect_current_results(", 1)[1].split("\ndef ", 1)[0]
+    cap_at = coll2.find("if detect_captcha(page):")
+    empty_at = coll2.find("_results_say_empty(page)")
+    check("капча проверяется РАНЬШЕ «ничего не найдено»",
+          0 < cap_at < empty_at, (cap_at, empty_at))
+    retry = src.split("def _search_with_retry(", 1)[1].split("\ndef ", 1)[0]
+    check("честный ноль в повторах тоже сверяется с капчей",
+          "_results_say_empty(page) and not detect_captcha(page)" in retry)
+
+    # --- ранний выход из скролла ---
+    check("быстрый порог холостых кругов меньше терпеливого",
+          y.SCROLL_STALE_FAST < y.SCROLL_STALE_MAX,
+          (y.SCROLL_STALE_FAST, y.SCROLL_STALE_MAX))
+    scroll = src.split("def scroll_and_parse(", 1)[1].split("\ndef ", 1)[0]
+    check("ранний выход требует ВСЕХ трёх признаков: не растёт, низ, нет кнопки",
+          "exhausted and not clicked and height == last_height" in scroll)
+    state = src.split("def _scroll_state(", 1)[1].split("\ndef ", 1)[0]
+    check("при сбое пробы скролла считаем, что крутить ЕСТЬ куда "
+          "(терпеливый режим)", "return {}" in state)
+    check("умолчания проб — в пользу терпения",
+          'st.get("canScroll", True)' in scroll and 'st.get("atBottom", False)' in scroll)
+
+    # --- один браузер на прогон ---
+    check("есть класс сессии браузера", hasattr(y, "BrowserSession"))
+    check("сессию можно поднять заново после падения Chrome",
+          hasattr(y.BrowserSession, "revive") and hasattr(y.BrowserSession, "close"))
+    import inspect
+    check("run_category_parser принимает готовую сессию",
+          "session" in inspect.signature(y.run_category_parser).parameters)
+    cities_src = src.split("def run_cities_parser(", 1)[1].split("\ndef ", 1)[0]
+    check("--all-cities отдаёт городам ОДНУ сессию",
+          "session=session" in cities_src)
+    check("смерть общего браузера поднимает его заново, а не роняет прогон",
+          "session.revive()" in cities_src)
+    fin = cities_src.split("finally:", 1)[-1][:200]
+    check("сессия закрывается в finally", "session.close(" in fin, fin[:120])
+    check("драйвер playwright тоже гасится", "stop_driver=True" in fin)
+    sess_src = src.split("class BrowserSession", 1)[1].split("\nclass ", 1)[0]
+    check("браузер поднимается ЛЕНИВО — при собранном списке Chrome не нужен",
+          "if self._ctx is None:" in sess_src and "def _open" in sess_src)
+    check("драйвер playwright тоже ленивый",
+          "if self._pw is None:" in sess_src and "sync_playwright()" in sess_src)
+    cat_src = src.split("def run_category_parser(", 1)[1].split("\ndef ", 1)[0]
+    check("прогрев сбрасывается только под СВОЙ браузер",
+          "if session is None:\n        _warmed_up = False" in cat_src)
+    check("доп. проход API не делается, когда за прокрутку не было ответов",
+          "api_intercept and collector.matched == 0" in cat_src
+          or "api_intercept and collector.matched == 0" in src)
+
+    # --- отчёты не плодятся по файлу на аул ---
+    import tempfile, os
+    start2 = Path.cwd()
+    with tempfile.TemporaryDirectory() as td:
+        os.chdir(td)
+        try:
+            y.save_run_report({"label": "Аул", "mode": "categories"},
+                              {"total": 3, "coverage": {}}, files=False)
+            rep = Path("reports")
+            jsons = sorted(x.name for x in rep.glob("*.json"))
+            check("по-НП-шный отчёт не создаёт файлов", jsons == [], jsons)
+            check("но строку в историю пишет",
+                  (rep / "history.jsonl").exists()
+                  and "Аул" in (rep / "history.jsonl").read_text(encoding="utf-8"))
+            y.save_run_report({"label": "Итог", "mode": "cities"},
+                              {"total": 9, "coverage": {}})
+            check("итоговый отчёт файлы создаёт",
+                  any(x.name.endswith(".md") for x in rep.glob("*.md")))
+        finally:
+            os.chdir(start2)
+
     print("\n" + ("✅ МОЛЧАЛИВЫЕ БАГИ ЗАКРЫТЫ" if not fails else f"❌ ПРОВАЛЫ: {fails}"))
     return 1 if fails else 0
 
