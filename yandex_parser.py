@@ -6117,24 +6117,41 @@ def _clean_cell(value: Any) -> str:
     return _ILLEGAL_XLSX_RE.sub("", s)
 
 
+#: По скольким строкам прикидываем ширину колонки. Раньше считали по ВСЕМ:
+#: `ws.columns` материализует каждую колонку целиком, и на 15 тысячах строк
+#: это 5-6 секунд на КАЖДОМ сохранении, а сохраняемся мы после каждой
+#: рубрики. Первых двух сотен строк для ширины хватает с запасом.
+_WIDTH_SAMPLE_ROWS = 200
+
+
 def _write_sheet(ws, orgs: list[Organization]) -> None:
     """Записать организации на один лист Excel."""
     from openpyxl.styles import Font
+    from openpyxl.utils import get_column_letter
 
     cols = FIELDNAMES
+    headers = [HEADERS_RU.get(f, f) for f in cols]
+    # append вместо ws.cell(row=…, column=…): тот ищет/создаёт ячейку по
+    # координатам на каждое значение. На книге в 15 тысяч строк разница
+    # около четверти общего времени сохранения.
+    ws.append(headers)
+    bold = Font(bold=True)
+    for cell in ws[1]:
+        cell.font = bold
 
-    for col_idx, field in enumerate(cols, 1):
-        cell = ws.cell(row=1, column=col_idx, value=HEADERS_RU.get(field, field))
-        cell.font = Font(bold=True)
-
-    for row_idx, org in enumerate(orgs, 2):
+    widths = [len(h) for h in headers]
+    for i, org in enumerate(orgs):
         d = asdict(org)
-        for col_idx, field in enumerate(cols, 1):
-            ws.cell(row=row_idx, column=col_idx, value=_clean_cell(d.get(field, "")))
+        row = [_clean_cell(d.get(f, "")) for f in cols]
+        ws.append(row)
+        if i < _WIDTH_SAMPLE_ROWS:
+            for j, v in enumerate(row):
+                n = len(str(v)) if v is not None else 0
+                if n > widths[j]:
+                    widths[j] = n
 
-    for col in ws.columns:
-        max_len = max((len(str(c.value or "")) for c in col), default=10)
-        ws.column_dimensions[col[0].column_letter].width = min(max_len + 2, 60)
+    for j, w in enumerate(widths, 1):
+        ws.column_dimensions[get_column_letter(j)].width = min(w + 2, 60)
 
 
 def save_xlsx(orgs: list[Organization], path: Path) -> None:
@@ -6159,6 +6176,175 @@ def save_xlsx(orgs: list[Organization], path: Path) -> None:
         # Не теряем данные из-за ошибки openpyxl — падаем в CSV.
         log.warning("Ошибка сохранения XLSX (%s) — сохраняю CSV", exc)
         save_csv(orgs, path.with_suffix(".csv"))
+
+
+#: Крупные города Казахстана — им в книге отдельный лист, всё остальное
+#: идёт на лист «Аулы и сёла». Список задан заказчиком (19 городов); чтобы
+#: перенести город из одной корзины в другую, достаточно поправить кортеж.
+#: Отличается от KZ_CITIES_MAJOR ровно одним городом: здесь Жезказган
+#: вместо Темиртау — так просили.
+MAJOR_CITY_SHEET: tuple[str, ...] = (
+    "Алматы", "Астана", "Шымкент", "Караганда", "Актобе", "Тараз",
+    "Павлодар", "Усть-Каменогорск", "Семей", "Атырау", "Костанай",
+    "Кызылорда", "Уральск", "Петропавловск", "Актау", "Талдыкорган",
+    "Кокшетау", "Туркестан", "Жезказган",
+)
+
+#: Те же города под другими именами. Яндекс, справочники и сами вывески
+#: зовут их по-разному, а строка «Оскемен» без этой таблицы уехала бы в
+#: сёла — вместе с областным центром на 300 тысяч человек.
+_MAJOR_ALIASES: dict[str, str] = {
+    "алма-ата": "Алматы", "almaty": "Алматы",
+    "нур-султан": "Астана", "нурсултан": "Астана", "целиноград": "Астана",
+    "акмола": "Астана", "astana": "Астана",
+    "чимкент": "Шымкент", "shymkent": "Шымкент",
+    "актюбинск": "Актобе",
+    "джамбул": "Тараз", "жамбыл": "Тараз", "аулие-ата": "Тараз",
+    "оскемен": "Усть-Каменогорск", "өскемен": "Усть-Каменогорск",
+    "усть каменогорск": "Усть-Каменогорск",
+    "шевченко": "Актау",
+    "гурьев": "Атырау",
+    "кустанай": "Костанай", "қостанай": "Костанай",
+    # «Кызылжар» — казахское имя Петропавловска, но в нашем справочнике под
+    # этим именем лежит СЕЛО в Карагандинской области (и ещё одно в Улытау).
+    # Псевдонима тут быть не должно: он утащил бы оба села в крупные города.
+    # Настоящий Петропавловск в справочнике зовётся Петропавловском.
+    "қызылжар": "Петропавловск",
+    "семипалатинск": "Семей",
+    "кзыл-орда": "Кызылорда", "қызылорда": "Кызылорда",
+    "орал": "Уральск",
+    "талды-курган": "Талдыкорган", "талдықорған": "Талдыкорган",
+    "кокчетав": "Кокшетау", "көкшетау": "Кокшетау",
+    "туркистан": "Туркестан", "түркістан": "Туркестан",
+    "джезказган": "Жезказган", "жезқазған": "Жезказган",
+}
+
+
+def _major_city_of(org: Organization) -> str:
+    """Крупный город строки, иначе "" (значит село, аул или трасса).
+
+    Сначала смотрим поле «город прогона» — оно заполнено в режиме по НП и
+    точнее всего. В свипе по стране и по трассам такого поля нет вовсе:
+    там работа режется по тайлам, а не по НП. Поэтому вторым заходом ищем
+    город в адресе — иначе весь национальный свип целиком уехал бы в сёла.
+    """
+    city = (org.city or "").strip()
+    if city:
+        # ВАЖНО: уточнение в скобках НЕ отбрасываем. Именно им справочник
+        # различает тёзок: «Актау» — город на Каспии, «Актау
+        # (Карагандинская)» — село за полторы тысячи километров от него.
+        # Со стрижкой скобок оба села-однофамильца уезжали в крупные города.
+        return _MAJOR_CANON.get(_norm_name(city), "")
+    addr = (org.address or "") + " " + (org.full_address or "")
+    if not addr.strip():
+        return ""
+    low = _norm_place(addr)
+    for base, canon in _MAJOR_CANON.items():
+        # Границы слова: «Актау» не должно находиться внутри «Актауский»,
+        # а «Семей» — внутри «Семейкино».
+        if re.search(rf"(?<![^\W\d_]){re.escape(base)}(?![^\W\d_])", low):
+            return canon
+    return ""
+
+
+def _norm_name(text: str) -> str:
+    """Имя НП для ТОЧНОГО сравнения: не считаем только регистр и ё/е.
+
+    Уточнение в скобках остаётся частью имени — оно и есть то, чем тёзки
+    различаются.
+    """
+    return unicodedata.normalize("NFC", text).lower().replace("ё", "е").strip()
+
+
+def _norm_place(text: str) -> str:
+    """То же, но без уточнения в скобках — для поиска города в тексте адреса."""
+    return re.sub(r"\s*\([^)]*\)", "", _norm_name(text)).strip()
+
+
+#: Нормализованное имя → каноническое. Собирается один раз: и сами города,
+#: и все их псевдонимы.
+_MAJOR_CANON: dict[str, str] = {
+    **{_norm_name(n): n for n in MAJOR_CITY_SHEET},
+    **{_norm_name(k): v for k, v in _MAJOR_ALIASES.items()},
+}
+
+
+def _sheet_title(base: str, used: set[str]) -> str:
+    """Имя листа Excel: без запрещённых символов, ≤31, уникальное.
+
+    Excel не различает листы по регистру и не принимает []:*?/\\ — а они
+    встречаются: тёзки из разных стран лежат в справочнике как
+    «Благовещенка [KG]». Раньше книга на таком просто не сохранялась.
+    """
+    base = re.sub(r"[\\/*?\[\]:]", "", base).strip().strip("'")
+    base = re.sub(r"\s+", " ", base)[:31] or "лист"
+    title, n = base, 2
+    while title.casefold() in used:
+        suffix = f"_{n}"
+        title = f"{base[:31 - len(suffix)]}{suffix}"
+        n += 1
+    used.add(title.casefold())
+    return title
+
+
+def _category_order(label: str) -> tuple[int, str]:
+    """Порядок листов рубрик: как в GT_SEGMENT, остальные — по алфавиту.
+
+    Заказчику нужны «Заправки» вторым листом и продуктовые третьим. Порядок
+    ключей словаря зависит от того, что встретилось первым при сборе, —
+    на это полагаться нельзя.
+    """
+    order = [lbl for _slug, lbl, _qs in GT_SEGMENT]
+    return (order.index(label), "") if label in order else (len(order), label)
+
+
+def _write_summary_sheet(ws, results: dict[str, list[Organization]]) -> None:
+    """Лист-сводка: строка на населённый пункт, колонка на рубрику.
+
+    Первой строкой идёт ИТОГО — чтобы общая картина была видна сразу, не
+    прокручивая девятьсот строк. Сортировка по убыванию: сверху те НП, где
+    собралось больше всего.
+    """
+    from openpyxl.styles import Font
+    from openpyxl.utils import get_column_letter
+
+    cats = sorted(results, key=_category_order)
+    counts: dict[str, dict[str, int]] = {}
+    kind: dict[str, str] = {}
+    for cat in cats:
+        for o in results[cat]:
+            major = _major_city_of(o)
+            name = (o.city or "").strip() or major or "(без НП)"
+            counts.setdefault(name, {})[cat] = counts.setdefault(name, {}).get(cat, 0) + 1
+            kind[name] = "Крупный город" if major else "Аул/село"
+
+    headers = ["Населённый пункт", "Тип", *cats, "Всего"]
+    ws.append(headers)
+    bold = Font(bold=True)
+    for cell in ws[1]:
+        cell.font = bold
+
+    totals = [len(results[c]) for c in cats]
+    row = ["ИТОГО", "", *totals, sum(totals)]
+    ws.append(row)
+    for cell in ws[2]:
+        cell.font = bold
+
+    rows = []
+    for name, per_cat in counts.items():
+        vals = [per_cat.get(c, 0) for c in cats]
+        rows.append((name, kind.get(name, ""), vals, sum(vals)))
+    # По убыванию собранного, при равенстве — по алфавиту.
+    rows.sort(key=lambda r: (-r[3], r[0]))
+    for name, tp, vals, total in rows:
+        ws.append([name, tp, *vals, total])
+
+    widths = [max(len(str(h)), 12) for h in headers]
+    for name, tp, _vals, _t in rows[:200]:
+        widths[0] = max(widths[0], len(name))
+        widths[1] = max(widths[1], len(tp))
+    for j, w in enumerate(widths, 1):
+        ws.column_dimensions[get_column_letter(j)].width = min(w + 2, 40)
 
 
 def save_xlsx_by_categories(
@@ -6188,25 +6374,38 @@ def save_xlsx_by_categories(
         ws_all.title = "Все результаты"
         _write_sheet(ws_all, all_orgs)
 
-        # Отдельный лист на каждую категорию
+        # Отдельный лист на каждую рубрику — в порядке GT_SEGMENT, чтобы
+        # «Заправки» были вторым листом, а продуктовые третьим.
         used_names: set[str] = {"все результаты"}
-        for query, orgs in results.items():
+        for query in sorted(results, key=_category_order):
+            orgs = results[query]
             if not orgs:
                 continue
-            # Имя листа Excel ≤ 31 символ, без спецсимволов, уникальное
-            base = re.sub(r'[\\/*?\[\]:]', '', query)[:31] or "лист"
-            sheet_name = base
-            n = 2
-            # Excel считает «Кафе» и «кафе» ОДНИМ листом, а обычный set —
-            # разными: книга не сохранялась вовсе. И суффикс «_100» вылезал
-            # за 31 символ, потому что обрезали до 28 под одну цифру.
-            while sheet_name.casefold() in used_names:
-                suffix = f"_{n}"
-                sheet_name = f"{base[:31 - len(suffix)]}{suffix}"
-                n += 1
-            used_names.add(sheet_name.casefold())
-            ws = wb.create_sheet(title=sheet_name)
+            ws = wb.create_sheet(title=_sheet_title(query, used_names))
             _write_sheet(ws, orgs)
+
+        # Разрез по географии: крупные города отдельно, всё прочее отдельно.
+        # Листа на КАЖДЫЙ НП не делаем намеренно: на прогоне по 504 аулам
+        # это 500+ вкладок, в которых человек ничего не найдёт, плюс книга
+        # пишется в полтора раза дольше на каждом промежуточном сохранении.
+        big: list[Organization] = []
+        rural: list[Organization] = []
+        for o in all_orgs:
+            (big if _major_city_of(o) else rural).append(o)
+        # Если НП всего один, эти листы — точная копия сводного. Не плодим.
+        distinct = {(o.city or _major_city_of(o) or "").strip() for o in all_orgs}
+        if len(distinct) > 1:
+            for title, bucket in (("Крупные города", big), ("Аулы и сёла", rural)):
+                if bucket:
+                    ws = wb.create_sheet(title=_sheet_title(title, used_names))
+                    _write_sheet(ws, bucket)
+
+            # Сводка: сколько чего собрано в каждом НП. Листы рубрик и так
+            # идут по всем городам сразу, но по ним не видно, где собралось
+            # много, а где пусто — а это первое, что хочется знать, открыв
+            # книгу после суточного прогона.
+            ws = wb.create_sheet(title=_sheet_title("Сводка по НП", used_names))
+            _write_summary_sheet(ws, results)
 
         tmp = _tmp_path(path)
         wb.save(tmp)

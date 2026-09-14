@@ -57,9 +57,15 @@ y.save_xlsx_by_categories(res, out)
 
 from openpyxl import load_workbook
 wb = load_workbook(out)
-sheets = [s for s in wb.sheetnames if s != "Все результаты"]
+# Кроме сводного и рубричных в книге есть служебные листы-разрезы
+# («Крупные города», «Аулы и сёла», «Сводка по НП») — они про географию,
+# а не про рубрики, и в эту проверку не входят.
+SERVICE = {"Все результаты", "Крупные города", "Аулы и сёла", "Сводка по НП"}
+sheets = [s for s in wb.sheetnames if s not in SERVICE]
 check(sorted(sheets) == sorted(labels),
       f"лист на КАЖДУЮ категорию (не на запрос): {sheets}")
+check(wb.sheetnames[0] == "Все результаты",
+      "сводный лист первый — докачка читает именно его")
 
 ws = wb["Все результаты"]
 head = [c.value for c in ws[1]]
