@@ -225,10 +225,76 @@ def main() -> int:
     # ---------- ровно список заказчика ----------
     mx = y.resolve_city_list("макс")
     попало = {big(n) for n in mx if big(n)}
-    check("в крупные города попадают ровно те 15, что назвал заказчик",
+    check("в крупные города попадают ровно те 19, что назвал заказчик",
           попало == set(y.MAJOR_CITY_SHEET),
           sorted(попало ^ set(y.MAJOR_CITY_SHEET)))
     y.set_countries(None)
+
+    # ---------- порядок листов: ТЗ, а не порядок сбора ----------
+    # Заказчик просил: 2-й лист АЗС, 3-й продуктовые. В GT_SEGMENT между ними
+    # стоит «Поесть» — если порядок листов взять оттуда, третьим станет она.
+    labels = [lbl for _s, lbl, _q in y.GT_SEGMENT]
+    порядок = sorted(labels, key=y._category_order)
+    check("лист 2 — Заправки", порядок[0] == "Заправки", порядок)
+    check("лист 3 — Продуктовые магазины, а не «Поесть»",
+          порядок[1] == "Продуктовые магазины", порядок)
+    check("остальные рубрики идут следом в порядке сбора",
+          порядок[2:] == ["Поесть", "Гипермаркеты"], порядок)
+    check("незнакомая рубрика уходит в конец, а не вклинивается",
+          sorted(labels + ["Аптеки"], key=y._category_order)[-1] == "Аптеки")
+
+    # ---------- потоковая запись: что ломается молча ----------
+    # Книга пишется в write_only-режиме: строки уходят на диск сразу, память
+    # не копится. Цена — ширины колонок и стили ячеек действуют, только пока
+    # первая строка листа не записана. Если их выставить позже, openpyxl
+    # выбросит их БЕЗ ошибки: книга сохранится, просто станет неудобной.
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "поток.xlsx"
+        orgs = [org(f"АЗС {i}", "Алматы", "Заправки",
+                    "Алматы, проспект Абая, дом 148, корпус 2") for i in range(5)]
+        orgs += [org(f"Лавка {i}", "Агадырь", "Продуктовые магазины") for i in range(3)]
+        res = {}
+        for o in orgs:
+            res.setdefault(o.search_query, []).append(o)
+        y.save_xlsx_by_categories(res, path)
+
+        from openpyxl import load_workbook
+        wb = load_workbook(path)
+        DEFAULT_W = 13.0            # ширина, которую Excel ставит сам
+
+        for name in wb.sheetnames:
+            ws = wb[name]
+            check(f"«{name}»: заголовок жирный", ws.cell(1, 1).font.bold)
+            widths = [d.width for d in ws.column_dimensions.values() if d.width]
+            check(f"«{name}»: ширины колонок записаны", len(widths) >= 2,
+                  f"ширин: {len(widths)}")
+            check(f"«{name}»: ширины не по умолчанию",
+                  any(abs(w - DEFAULT_W) > 0.01 for w in widths), widths[:5])
+
+        for name in wb.sheetnames:
+            ws = wb[name]
+            expect = "A3" if name == "Сводка по НП" else "A2"
+            check(f"«{name}»: шапка закреплена ({expect})",
+                  ws.freeze_panes == expect, ws.freeze_panes)
+            if name != "Сводка по НП":
+                check(f"«{name}»: фильтр на всю таблицу",
+                      (ws.auto_filter.ref or "").startswith("A1:"),
+                      ws.auto_filter.ref)
+        check("на сводке фильтра нет — он бы утащил строку ИТОГО",
+              not wb["Сводка по НП"].auto_filter.ref)
+
+        ws = wb["Все результаты"]
+        long_addr = max(len(str(c.value or "")) for c in ws["B"])
+        width_b = ws.column_dimensions["B"].width
+        check("ширина колонки подогнана под содержимое",
+              width_b >= min(long_addr, 58), f"ширина {width_b}, длина {long_addr}")
+        check("и не разъехалась шире потолка", width_b <= 60, width_b)
+
+        check("активный лист — сводный, докачка читает именно его",
+              wb.active.title == "Все результаты", wb.active.title)
+        check("докачка видит все строки",
+              len(y.ResumeManager(path)._existing) == len(orgs),
+              len(y.ResumeManager(path)._existing))
 
     print("\n" + ("✅ СТРУКТУРА КНИГИ ОК" if not fails else f"❌ ПРОВАЛЫ: {fails}"))
     return 1 if fails else 0

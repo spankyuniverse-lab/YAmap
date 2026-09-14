@@ -6124,39 +6124,88 @@ def _clean_cell(value: Any) -> str:
 _WIDTH_SAMPLE_ROWS = 200
 
 
+def _new_workbook():
+    """Книга в потоковом режиме: строка уходит в файл, а не копится в памяти.
+
+    Обычная openpyxl-книга держит КАЖДУЮ ячейку отдельным объектом Python до
+    самого save(). На пятидесяти тысячах организаций (а это рядовой прогон по
+    аулам) сохранение отъедало 2.5 ГБ — на машине, где одновременно открыт
+    Chrome с браузерами-воркерами. В потоковом режиме тот же файл получается
+    байт в байт такой же, но пик памяти держится в районе двух сотен мегабайт.
+
+    Плата за это: к записанным строкам больше нельзя вернуться, а ширины
+    колонок надо выставить ДО первой строки (см. _write_sheet).
+    """
+    from openpyxl import Workbook
+    return Workbook(write_only=True)
+
+
+def _head_row(ws, headers: list[str]) -> list:
+    """Строка заголовка жирным. В потоковой книге стиль ставится только так:
+    вернуться к уже записанной ячейке и покрасить её задним числом нельзя."""
+    from openpyxl.cell import WriteOnlyCell
+    from openpyxl.styles import Font
+
+    bold = Font(bold=True)
+    out = []
+    for h in headers:
+        cell = WriteOnlyCell(ws, value=h)
+        cell.font = bold
+        out.append(cell)
+    return out
+
+
+def _freeze_and_filter(ws, rows: int, cols: int) -> None:
+    """Шапка прибита, на колонках — фильтры.
+
+    В книге на 63 колонки и десятки тысяч строк без этого невозможно работать:
+    прокрутил на сто строк — и уже не помнишь, какая колонка «Телефон».
+    Ставится до записи строк: потоковая книга отдаёт лист один раз.
+    """
+    ws.freeze_panes = "A2"
+    if rows and cols:
+        from openpyxl.utils import get_column_letter
+        ws.auto_filter.ref = f"A1:{get_column_letter(cols)}{rows}"
+
+
+def _set_widths(ws, widths: list[int], cap: int = 60) -> None:
+    """Ширины колонок. ТОЛЬКО до первой записанной строки.
+
+    В потоковой книге <cols> уходит на диск вместе с первым блоком строк.
+    Всё, что выставлено после, openpyxl выбрасывает молча — ни исключения,
+    ни предупреждения, просто книга открывается с колонками по умолчанию.
+    """
+    from openpyxl.utils import get_column_letter
+    for j, w in enumerate(widths, 1):
+        ws.column_dimensions[get_column_letter(j)].width = min(w + 2, cap)
+
+
 def _write_sheet(ws, orgs: list[Organization]) -> None:
     """Записать организации на один лист Excel."""
-    from openpyxl.styles import Font
-    from openpyxl.utils import get_column_letter
-
     cols = FIELDNAMES
     headers = [HEADERS_RU.get(f, f) for f in cols]
-    # append вместо ws.cell(row=…, column=…): тот ищет/создаёт ячейку по
-    # координатам на каждое значение. На книге в 15 тысяч строк разница
-    # около четверти общего времени сохранения.
-    ws.append(headers)
-    bold = Font(bold=True)
-    for cell in ws[1]:
-        cell.font = bold
 
+    # Ширины считаем ПЕРЕД записью — по первым _WIDTH_SAMPLE_ROWS строкам,
+    # ровно как и раньше. Порядок тут не косметический: см. _set_widths.
     widths = [len(h) for h in headers]
-    for i, org in enumerate(orgs):
+    for org in orgs[:_WIDTH_SAMPLE_ROWS]:
         d = asdict(org)
-        row = [_clean_cell(d.get(f, "")) for f in cols]
-        ws.append(row)
-        if i < _WIDTH_SAMPLE_ROWS:
-            for j, v in enumerate(row):
-                n = len(str(v)) if v is not None else 0
-                if n > widths[j]:
-                    widths[j] = n
+        for j, f in enumerate(cols):
+            n = len(_clean_cell(d.get(f, "")))
+            if n > widths[j]:
+                widths[j] = n
+    _set_widths(ws, widths)
+    _freeze_and_filter(ws, len(orgs) + 1, len(cols))
 
-    for j, w in enumerate(widths, 1):
-        ws.column_dimensions[get_column_letter(j)].width = min(w + 2, 60)
+    ws.append(_head_row(ws, headers))
+    for org in orgs:
+        d = asdict(org)
+        ws.append([_clean_cell(d.get(f, "")) for f in cols])
 
 
 def save_xlsx(orgs: list[Organization], path: Path) -> None:
     try:
-        from openpyxl import Workbook
+        from openpyxl import Workbook  # noqa: F401 — проверка наличия библиотеки
     except ImportError:
         log.warning("openpyxl не установлен — сохраняю в CSV")
         save_csv(orgs, path.with_suffix(".csv"))
@@ -6164,10 +6213,8 @@ def save_xlsx(orgs: list[Organization], path: Path) -> None:
 
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
-        wb = Workbook()
-        ws = wb.active
-        ws.title = "Яндекс.Карты"
-        _write_sheet(ws, orgs)
+        wb = _new_workbook()
+        _write_sheet(wb.create_sheet(title="Яндекс.Карты"), orgs)
         tmp = _tmp_path(path)
         wb.save(tmp)
         os.replace(tmp, path)
@@ -6276,26 +6323,50 @@ def _sheet_title(base: str, used: set[str]) -> str:
     встречаются: тёзки из разных стран лежат в справочнике как
     «Благовещенка [KG]». Раньше книга на таком просто не сохранялась.
     """
-    base = re.sub(r"[\\/*?\[\]:]", "", base).strip().strip("'")
-    base = re.sub(r"\s+", " ", base)[:31] or "лист"
+    base = re.sub(r"[\\/*?\[\]:]", "", base)
+    base = _trim_title(re.sub(r"\s+", " ", base))
     title, n = base, 2
     while title.casefold() in used:
         suffix = f"_{n}"
-        title = f"{base[:31 - len(suffix)]}{suffix}"
+        title = f"{_trim_title(base, 31 - len(suffix))}{suffix}"
         n += 1
     used.add(title.casefold())
     return title
 
 
-def _category_order(label: str) -> tuple[int, str]:
-    """Порядок листов рубрик: как в GT_SEGMENT, остальные — по алфавиту.
+#: Апостроф в любом начертании: прямой, типографский и два казахских/узбекских
+#: («Қызылорда ойл'», Sirdaryo’). Excel не принимает имя листа, которое на
+#: апостроф начинается или заканчивается, — книга открывается с руганью.
+_TITLE_EDGE = " '\u2019\u02bb\u02bc\u2018`"
 
-    Заказчику нужны «Заправки» вторым листом и продуктовые третьим. Порядок
-    ключей словаря зависит от того, что встретилось первым при сборе, —
-    на это полагаться нельзя.
+
+def _trim_title(base: str, limit: int = 31) -> str:
+    """Обрезать имя листа до лимита и убрать с краёв то, что Excel не терпит.
+
+    Порядок важен: сначала обрезаем, потом чистим края. Наоборот — и апостроф,
+    стоявший 31-м символом, оказывается последним уже ПОСЛЕ чистки: openpyxl
+    такую книгу молча сохранит, а Excel откажется её открывать.
     """
+    return base[:limit].strip(_TITLE_EDGE) or "лист"
+
+
+#: Первые листы книги — в этом порядке, что бы ни стояло в GT_SEGMENT.
+#: Заказчику нужны АЗС вторым листом и продуктовые третьим, а в GT_SEGMENT
+#: между ними лежит «Поесть»: там свой порядок, по логике сбора. Связывать
+#: эти два порядка нельзя — стоило добавить рубрику в сбор, и книга молча
+#: переставляла бы листы.
+SHEET_PRIORITY: tuple[str, ...] = ("Заправки", "Продуктовые магазины")
+
+
+def _category_order(label: str) -> tuple[int, int, str]:
+    """Порядок листов рубрик: сперва SHEET_PRIORITY, потом GT_SEGMENT,
+    остальные — по алфавиту."""
+    if label in SHEET_PRIORITY:
+        return (0, SHEET_PRIORITY.index(label), "")
     order = [lbl for _slug, lbl, _qs in GT_SEGMENT]
-    return (order.index(label), "") if label in order else (len(order), label)
+    if label in order:
+        return (1, order.index(label), "")
+    return (2, 0, label)
 
 
 def _write_summary_sheet(ws, results: dict[str, list[Organization]]) -> None:
@@ -6305,9 +6376,6 @@ def _write_summary_sheet(ws, results: dict[str, list[Organization]]) -> None:
     прокручивая девятьсот строк. Сортировка по убыванию: сверху те НП, где
     собралось больше всего.
     """
-    from openpyxl.styles import Font
-    from openpyxl.utils import get_column_letter
-
     cats = sorted(results, key=_category_order)
     counts: dict[str, dict[str, int]] = {}
     kind: dict[str, str] = {}
@@ -6319,16 +6387,6 @@ def _write_summary_sheet(ws, results: dict[str, list[Organization]]) -> None:
             kind[name] = "Крупный город" if major else "Аул/село"
 
     headers = ["Населённый пункт", "Тип", *cats, "Всего"]
-    ws.append(headers)
-    bold = Font(bold=True)
-    for cell in ws[1]:
-        cell.font = bold
-
-    totals = [len(results[c]) for c in cats]
-    row = ["ИТОГО", "", *totals, sum(totals)]
-    ws.append(row)
-    for cell in ws[2]:
-        cell.font = bold
 
     rows = []
     for name, per_cat in counts.items():
@@ -6336,15 +6394,23 @@ def _write_summary_sheet(ws, results: dict[str, list[Organization]]) -> None:
         rows.append((name, kind.get(name, ""), vals, sum(vals)))
     # По убыванию собранного, при равенстве — по алфавиту.
     rows.sort(key=lambda r: (-r[3], r[0]))
-    for name, tp, vals, total in rows:
-        ws.append([name, tp, *vals, total])
 
+    # Ширины — до первой строки (см. _set_widths), заголовок и ИТОГО жирным.
     widths = [max(len(str(h)), 12) for h in headers]
     for name, tp, _vals, _t in rows[:200]:
         widths[0] = max(widths[0], len(name))
         widths[1] = max(widths[1], len(tp))
-    for j, w in enumerate(widths, 1):
-        ws.column_dimensions[get_column_letter(j)].width = min(w + 2, 40)
+    _set_widths(ws, widths, cap=40)
+    # Шапка и строка ИТОГО прибиты обе. Фильтра тут намеренно нет: он
+    # захватил бы ИТОГО как обычную строку, и первая же сортировка увезла бы
+    # её в середину списка.
+    ws.freeze_panes = "A3"
+
+    ws.append(_head_row(ws, headers))
+    totals = [len(results[c]) for c in cats]
+    ws.append(_head_row(ws, ["ИТОГО", "", *totals, sum(totals)]))
+    for name, tp, vals, total in rows:
+        ws.append([name, tp, *vals, total])
 
 
 def save_xlsx_by_categories(
@@ -6353,7 +6419,7 @@ def save_xlsx_by_categories(
 ) -> None:
     """Сохранить результаты по категориям: отдельный лист на каждую + сводный."""
     try:
-        from openpyxl import Workbook
+        from openpyxl import Workbook  # noqa: F401 — проверка наличия библиотеки
     except ImportError:
         log.warning("openpyxl не установлен — сохраняю сводный CSV")
         all_orgs = []
@@ -6367,12 +6433,11 @@ def save_xlsx_by_categories(
     for orgs in results.values():
         all_orgs.extend(orgs)
     try:
-        wb = Workbook()
+        wb = _new_workbook()
 
-        # Сводный лист со всеми результатами
-        ws_all = wb.active
-        ws_all.title = "Все результаты"
-        _write_sheet(ws_all, all_orgs)
+        # Сводный лист со всеми результатами. Он ПЕРВЫЙ и обязан им остаться:
+        # докачка читает активный лист книги, то есть именно его.
+        _write_sheet(wb.create_sheet(title="Все результаты"), all_orgs)
 
         # Отдельный лист на каждую рубрику — в порядке GT_SEGMENT, чтобы
         # «Заправки» были вторым листом, а продуктовые третьим.
@@ -8120,6 +8185,12 @@ def run_cities_parser(
     todo = [c for c in cities if c not in done]
     # Как часто перезаписывать общую книгу (см. коммент у сохранения ниже).
     save_every = 1 if len(todo) <= 60 else 25
+    #: Есть ли в `merged` то, чего ещё нет в книге на диске. Раньше вместо
+    #: этого стояло «if todo», и книга целиком переписывалась ДВАЖДЫ на каждом
+    #: доведённом до конца прогоне: один раз в цикле на последнем НП, второй —
+    #: «досохранением» сразу после цикла. На большом прогоне это лишняя полная
+    #: запись многогигабайтной книги на ровном месте.
+    dirty = False
     log.info("Города: %d к сбору (всего %d) | категорий: %d%s",
              len(todo), len(cities), len(resolve_categories(categories)),
              f" | общий файл пишу раз в {save_every} НП" if save_every > 1 else "")
@@ -8206,8 +8277,10 @@ def run_cities_parser(
             # пачками. Данные при этом не рискуют: погородная часть в
             # `<файл>_parts/` пишется всегда, и докачка поднимает НП именно из
             # частей, а не из общей книги.
+            dirty = True
             if idx % save_every == 0 or idx == len(todo):
                 save_xlsx_by_categories(merged, out_path)
+                dirty = False
             try:
                 _atomic_write_text(done_file,
                                      json.dumps(sorted(done), ensure_ascii=False))
@@ -8217,8 +8290,9 @@ def run_cities_parser(
         session.close(stop_driver=True)
 
 
-    # Досохраняем, если цикл прервали между пачками.
-    if todo:
+    # Досохраняем, если цикл прервали между пачками. Если последняя пачка
+    # уже легла на диск — второй раз ту же книгу не пишем.
+    if dirty:
         save_xlsx_by_categories(merged, out_path)
 
     # ОДИН отчёт на весь прогон вместо тысячи по-НП-шных файлов.
