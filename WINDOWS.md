@@ -56,6 +56,7 @@
 
 ```bat
 run.bat --city Алматы --category gt
+run.bat --city Алматы --search АЗС Продукты "Где поесть"
 run.bat --all-cities --category gt -o kz_gt.xlsx --workers 3
 run.bat --all-cities --cities aul --category gt-rural -o kz_aul.xlsx -w 2
 run.bat --routes --category gt-rural -o kz_routes.xlsx -w 2

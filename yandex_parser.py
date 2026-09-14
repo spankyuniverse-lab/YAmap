@@ -129,7 +129,7 @@ DOMAIN = "yandex.kz"   # хост по умолчанию — Казахстан
 LANG = "ru_RU"         # язык выдачи (kk_KZ у Карт нет — используем русский)
 
 # Пресеты городов Казахстана: ll = "lon,lat" (долгота ПЕРВАЯ — как в GeoJSON).
-# Зум по умолчанию z=12 (город); 10 — пригороды, 14 — плотный центр.
+# Зум по умолчанию z=11 (город с пригородами); 12 — плотнее, 10 — район.
 KZ_CITIES: dict[str, str] = {
     "Алматы": "76.8897,43.2389",
     "Астана": "71.4491,51.1694",            # не «Нур-Султан»; регион 163
@@ -153,7 +153,7 @@ KZ_CITIES: dict[str, str] = {
 
 # Остальные города и крупные посёлки Казахстана — вторая волна охвата.
 # Координаты приблизительные (центр населённого пункта); точность тут не
-# критична: вьюпорт z=12 накрывает ~0.35°, а название города всё равно уходит
+# критична: вьюпорт z=11 накрывает ~0.73°, а название города всё равно уходит
 # в текст запроса («АЗС Кентау»), так что Яндекс доводит выдачу сам.
 KZ_CITIES_EXTRA: dict[str, str] = {
     # Карагандинская / Улытау
@@ -1043,7 +1043,17 @@ def _warn_unknown_places(names: list[str], source: str) -> None:
                  f"({', '.join(unknown[:5])})")
 
 KZ_COUNTRY_LL = "66.9237,48.0196"   # весь Казахстан (регион 159), использовать с z=5
-DEFAULT_CITY_Z = 12                 # зум для сбора по городу
+#: Зум вьюпорта для сбора по населённому пункту.
+#: По калибровке самого парсера (см. _zoom_for_span) окно по долготе — это
+#: примерно 1500/2^z градусов: z=12 → 0.37° ≈ 30 км, z=11 → 0.73° ≈ 59 км.
+#: Алматы — около 30 км в поперечнике, то есть на z=12 город впритык влезал в
+#: окно и окраины оказывались на самом его краю. z=11 накрывает город целиком
+#: с пригородами.
+#: Расширение безопасно: организации, уехавшие далеко от центра поиска,
+#: отсекает _too_far_from_viewport с порогом MAX_VIEWPORT_DRIFT_DEG = 1.2°, а
+#: половина окна на z=11 — 0.37°, то есть втрое меньше порога. Законно
+#: найденное на краю города остаётся, чужие тёзки за полстраны — нет.
+DEFAULT_CITY_Z = 11
 
 # Grid-свип: Яндекс отдаёт ограниченное число результатов на один вьюпорт.
 # Чтобы собрать БОЛЬШЕ, проходим сеткой вьюпортов по площади города.
@@ -3538,6 +3548,20 @@ GT_GROCERY: list[str] = [q for _s, _l, qs in GT_SEGMENT[2:] for q in qs]
 GT_RURAL: list[str] = ["Заправки", "Магазин продуктов",
                        "Магазин смешанных товаров", "Кафе", "Столовая"]
 
+#: Быстрый выбор для режима «один город»: ровно те фразы, которые человек
+#: печатает в строку поиска Яндекс.Карт руками. Уходят ДОСЛОВНО — каталог их
+#: не разворачивает (см. LITERAL_PREFIX), иначе «Продукты» превратились бы в
+#: восемь чужих запросов, а «Спорт» — в девять.
+#: Второй элемент пары — пояснение для меню, в запрос оно не идёт.
+CITY_PICK: list[tuple[str, str]] = [
+    ("АЗС", "заправки"),
+    ("Продукты", "продуктовые магазины и супермаркеты"),
+    ("Где поесть", "витрина Яндекса: кафе, рестораны, фастфуд разом"),
+    ("Кафе", "только кафе"),
+    ("Спорт", "залы, секции, спортивные магазины"),
+]
+
+
 PRESETS: dict[str, list[str]] = {
     "gt": GT_ALL,
     "gt-азс": GT_FUEL,
@@ -3572,6 +3596,21 @@ def list_categories() -> None:
     print('  python yandex_parser.py --country --category gt -o kz_gt.xlsx')
 
 
+#: Префикс «слать дословно». Без него имя сверяется с каталогом CATEGORIES, а
+#: там есть группы «продукты» и «спорт» — и запрос «Продукты» молча
+#: превращался в восемь ЧУЖИХ запросов («мясные магазины», «кулинарии»…), а
+#: «Спорт» — в девять. Человек при этом уверен, что ищет ровно то, что
+#: напечатал. Префикс отключает всякое разворачивание: «=Продукты» уходит в
+#: Яндекс как «Продукты». Флаг --search ставит его сам.
+LITERAL_PREFIX = "="
+
+
+def literal_query(text: str) -> str:
+    """Пометить текст как дословный поисковый запрос (для --search и меню)."""
+    text = text.strip()
+    return text if text.startswith(LITERAL_PREFIX) else LITERAL_PREFIX + text
+
+
 def resolve_categories(names: list[str]) -> list[str]:
     """Преобразовать названия групп/категорий в список поисковых запросов.
 
@@ -3579,6 +3618,9 @@ def resolve_categories(names: list[str]) -> list[str]:
     (gt, gt-азс) и конкретные запросы (рестораны, кафе). Группа/пресет
     разворачивается в список подзапросов, всё остальное трактуется как
     прямой поисковый запрос. Дубликаты убираются с сохранением порядка.
+
+    Имя с префиксом «=» не разворачивается никогда — уходит в Яндекс ровно
+    так, как написано (см. LITERAL_PREFIX).
     """
     queries: list[str] = []
     seen: set[str] = set()
@@ -3595,7 +3637,9 @@ def resolve_categories(names: list[str]) -> list[str]:
 
     for name in names:
         key = name.lower().strip()
-        if key in CATEGORIES:
+        if key.startswith(LITERAL_PREFIX):
+            _add(name.strip()[len(LITERAL_PREFIX):])
+        elif key in CATEGORIES:
             for item in CATEGORIES[key]:
                 _add(item)
         elif key in PRESETS:
@@ -6355,7 +6399,12 @@ def _trim_title(base: str, limit: int = 31) -> str:
 #: между ними лежит «Поесть»: там свой порядок, по логике сбора. Связывать
 #: эти два порядка нельзя — стоило добавить рубрику в сбор, и книга молча
 #: переставляла бы листы.
-SHEET_PRIORITY: tuple[str, ...] = ("Заправки", "Продуктовые магазины")
+#: «Заправки»/«Продуктовые магазины» — имена рубрик GT; «АЗС»/«Продукты» —
+#: те же смыслы, но словами заказчика из режима одного города. Держим оба
+#: набора, чтобы правило «второй лист топливо, третий продукты» выполнялось
+#: независимо от того, каким словарём собирали.
+SHEET_PRIORITY: tuple[str, ...] = ("Заправки", "АЗС",
+                                   "Продуктовые магазины", "Продукты")
 
 
 def _category_order(label: str) -> tuple[int, int, str]:
@@ -9464,6 +9513,13 @@ def main() -> None:
         help="Парсить все категории из каталога",
     )
     parser.add_argument(
+        "--search", nargs="+", default=None, metavar="ФРАЗА",
+        help="Точные поисковые фразы — как вы печатаете их в Яндекс.Картах "
+             "(напр. --search АЗС Продукты \"Где поесть\"). В отличие от "
+             "--category каталог их НЕ разворачивает: «Продукты» ищутся как "
+             "«Продукты», а не как восемь других запросов",
+    )
+    parser.add_argument(
         "--max-results", "-n", type=int, default=None,
         help=f"Максимум организаций на запрос/категорию (по умолчанию "
              f"{DEFAULT_MAX_RESULTS}; для --country — {COUNTRY_MAX_PER_TILE} на "
@@ -9646,7 +9702,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--z", type=int, default=None,
-        help="Зум карты (11-13 город, 10 пригороды, 14 центр; по умолчанию 12)",
+        help="Зум карты (11 город с пригородами — по умолчанию, 12-13 плотнее, 10 район, 14 центр)",
     )
     parser.add_argument(
         "--list-cities", action="store_true",
@@ -9654,6 +9710,13 @@ def main() -> None:
     )
 
     args = parser.parse_args()
+
+    # --search — те же категории, но помеченные «слать дословно». Складываем
+    # их в args.category СРАЗУ после разбора: дальше по коду категории
+    # читаются из десятка мест, включая сборку командной строки воркерам, и
+    # отдельная ветка для --search рано или поздно где-нибудь бы потерялась.
+    if args.search:
+        args.category = (args.category or []) + [literal_query(s) for s in args.search]
 
     # Домен/язык — резолвим РАНО (до ветки --detect-selectors, которая уже
     # строит URL). Приоритет: --tld > config['tld'/'domain'] > 'kz'.
@@ -10331,7 +10394,11 @@ def _dispatch_parallel(args, workers: int, headless: bool,
         output = _run_out(args, args.output or f"{args.city}_categories.xlsx")
         workers = min(workers, len(queries))
         base += ["--city", args.city]
-        shards = [["--category", *chunk]
+        # Воркеру уходят УЖЕ РАЗВЁРНУТЫЕ запросы, поэтому помечаем их
+        # дословными. Иначе воркер развернул бы их второй раз: «Продукты» —
+        # имя группы каталога, и вместо одного запроса заказчика он ушёл бы
+        # искать восемь чужих («мясные магазины», «кулинарии»…).
+        shards = [["--category", *[literal_query(q) for q in chunk]]
                   for chunk in _split_round_robin(queries, workers)]
         run_parallel(base, shards, output)
         return 0
@@ -10362,6 +10429,80 @@ def _input_choice(prompt: str, options: list[str], allow_empty: bool = False) ->
         if raw in options or allow_empty:
             return raw
         print("  Неверный выбор, попробуйте ещё раз.")
+
+
+def _input_multi(prompt: str, options: list[tuple[str, str]],
+                 default_all: bool = True) -> list[str]:
+    """Выбрать НЕСКОЛЬКО пунктов: «1 3», «1-3», «все», пустой ввод = все.
+
+    Обычный _input_choice возвращает один ответ, а тут человек выбирает набор
+    категорий. Молча глотать мусор нельзя: «1 5 9» при пяти пунктах — это
+    почти наверняка опечатка, и собрать не то дороже, чем переспросить.
+    """
+    for i, (name, hint) in enumerate(options, 1):
+        print(f"  {i}. {name}" + (f"   — {hint}" if hint else ""))
+    print("  (номера через пробел, «1-3» диапазоном, «все» — всё; "
+          "Enter = " + ("все" if default_all else "отмена") + ")")
+    names = [n for n, _h in options]
+    while True:
+        raw = input(f"\n{prompt} ").strip()
+        if not raw:
+            return list(names) if default_all else []
+        if raw.lower() in ("все", "всё", "all", "*"):
+            return list(names)
+        picked: list[str] = []
+        bad: list[str] = []
+        for part in raw.replace(",", " ").split():
+            rng = re.fullmatch(r"(\d+)-(\d+)", part)
+            span = (range(int(rng.group(1)), int(rng.group(2)) + 1)
+                    if rng else ([int(part)] if part.isdigit() else None))
+            if span is None:
+                # Не номер — может, человек написал название целиком.
+                hit = [n for n in names if n.casefold() == part.casefold()]
+                (picked.extend if hit else bad.append)(hit or part)
+                continue
+            for num in span:
+                if 1 <= num <= len(names):
+                    picked.append(names[num - 1])
+                else:
+                    bad.append(str(num))
+        if bad:
+            print(f"  Не понял: {', '.join(bad)}. Пункты — с 1 по {len(names)}.")
+            continue
+        if picked:
+            # Порядок как в списке, без повторов: «3 1 3» → пункты 1 и 3.
+            return [n for n in names if n in set(picked)]
+        print("  Ничего не выбрано, попробуйте ещё раз.")
+
+
+def _ask_place(prompt: str = "Город или аул") -> str:
+    """Спросить населённый пункт и СВЕРИТЬ со справочником.
+
+    Раньше опечатку принимали молча, а потом set_viewport не находил такой НП
+    и ставил вьюпорт в центр страны на z=5 — прогон шёл, выдача была
+    случайной по всему Казахстану, и выяснялось это уже по результату.
+    """
+    import difflib
+    while True:
+        raw = input(f"\n{prompt}: ").strip()
+        if not raw:
+            print("  Пусто. Напишите название, напр. Алматы.")
+            continue
+        if raw in PLACES_ALL:
+            return raw
+        # Регистр и «ё» — не повод ругаться.
+        for known in PLACES_ALL:
+            if known.casefold().replace("ё", "е") == raw.casefold().replace("ё", "е"):
+                return known
+        close = difflib.get_close_matches(raw, list(PLACES_ALL), n=5, cutoff=0.6)
+        print(f"  «{raw}» в справочнике нет.")
+        if close:
+            print("  Возможно: " + ", ".join(close))
+        else:
+            print(f"  Всего известно {len(PLACES_ALL)} НП; "
+                  f"список — ./run.sh --list-cities")
+        if _input_yn("  Всё равно искать по этому названию?", default=False):
+            return raw
 
 
 def _input_yn(prompt: str, default: bool = False) -> bool:
@@ -10460,6 +10601,63 @@ def _menu_gt() -> None:
     main()
 
 
+def _menu_one_city() -> None:
+    """Один населённый пункт + выбранные категории.
+
+    Отличие от пункта «Парсинг по категориям»: тот разворачивает ГРУППЫ
+    каталога (выбрал «продукты» — ушло восемь запросов), а тут человек
+    выбирает ровно те фразы, которые сам печатает в Яндекс.Картах, и они
+    уходят дословно. Плюс этот путь идёт через main(), а значит получает и
+    папку прогона runs/<дата>__<имя>/, и несколько браузеров, и докачку.
+    """
+    print("\n--- Один город или аул + категории на выбор ---")
+    print("Фразы уходят в поиск ровно так, как написаны.\n")
+
+    city = _ask_place("Город или аул")
+
+    picks = _input_multi("Что ищем?", CITY_PICK)
+    extra = input("\nДобавить свои фразы через запятую (Enter — не надо): ").strip()
+    if extra:
+        picks += [s.strip() for s in extra.split(",") if s.strip()]
+    # Повторы убираем, порядок сохраняем: человек мог выбрать «Кафе» галочкой
+    # и дописать его же руками.
+    seen: set[str] = set()
+    picks = [q for q in picks if not (q.casefold() in seen or seen.add(q.casefold()))]
+    if not picks:
+        print("Ничего не выбрано — отменяю.")
+        return
+
+    # Параллелить тут можно только ПО ЗАПРОСАМ: город один. Больше браузеров,
+    # чем запросов, не бывает — лишние стартовали бы вхолостую.
+    max_w = min(MAX_WORKERS, len(picks))
+    if max_w > 1:
+        print(f"\nСколько браузеров одновременно? Все идут с одного твоего IP.")
+        print(f"  Запросов {len(picks)}, значит больше {max_w} смысла не имеет.")
+        raw = input(f"\nЧисло браузеров [1]: ").strip()
+        workers = int(raw) if raw.isdigit() and 1 <= int(raw) <= max_w else 1
+    else:
+        workers = 1
+
+    output = f"{city}.xlsx"
+    raw_out = input(f"\nИмя файла [{output}]: ").strip()
+    output = _ensure_ext(raw_out) if raw_out else output
+
+    print("\n" + "=" * 55)
+    print(f"  Место:     {city}"
+          + (f"  ({PLACES_ALL[city]}, z={DEFAULT_CITY_Z})" if city in PLACES_ALL else ""))
+    print(f"  Запросы:   {', '.join(picks)}")
+    print(f"  Браузеров: {workers}")
+    print(f"  Файл:      {output}")
+    print("=" * 55)
+    if not _input_yn("\nЗапускаем?", True):
+        print("Отменено.")
+        return
+
+    sys.argv = [sys.argv[0], "--city", city, "--search", *picks,
+                "-o", output, "--workers", str(workers), "--api-intercept"]
+    main()
+
+
 def interactive_menu() -> None:
     """Пошаговое интерактивное меню — запускается при старте без аргументов."""
     print()
@@ -10483,11 +10681,13 @@ def interactive_menu() -> None:
     # 1. Режим работы
     print("\nВыберите режим:")
     _GT_MODE = "GT по всем городам КЗ (АЗС / продуктовые) ⭐"
+    _ONE_CITY_MODE = "ОДИН город или аул + категории на выбор ⭐"
     _DOCTOR_MODE = "Диагностика: что уже собрано, ошибки, капчи"
     mode = _input_choice(
         "Номер:",
         [
             _GT_MODE,
+            _ONE_CITY_MODE,
             "Поиск по запросу",
             "Парсинг по категориям (как 2ГИС)",
             "Все категории города",
@@ -10499,6 +10699,10 @@ def interactive_menu() -> None:
 
     if mode == _GT_MODE:
         _menu_gt()
+        return
+
+    if mode == _ONE_CITY_MODE:
+        _menu_one_city()
         return
 
     if mode == _DOCTOR_MODE:
