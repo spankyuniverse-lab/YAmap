@@ -8449,9 +8449,63 @@ def _log_line_level(line: str) -> str:
     m = _LOG_LEVEL_RE.match(line)
     if m:
         return m.group(1)
-    if line.lstrip().startswith("Traceback (most recent call last)"):
+    if _is_crash_line(line):
         return "ERROR"
     return ""
+
+
+#: Смерть воркера не всегда доезжает до логгера: интерпретатор пишет эти
+#: строки сам — до того, как логгер вообще настроен, или когда процессу уже
+#: не до логов. Без них сводка здоровья честно показывала «Ошибок в логах: 0»
+#: над воркером, который трижды не смог стартовать.
+_CRASH_MARKERS: tuple[str, ...] = (
+    "traceback (most recent call last)",
+    "can't open file",              # интерпретатор не нашёл сам скрипт
+    "modulenotfounderror",
+    "importerror",
+    "syntaxerror:",
+    "indentationerror:",
+    "memoryerror",
+    "segmentation fault",
+    "[errno 24]",                   # кончились файловые дескрипторы
+    "[errno 28]",                   # кончилось место на диске
+)
+
+
+def _is_crash_line(line: str) -> bool:
+    """Строка, по которой видно падение процесса, даже без уровня в ней."""
+    low = line.strip().lower()
+    return any(marker in low for marker in _CRASH_MARKERS)
+
+
+#: Строки прогресса: «[12:05:31]  всего ~140» и «w2  собрано 51 ⟳1». В хвосте
+#: лога они только занимают место — причину падения объясняют не они.
+_PROGRESS_LINE_RE = re.compile(r"^(?:\[\d{2}:\d{2}:\d{2}\]|w\d+\s)")
+
+
+def _worker_log_tail(idx: int, limit: int = 5) -> list[str]:
+    """Последние осмысленные строки лога воркера — чтобы показать ПРИЧИНУ.
+
+    Родитель и так писал «смотри logs/worker<N>.log», но человек, у которого
+    в четырёх окнах умер один воркер, эту строку читает уже после прогона.
+    Причину надо показывать сразу, поэтому берём хвост лога и выбрасываем из
+    него прогресс-строки — они длинные и ничего не объясняют.
+    """
+    path = LOGS_DIR / f"worker{idx}.log"
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except Exception:
+        return []
+    out: list[str] = []
+    for line in reversed(lines[-400:]):
+        text = line.strip()
+        if not text or _PROGRESS_LINE_RE.match(text):
+            continue
+        out.append(text[:200])
+        if len(out) >= limit:
+            break
+    return list(reversed(out))
+
 
 
 def run_doctor() -> None:
@@ -8728,6 +8782,10 @@ def run_parallel(base_argv: list[str], shards: list[list[str]], output: str,
                 log.warning("Воркер %d упал (код %s) — поднимаю через %d сек "
                             "(попытка %d/%d)", i + 1, p.returncode, delay,
                             restarts[i], MAX_RESTARTS)
+                # Причина смерти — сразу на экран. Лог воркера уже закрыт
+                # выше, так что хвост читается целиком, без обрезанной строки.
+                for line in _worker_log_tail(i + 1):
+                    print(f"        w{i + 1}| {line}")
                 time.sleep(delay)
                 try:
                     _launch(i)
@@ -8799,6 +8857,12 @@ def run_parallel(base_argv: list[str], shards: list[list[str]], output: str,
         log.warning("Воркеры, не поднявшиеся после %d попыток: %s — "
                     "смотри logs/worker<N>.log", MAX_RESTARTS,
                     ", ".join(map(str, failed)))
+        # И сразу хвост лога каждого: без этого единственный след насовсем
+        # умершего воркера — строка выше, а причина остаётся в файле, который
+        # никто не откроет.
+        for i in failed:
+            for line in _worker_log_tail(i, limit=8):
+                print(f"        w{i}| {line}")
 
     merged = _merge_parts(parts, out_path)
     print(f"\n✅ Слито из {n} воркеров: {len(merged)} организаций → {output}")

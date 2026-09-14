@@ -37,3 +37,7 @@ fake_worker.py
 *.places.json
 
 wikidata_places.json
+
+# Замок каталога тестов (tests/run_all.py) — не даёт двум прогонам
+# затирать общие файлы друг у друга.
+.run_all.lock
