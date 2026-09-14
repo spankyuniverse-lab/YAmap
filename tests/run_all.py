@@ -15,6 +15,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -96,23 +97,33 @@ def main() -> int:
 
 def _run() -> int:
     failed: list[str] = []
+    times: list[tuple[float, str]] = []
+    started = time.time()
     for name in TESTS:
         _clean()
         print(f"\n{'=' * 60}\n  {name}\n{'=' * 60}")
+        t0 = time.time()
         proc = subprocess.run([sys.executable, str(HERE / f"{name}.py")],
                               cwd=HERE, capture_output=True, text=True)
+        spent = time.time() - t0
+        times.append((spent, name))
         tail = "\n".join((proc.stdout + proc.stderr).strip().splitlines()[-6:])
         print(tail)
         if proc.returncode == 0:
-            print(f"  → OK")
+            print(f"  → OK ({spent:.1f} c)")
         elif "playwright" in tail.lower() or "executable doesn't exist" in tail.lower():
-            print(f"  → ПРОПУЩЕН (нет браузера)")
+            print(f"  → ПРОПУЩЕН (нет браузера, {spent:.1f} c)")
         else:
-            print(f"  → ПРОВАЛ (код {proc.returncode})")
+            print(f"  → ПРОВАЛ (код {proc.returncode}, {spent:.1f} c)")
             failed.append(name)
     _clean()
+    total = time.time() - started
     print(f"\n{'=' * 60}")
     print("  ВСЁ ЗЕЛЁНОЕ" if not failed else f"  ПРОВАЛЫ: {', '.join(failed)}")
+    # Что именно съедает время — иначе ускорять приходится вслепую.
+    print(f"  Всего {total:.0f} c. Самые долгие:")
+    for spent, name in sorted(times, reverse=True)[:5]:
+        print(f"    {spent:6.1f} c  {name}  ({spent / total * 100:.0f}%)")
     print("=" * 60)
     return 1 if failed else 0
 
