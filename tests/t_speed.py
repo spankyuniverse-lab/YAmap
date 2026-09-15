@@ -32,7 +32,49 @@ def check(cond, msg, detail=""):
         fails.append(msg)
 
 
+def check_pacing() -> None:
+    """Множитель пауз: боевое значение цело, тестовое действительно ужимает.
+
+    Сами паузы — это и есть защита от капчи, поэтому проверяем не секундомером
+    (он бы мерил макет, а не Яндекс), а контрактом: при PACING = 1.0 пауза
+    равна тому, что заказано, и ужимается только когда её попросили ужать.
+    """
+    sys.path.insert(0, str(HERE.parent))
+    import yandex_parser as y
+
+    saved = y.PACING
+    try:
+        y.PACING = 1.0
+        check(y._pace(2000) == 2000, "боевой режим: пауза 2000 мс не трогается",
+              y._pace(2000))
+        check(y._pace(0) == 0, "нулевая пауза остаётся нулевой")
+        pauses = [y.get_throttle().get_pause(2000) for _ in range(30)]
+        check(all(1600 <= x <= 2400 for x in pauses),
+              "боевой режим: пауза между запросами держится около заказанной",
+              f"{min(pauses)}…{max(pauses)} мс")
+
+        y.PACING = 0.02
+        check(y._pace(2000) == 40, "тестовый режим ужимает в 50 раз", y._pace(2000))
+        fast = [y.get_throttle().get_pause(2000) for _ in range(30)]
+        check(max(fast) < min(pauses) / 10,
+              "и пауза между запросами ужимается вместе со всеми",
+              f"{min(fast)}…{max(fast)} мс против {min(pauses)}…{max(pauses)}")
+    finally:
+        y.PACING = saved
+
+    # Мусор и ноль не должны молча превращаться в «без пауз вообще».
+    import importlib
+    for bad in ("0", "-1", "ерунда", ""):
+        os.environ["YAMAP_PACING"] = bad
+        y.PACING = 1.0
+        y._set_pacing_from_env()
+        check(y.PACING == 1.0, f"YAMAP_PACING={bad!r} не отключает паузы", y.PACING)
+    os.environ.pop("YAMAP_PACING", None)
+    y.PACING = saved
+
+
 def main() -> int:
+    check_pacing()
     browser = os.environ.get("YAMAP_BROWSER_PATH")
     if not browser:
         for cand in ("/opt/pw-browsers/chromium",
@@ -48,7 +90,9 @@ def main() -> int:
     print(f"макет Яндекса поднят на {base}\n")
     env = dict(os.environ)
     env.update({"YAMAP_BASE_URL": base, "YAMAP_BROWSER_PATH": browser,
-                "YAMAP_HEADLESS": "1", "PYTHONIOENCODING": "utf-8"})
+                "YAMAP_HEADLESS": "1",
+                # Паузы «под человека» против локального макета не нужны.
+                "YAMAP_PACING": os.environ.get("YAMAP_PACING", "0.02"), "PYTHONIOENCODING": "utf-8"})
     out = HERE / "speed.xlsx"
     for junk in (out, HERE / "speed.cities.json"):
         if junk.exists():

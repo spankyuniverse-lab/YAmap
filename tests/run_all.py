@@ -19,10 +19,20 @@ import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-TESTS = ["t_cli", "t_dedup", "t_gt", "t_badname", "t_progress", "t_menu", "t_par", "t_cities", "t_expand", "t_supervise", "t_showmore", "t_search_input", "t_kz_geo", "t_opts", "t_fastapi", "t_rundir", "t_silent", "t_speed", "t_migrate", "t_sheets", "t_crashlog", "t_savecount", "t_onecity"]
+TESTS = ["t_cli", "t_dedup", "t_gt", "t_badname", "t_progress", "t_menu", "t_par", "t_cities", "t_expand", "t_supervise", "t_showmore", "t_search_input", "t_kz_geo", "t_opts", "t_fastapi", "t_rundir", "t_silent", "t_speed", "t_migrate", "t_sheets", "t_crashlog", "t_savecount", "t_onecity", "t_resume_speed"]
 JUNK = ["out", "logs", "runs", "reports", "crashy_worker.py", "fake_worker.py",
         "selectors_cache.json", "e2e.xlsx", "e2e_par.xlsx",
         "kz_osm_places.json"]
+
+
+#: Тесты гоняют настоящий парсер против макета на 127.0.0.1. Выдержки, которые
+#: в бою оберегают от капчи, тут изображают человека перед несуществующим
+#: Яндексом: один прогон парсера против макета — 41 секунда, из них 14 уходит
+#: на прогрев. Ужимаем намеренные паузы в 50 раз; технические таймауты
+#: (загрузка страницы, появление карточек) множитель не трогает.
+#: Сами значения пауз проверяет t_resume_speed при PACING = 1.0 — то есть
+#: регрессию «кто-то убрал паузу» ловит он, а не секундомер.
+TEST_ENV = {**os.environ, "YAMAP_PACING": os.environ.get("YAMAP_PACING", "0.02")}
 
 
 def _clean() -> None:
@@ -104,7 +114,8 @@ def _run() -> int:
         print(f"\n{'=' * 60}\n  {name}\n{'=' * 60}")
         t0 = time.time()
         proc = subprocess.run([sys.executable, str(HERE / f"{name}.py")],
-                              cwd=HERE, capture_output=True, text=True)
+                              cwd=HERE, capture_output=True, text=True,
+                              env=TEST_ENV)
         spent = time.time() - t0
         times.append((spent, name))
         tail = "\n".join((proc.stdout + proc.stderr).strip().splitlines()[-6:])

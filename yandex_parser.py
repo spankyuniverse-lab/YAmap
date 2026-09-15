@@ -4383,7 +4383,7 @@ def _human_scroll(page: Page, container_sel: str | None,
     mouse_x = random.randint(150, 420)
     mouse_y = random.randint(200, 700)
     page.mouse.move(mouse_x, mouse_y)
-    page.wait_for_timeout(random.randint(50, 200))
+    page.wait_for_timeout(_pace(random.randint(50, 200)))
 
     # Общая дельта этого скролла
     total_delta = random.randint(200, 700)
@@ -4392,7 +4392,7 @@ def _human_scroll(page: Page, container_sel: str | None,
     if not brief and random.random() < 0.15:
         up_delta = random.randint(50, 150)
         _do_scroll_step(page, container_sel, -up_delta)
-        page.wait_for_timeout(random.randint(300, 800))
+        page.wait_for_timeout(_pace(random.randint(300, 800)))
 
     # Разбиваем на микро-шаги
     steps = random.randint(1, 2) if brief else random.randint(3, 6)
@@ -4405,11 +4405,11 @@ def _human_scroll(page: Page, container_sel: str | None,
         _do_scroll_step(page, container_sel, step_delta)
 
         # Микро-пауза между шагами (50–150 мс)
-        page.wait_for_timeout(random.randint(50, 150))
+        page.wait_for_timeout(_pace(random.randint(50, 150)))
 
     # Иногда (10%) «задумываемся» — длинная пауза
     if not brief and random.random() < 0.10:
-        think_ms = random.randint(1500, 3500)
+        think_ms = _pace(random.randint(1500, 3500))
         log.debug("Имитация паузы: %d мс", think_ms)
         page.wait_for_timeout(think_ms)
 
@@ -4756,7 +4756,7 @@ def scroll_and_parse(
         # Ждём ПОЯВЛЕНИЯ карточек, а не просто спим. Бюджет тот же, что и
         # раньше, так что хуже не станет; лучше станет всегда, когда выдача
         # дорисовывается быстрее паузы.
-        jitter_ms = int(scroll_pause * random.uniform(0.7, 1.3) * 1000)
+        jitter_ms = _pace(int(scroll_pause * random.uniform(0.7, 1.3) * 1000))
         if settled_rounds > 0:
             # Нечего ждать: мы уже дважды видели, что список не растёт.
             jitter_ms = min(jitter_ms, 500)
@@ -6004,7 +6004,7 @@ def run_api_intercept(
 
             # Рандомизированная пауза
             jitter = scroll_pause * random.uniform(0.7, 1.3)
-            page.wait_for_timeout(int(jitter * 1000))
+            page.wait_for_timeout(_pace(int(jitter * 1000)))
 
             new_count = len(all_orgs) - prev
             if new_count > 0:
@@ -6603,6 +6603,50 @@ BROWSER_DATA_DIR = Path(os.environ.get("YAMAP_PROFILE_DIR") or ".browser_profile
 # Адаптивный троттлинг — замедляемся при появлении капчи
 # ---------------------------------------------------------------------------
 
+#: Во сколько раз ужимать НАМЕРЕННЫЕ паузы — те, что имитируют человека.
+#: 1.0 (по умолчанию) — боевое поведение, ничего не меняется.
+#:
+#: Нужно это тестам. Они гоняют настоящий парсер против локального макета на
+#: 127.0.0.1, и выдержки, которые в бою оберегают от капчи, там изображают
+#: человека ПЕРЕД НЕСУЩЕСТВУЮЩИМ Яндексом. Один прогон против макета — 41
+#: секунда, из них 14 уходит на прогрев.
+#:
+#: ВАЖНО: множитель НЕ трогает технические таймауты (сколько ждать загрузки
+#: страницы, появления карточек) — только выдержки. И не должен ставиться
+#: меньше единицы против настоящего Яндекса: именно эти паузы и держат
+#: частоту обращений на человеческом уровне.
+PACING: float = 1.0
+
+
+def _set_pacing_from_env() -> None:
+    """Прочитать YAMAP_PACING. Отклонение от 1.0 говорим вслух."""
+    global PACING
+    try:
+        val = float(os.environ.get("YAMAP_PACING", "") or 1.0)
+    except ValueError:
+        return
+    if val <= 0 or val == PACING:
+        return
+    PACING = val
+    if val < 1.0:
+        log.warning("YAMAP_PACING=%.3g — намеренные паузы ужаты в %.0f раз. "
+                    "Это режим для тестов против макета. Против настоящего "
+                    "Яндекса так ходить нельзя: паузы и есть защита от капчи.",
+                    val, 1 / val)
+    else:
+        log.info("YAMAP_PACING=%.3g — намеренные паузы растянуты", val)
+
+
+def _pace(ms: int) -> int:
+    """Намеренная пауза в миллисекундах с учётом PACING."""
+    return max(0, int(ms * PACING))
+
+
+# Читаем при импорте: воркеры — это отдельные процессы, и переменная окружения
+# единственное, что доезжает до них без правки командной строки.
+_set_pacing_from_env()
+
+
 class AdaptiveThrottle:
     """Адаптивное управление скоростью парсинга.
 
@@ -6637,7 +6681,7 @@ class AdaptiveThrottle:
         pause = int(base_ms * self._multiplier)
         # Добавляем 20% случайного шума
         noise = int(pause * 0.2)
-        return pause + random.randint(-noise, noise)
+        return _pace(pause + random.randint(-noise, noise))
 
     @property
     def multiplier(self) -> float:
@@ -6907,7 +6951,7 @@ def _warmup(page: Page, headless: bool) -> None:
     try:
         # Шаг 1: заходим на главную Яндекса (как обычный пользователь)
         page.goto(f"{base_url()}/", wait_until="domcontentloaded", timeout=20000)
-        page.wait_for_timeout(random.randint(2000, 4000))
+        page.wait_for_timeout(_pace(random.randint(2000, 4000)))
 
         # Проверяем капчу на главной. Результат ВАЖЕН: нерешённая капча тут
         # означает, что на карты мы приходим уже помеченной сессией, и весь
@@ -6929,14 +6973,14 @@ def _warmup(page: Page, headless: bool) -> None:
                 random.randint(100, 900),
                 random.randint(100, 600),
             )
-            page.wait_for_timeout(random.randint(100, 400))
+            page.wait_for_timeout(_pace(random.randint(100, 400)))
 
         # Шаг 2: переходим на карты через навигацию (реферер = тот же домен).
         # Открываем карты сразу с гео-вьюпортом KZ, чтобы регион не «уполз» в Москву.
-        page.wait_for_timeout(random.randint(1000, 2500))
+        page.wait_for_timeout(_pace(random.randint(1000, 2500)))
         warm_maps = f"{maps_url()}?lang={LANG}" + (f"&ll={MAP_LL}&z={MAP_Z}" if MAP_LL else "")
         page.goto(warm_maps, wait_until="domcontentloaded", timeout=20000)
-        page.wait_for_timeout(random.randint(2000, 4000))
+        page.wait_for_timeout(_pace(random.randint(2000, 4000)))
 
         # Проверяем капчу на картах
         if detect_captcha(page):
@@ -6952,7 +6996,7 @@ def _warmup(page: Page, headless: bool) -> None:
                 random.randint(100, 900),
                 random.randint(100, 700),
             )
-            page.wait_for_timeout(random.randint(100, 400))
+            page.wait_for_timeout(_pace(random.randint(100, 400)))
 
         # По карте НЕ кликаем: слепой клик попадает в пин организации и
         # открывает её карточку — браузер уезжает на /maps/org/…, а сбор потом
@@ -8223,13 +8267,35 @@ def run_cities_parser(
 
     # Подхватываем уже собранное: сам итоговый файл (в нём лежит слитое из
     # прошлых прогонов, включая параллельные) + погородные части.
+    #
+    # Части нужны не все. Общая книга пишется пачками (save_every), поэтому в
+    # частях лежит ХВОСТ — последние НП, до которых запись книги не дошла.
+    # Всё, что старше книги, в неё уже вошло: книга пишется из merged, куда
+    # часть попадает раньше, чем книга сохраняется. Раньше читали подряд все,
+    # и на прогоне из 300 пройденных НП это ровно удваивало время старта:
+    # книга 10.7 c и ещё 11.0 c на части с теми же самыми организациями.
+    book_mtime = out_path.stat().st_mtime if out_path.exists() else 0.0
     if out_path.exists():
         _seed(_load_existing_orgs(out_path))
+    # Запас в 5 секунд — на грубость файловых отметок времени и на то, что
+    # между записью части и записью книги проходит какое-то время. Ошибиться
+    # тут можно только в одну сторону: лишняя прочитанная часть стоит
+    # миллисекунд, пропущенная — потерянные данные.
+    read_parts = skipped = 0
     for city in sorted(done):
-        _seed(_load_existing_orgs(parts_dir / f"{_safe_name(city)}.xlsx"))
+        part = parts_dir / f"{_safe_name(city)}.xlsx"
+        if not part.exists():
+            continue
+        if book_mtime and part.stat().st_mtime < book_mtime - 5:
+            skipped += 1          # эта часть уже слита в книгу
+            continue
+        _seed(_load_existing_orgs(part))
+        read_parts += 1
     if done or seen:
-        log.info("Резюме: %d городов уже пройдено, %d организаций поднято",
-                 len(done), len(seen))
+        log.info("Резюме: %d городов уже пройдено, %d организаций поднято"
+                 "%s", len(done), len(seen),
+                 f" (частей прочитано {read_parts}, {skipped} уже в книге)"
+                 if skipped else "")
 
     todo = [c for c in cities if c not in done]
     # Как часто перезаписывать общую книгу (см. коммент у сохранения ниже).
@@ -8389,6 +8455,14 @@ MAX_WORKERS = 8
 #: смерть Chrome или обрыв сети, и после рестарта воркер продолжает с места
 #: обрыва (свой файл идёт ему как resume), а не начинает заново.
 MAX_RESTARTS = 5
+
+#: Пауза перед подъёмом упавшего воркера: 30 c, 60 c, 90 c… но не дольше 120.
+#: Вынесено в константу не ради настройки, а ради тестов: проверка «упал →
+#: поднялся → продолжил с места обрыва» не про длину паузы, а полминуты
+#: ожидания в наборе — это полминуты на пустом месте. Тест ставит 1 секунду и
+#: отдельно сверяет, что боевое значение не уехало.
+RESTART_BACKOFF_SEC = 30
+RESTART_BACKOFF_MAX = 120
 
 
 def _split_round_robin(items: list[Any], n: int) -> list[list[Any]]:
@@ -8672,7 +8746,7 @@ def run_doctor() -> None:
         print("    (файлов результатов нет)")
     for f in files:
         try:
-            cnt = len(_load_existing_orgs(f, quiet=True))
+            cnt = _count_collected(f)
             age = (time.time() - f.stat().st_mtime) / 60
             print(f"    {f.name:36s} {cnt:>7} записей, обновлён {age:.0f} мин назад")
         except Exception as exc:
@@ -8901,7 +8975,8 @@ def run_parallel(base_argv: list[str], shards: list[list[str]], output: str,
                     log_files[i].close()
                 except Exception:
                     pass
-                delay = min(30 * restarts[i], 120)   # backoff: 30с, 60с, 90с…
+                delay = min(RESTART_BACKOFF_SEC * restarts[i],
+                            RESTART_BACKOFF_MAX)   # 30с, 60с, 90с…
                 log.warning("Воркер %d упал (код %s) — поднимаю через %d сек "
                             "(попытка %d/%d)", i + 1, p.returncode, delay,
                             restarts[i], MAX_RESTARTS)
@@ -8924,7 +8999,7 @@ def run_parallel(base_argv: list[str], shards: list[list[str]], output: str,
             last_report = time.time()
             rows, total = [], 0
             for i, part in enumerate(parts, 1):
-                cnt = len(_load_existing_orgs(part, quiet=True)) if part.exists() else 0
+                cnt = _count_collected(part) or 0
                 # Воркер может как раз перезаписывать файл — чтение упадёт и
                 # вернёт 0. Не пугаем цифрой «0», показываем последнее живое.
                 if cnt == 0 and seen_counts[i - 1]:
@@ -9112,6 +9187,94 @@ def _print_health(parts: list[Path], n: int = 0) -> None:
 # (города, посёлки, трассы). Устойчив к перезапуску: прогресс по тайлам и уже
 # собранные организации сохраняются, при повторном запуске сбор продолжается.
 # ---------------------------------------------------------------------------
+
+def _count_rows_xlsx(path: Path) -> int | None:
+    """Сколько строк данных в книге — БЕЗ её разбора. None, если не вышло.
+
+    Родитель в параллельном режиме каждые 30 секунд показывает, сколько набрал
+    каждый воркер, и брал это число как len(_load_existing_orgs(часть)) — то
+    есть полностью разбирал чужую книгу в объекты Organization ради одного
+    числа. На книге в 20 тысяч строк это 13 секунд, на 47 тысячах — за
+    полминуты. При четырёх воркерах цикл присмотра переставал быть циклом: он
+    почти всё время сидел в чтении, отчитывался раз в три минуты вместо
+    тридцати секунд и замечал смерть воркера через две минуты вместо двух
+    секунд.
+
+    Здесь мы не разбираем, а считаем открывающие теги строк в XML листа.
+    Те же 20 тысяч строк — 0.09 секунды, в 147 раз быстрее.
+
+    Тонкость: это число СТРОК, а _load_existing_orgs возвращал число
+    УНИКАЛЬНЫХ организаций. На файлах, которые пишет сам парсер, это одно и то
+    же (дедуп отрабатывает до записи). В чужом файле с дублями счётчик на
+    экране будет чуть больше — но это счётчик на экране, на данные он не
+    влияет.
+    """
+    try:
+        import zipfile
+        with zipfile.ZipFile(path) as z:
+            names = set(z.namelist())
+            sheet = _active_sheet_path(z, names)
+            if sheet is None:
+                return None
+            rows, tail = 0, b""
+            with z.open(sheet) as f:
+                while True:
+                    chunk = f.read(1 << 20)
+                    if not chunk:
+                        break
+                    # Нахлёст в 5 байт: «<row » может оказаться разорванным
+                    # границей куска, и тогда строка не посчиталась бы.
+                    buf = tail + chunk
+                    rows += buf.count(b"<row ")
+                    tail = buf[-5:]
+        return max(0, rows - 1)          # первая строка — шапка
+    except Exception:
+        # Молча: воркер мог как раз перезаписывать файл, это штатная гонка.
+        # Исключение отсюда выпало бы в цикл присмотра, а его finally гасит
+        # ВСЕХ воркеров — то есть кривой счётчик убил бы весь прогон.
+        return None
+
+
+def _active_sheet_path(z, names: set[str]) -> str | None:
+    """Путь к XML активного листа книги — того же, что читает докачка.
+
+    Докачка берёт wb.active, поэтому и считать надо его, а не «первый файл,
+    попавшийся в архиве»: порядок записи в zip нам никто не обещал.
+    """
+    import re as _re
+    try:
+        book = z.read("xl/workbook.xml").decode("utf-8", "replace")
+        rels = z.read("xl/_rels/workbook.xml.rels").decode("utf-8", "replace")
+        ids = _re.findall(r'<sheet\b[^>]*r:id="([^"]+)"', book)
+        m = _re.search(r'<workbookView\b[^>]*activeTab="(\d+)"', book)
+        idx = int(m.group(1)) if m else 0
+        target = dict(_re.findall(r'Id="([^"]+)"[^>]*Target="([^"]+)"', rels))
+        path = target.get(ids[idx] if idx < len(ids) else ids[0], "")
+        path = path.lstrip("/")
+        for cand in (f"xl/{path}", path):
+            if cand in names:
+                return cand
+    except Exception:
+        pass
+    return "xl/worksheets/sheet1.xml" if "xl/worksheets/sheet1.xml" in names else None
+
+
+def _count_collected(path: Path) -> int | None:
+    """Сколько собрано в файле результатов. None — прочитать не вышло."""
+    if not path.exists():
+        return 0
+    if path.suffix.lower() == ".xlsx":
+        fast = _count_rows_xlsx(path)
+        if fast is not None:
+            return fast
+    # CSV и JSON читаются дёшево (csv на 47 тысячах — полторы секунды против
+    # сорока у xlsx), а считать в CSV переводы строк нельзя: часы работы и
+    # описание бывают многострочными, и счётчик завысил бы почти вдвое.
+    try:
+        return len(_load_existing_orgs(path, quiet=True))
+    except Exception:
+        return None
+
 
 def _load_existing_orgs(out_path: Path, quiet: bool = False) -> list[Organization]:
     """Прочитать уже собранные организации из файла результатов (для resume).

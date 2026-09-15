@@ -55,7 +55,9 @@ def main() -> int:
     print(f"макет Яндекса поднят на {base}\n")
     env = dict(os.environ)
     env.update({"YAMAP_BASE_URL": base, "YAMAP_BROWSER_PATH": browser,
-                "YAMAP_HEADLESS": "1", "PYTHONIOENCODING": "utf-8"})
+                "YAMAP_HEADLESS": "1",
+                # Паузы «под человека» против локального макета не нужны.
+                "YAMAP_PACING": os.environ.get("YAMAP_PACING", "0.02"), "PYTHONIOENCODING": "utf-8"})
 
     for junk in HERE.glob("fa_*.xlsx"):
         junk.unlink()

@@ -6,6 +6,11 @@ sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent.par
 import yandex_parser as y
 
 y.MAX_RESTARTS = 3
+# Проверяем логику подъёма, а не длину паузы: боевые 30/60/90 секунд тут
+# были бы просто ожиданием. Само боевое значение сверяем ниже.
+check_backoff = (y.RESTART_BACKOFF_SEC, y.RESTART_BACKOFF_MAX)
+y.RESTART_BACKOFF_SEC = 1
+y.RESTART_BACKOFF_MAX = 2
 fake = Path("crashy_worker.py").resolve()
 fake.write_text('''
 import sys, os
@@ -54,4 +59,6 @@ print("\nИТОГ:", n, "| добор увидел:", called.get("missing"))
 assert Path("crashed_1.flag").exists(), "воркер 1 не падал?"
 assert n >= 2, f"после рестарта данных нет: {n}"
 assert called.get("missing"), "добор не заметил пропущенные города"
-print("✅ рестарт + resume + добор работают")
+assert check_backoff == (30, 120), \
+    f"боевая пауза перед подъёмом воркера уехала: {check_backoff}, ждали (30, 120)"
+print("✅ рестарт + resume + добор работают (боевая пауза 30/120 c на месте)")
