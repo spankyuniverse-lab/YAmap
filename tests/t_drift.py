@@ -229,9 +229,24 @@ def drift_units() -> None:
         bad = FakePage(fail_goto=True)
         same, _ = y._retry_if_drifted(bad, away, "Заправки", "Заправки Павлодар",
                                       center, 50, 1.0, False, True)
-        check(same == away, "сбой goto при повторе не роняет рубрику")
+        check(same == [], "сбой goto при повторе: остаётся правдоподобное (тут — ничего)",
+              len(same))
+        check(_ is None, "…и НП не переключается «сразу по карте»")
     finally:
         y._search_with_retry = real
+
+    # Ушедшая выдача видна уже по первой странице — дальше не листаем
+    class Coll:
+        def __init__(self, items):
+            self.by_key = {o.org_id: o for o in items}
+    y.set_viewport(city="Павлодар")
+    stop = y._drift_stop_check(Coll(away + [org(500 + i, 2.5, -1.0) for i in range(10)]))
+    check(bool(stop and stop()), "первая страница чужая — прокрутка встаёт")
+    stop = y._drift_stop_check(Coll(local + tail))
+    check(stop is not None and stop() == "", "своя первая страница — листаем дальше")
+    y.set_viewport(city="Такого-НП-нет")
+    check(y._drift_stop_check(Coll(away)) is None, "без центра НП проверки нет")
+    y.set_viewport(city="Павлодар")
 
     # Капча посреди скролла: повторяем, а держится до конца — «не решена»
     real_sac = y._search_and_collect

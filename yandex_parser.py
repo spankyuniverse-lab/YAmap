@@ -4671,6 +4671,7 @@ def scroll_and_parse(
     max_results: int,
     scroll_pause: float = 1.0,
     on_org: Any = None,
+    stop_check: Any = None,
 ) -> list[Organization]:
     """Скроллить и парсить сниппеты на лету по мере появления.
 
@@ -4682,6 +4683,8 @@ def scroll_and_parse(
         max_results: Максимум организаций.
         scroll_pause: Базовая пауза между скроллами (рандомизируется).
         on_org: Callback(org, index) — вызывается при каждой новой организации.
+        stop_check: () -> str — непустая строка значит «дальше не листать»
+            (выдача ушла к тёзке: 300 чужих точек листались четверть часа).
 
     Returns:
         Список собранных Organization.
@@ -4760,6 +4763,12 @@ def scroll_and_parse(
                         "запрос надо повторить")
                 log.info("Выдача кончилась: список не растёт, низ достигнут, "
                          "кнопки «ещё» нет (всего %d)", len(orgs))
+                break
+
+        if stop_check is not None:
+            reason = stop_check()
+            if reason:
+                log.info("%s — дальше не листаю (собрано %d)", reason, len(orgs))
                 break
 
         # Проверяем лимиты
@@ -7553,7 +7562,8 @@ def _collect_current_results(
         # их, и триггерит те самые API-ответы, которыми потом обогащаем данные.
         # (флаг --api-intercept оставлен для совместимости; перехват API идёт
         #  фоном в любом режиме через collector.)
-        orgs = scroll_and_parse(page, max_results, scroll_pause, on_org=on_org)
+        orgs = scroll_and_parse(page, max_results, scroll_pause, on_org=on_org,
+                                stop_check=_drift_stop_check(collector))
 
         # SSR-обогащение: полные карточки Яндекс встраивает в inline-конфиг
         # страницы (телефон/координаты/часы/рубрики) — кладём их в индекс
@@ -8349,6 +8359,7 @@ def run_category_parser(
             q_started = time.time()
 
             try:
+                orgs = None
                 if map_only:
                     log.info("↪ «%s»: у этого НП выдача уже уходила — ищу «%s» "
                              "сразу по карте НП", full_query, cat_query)
@@ -8359,9 +8370,12 @@ def run_category_parser(
                     except CaptchaUnsolved:
                         raise
                     except Exception as exc:
-                        log.warning("↪ карта не перешла на НП (%s)", exc)
-                        orgs = []
-                else:
+                        # Не пустая рубрика, а обычный поиск: у Степняка так
+                        # пять рубрик подряд записались нулями.
+                        log.warning("↪ карта не перешла на НП (%s) — ищу с названием",
+                                    str(exc).splitlines()[0])
+                        map_only = False
+                if orgs is None:
                     orgs = _search_with_retry(
                         page, full_query, max_results_per_category,
                         scroll_pause, api_intercept, headless=headless, tiles=tiles,
@@ -8664,6 +8678,32 @@ def _search_on_map(
     return [o for o in found if _plausible_here(o, center_ll)], started
 
 
+def _drift_stop_check(collector: "_ApiCollector | None"):
+    """Проверка для scroll_and_parse: первые DRIFT_HEAD точек API с
+    координатами легли не у НП — листать дальше незачем, повтор по карте
+    всё равно будет. Центр — только настоящий центр НП (MAP_LL_IS_PLACE)."""
+    if collector is None or not (MAP_LL and MAP_LL_IS_PLACE):
+        return None
+    center = MAP_LL
+    decided = {"done": False}
+
+    def check() -> str:
+        if decided["done"]:
+            return ""
+        with_coords = [o for o in list(collector.by_key.values())
+                       if o.latitude and o.longitude]
+        if len(with_coords) < DRIFT_HEAD:
+            return ""
+        decided["done"] = True
+        drifted, near, known = _is_drifted(with_coords, center)
+        if drifted:
+            return (f"Выдача ушла от НП: из первых {known} точек ближе "
+                    f"{DRIFT_NEAR_KM:.0f} км лишь {near}")
+        return ""
+
+    return check
+
+
 def _retry_if_drifted(
     page: Page,
     orgs: list[Organization],
@@ -8695,8 +8735,12 @@ def _retry_if_drifted(
     except CaptchaUnsolved:
         raise
     except Exception as exc:
-        log.warning("↪ карта не перешла на НП (%s) — оставляю выдачу как есть", exc)
-        return orgs, time.time()
+        # Оставляем правдоподобное из первой выдачи и НЕ переключаем НП на
+        # «сразу по карте»: раз карта не открывается, следующие рубрики
+        # честнее искать с названием, чем записать пустыми.
+        log.warning("↪ карта не перешла на НП (%s) — оставляю правдоподобное "
+                    "из выдачи", str(exc).splitlines()[0])
+        return [o for o in orgs if _plausible_here(o, center_ll)], None
     first = [o for o in orgs if _plausible_here(o, center_ll)]
     seen_keys = {_dedup_key(o) for o in first}
     kept = [o for o in again if _dedup_key(o) not in seen_keys]
