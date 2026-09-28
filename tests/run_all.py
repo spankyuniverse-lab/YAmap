@@ -19,7 +19,7 @@ import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-TESTS = ["t_cli", "t_dedup", "t_gt", "t_badname", "t_progress", "t_menu", "t_par", "t_cities", "t_expand", "t_supervise", "t_showmore", "t_search_input", "t_kz_geo", "t_opts", "t_fastapi", "t_rundir", "t_silent", "t_speed", "t_migrate", "t_sheets", "t_crashlog", "t_savecount", "t_onecity", "t_resume_speed"]
+TESTS = ["t_cli", "t_dedup", "t_gt", "t_badname", "t_progress", "t_menu", "t_par", "t_cities", "t_expand", "t_supervise", "t_showmore", "t_search_input", "t_kz_geo", "t_opts", "t_fastapi", "t_rundir", "t_silent", "t_speed", "t_migrate", "t_sheets", "t_crashlog", "t_savecount", "t_onecity", "t_resume_speed", "t_drift"]
 JUNK = ["out", "logs", "runs", "reports", "crashy_worker.py", "fake_worker.py",
         "selectors_cache.json", "e2e.xlsx", "e2e_par.xlsx",
         "kz_osm_places.json"]

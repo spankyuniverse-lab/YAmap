@@ -7,9 +7,10 @@
 московской. Домен переключается флагом --tld (kz/ru/com/by/uz/tr).
 
 Яндекс.Карты используют динамическую подгрузку результатов (infinite scroll),
-поэтому применяется Playwright/patchright с эмуляцией прокрутки и обходом
-анти-фрод системы (SmartCaptcha): настоящий Chrome, persistent-профиль,
-человеческая мышь (Безье), прогрев, адаптивный троттлинг, ротация прокси.
+поэтому применяется Playwright/patchright с эмуляцией прокрутки. Чтобы не
+нарваться на SmartCaptcha: настоящий Chrome, persistent-профиль, прогрев,
+паузы, адаптивный троттлинг. Саму капчу парсер не решает и не кликает —
+пережидает, а в видимом окне ждёт, пока её решит человек.
 
 Режимы работы:
   1. По запросу:    python yandex_parser.py "кофейни Алматы"
@@ -28,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import functools
 import glob
 import json
 import logging
@@ -204,7 +206,7 @@ KZ_CITIES_EXTRA: dict[str, str] = {
     "Ушарал": "80.9833,46.1667",
     "Сарканд": "79.9167,45.4167",
     "Жаркент": "80.0000,44.1667",
-    "Отеген батыр": "76.9833,43.4167",
+    "Отеген батыр": "77.0172,43.4231",     # Википедия; было 76.9833,43.4167 (~3 км)
     # Восточно-Казахстанская / Абай
     "Риддер": "83.5111,50.3439",
     "Алтай": "84.2667,49.7167",           # бывш. Зыряновск
@@ -246,7 +248,7 @@ KZ_CITIES_EXTRA: dict[str, str] = {
     "Бейнеу": "55.2000,45.3167",
     "Форт-Шевченко": "50.2667,44.5167",
     # Западно-Казахстанская
-    "Аксай": "48.2833,51.1667",
+    "Аксай": "52.9950,51.1678",            # ЗКО; было 48.2833 — точка в Саратовской обл. РФ
 }
 
 #: Полный список: областные центры + остальные города и посёлки (96).
@@ -341,7 +343,7 @@ KZ_SETTLEMENTS: dict[str, str] = {
     "Шалкия": "67.4700,43.9700",
     "Бесарык": "66.1000,44.0500",
     "Аксуат": "65.3000,44.7000",
-    "Курык": "52.5000,43.1800",
+    "Курык": "51.6833,43.1833",            # берег Каспия; было 52.50 — 66 км в пустыне
     "Шетпе": "52.1000,44.1700",
     "Жетыбай": "52.0800,43.5800",
     "Мангистау": "51.2700,43.7500",
@@ -349,7 +351,7 @@ KZ_SETTLEMENTS: dict[str, str] = {
     "Таучик": "51.3000,44.2000",
     "Уштаган": "51.7000,44.2000",
     "Сайотес": "53.9500,44.3500",
-    "Боранкул": "53.6500,46.7800",
+    "Боранкул": "54.4711,46.2078",         # было 53.65,46.78 — 89 км мимо
     "Акшукур": "51.1000,43.7500",
     "Кызылтобе": "51.3000,43.7000",
     "Жынгылды": "54.0000,45.5000",
@@ -628,12 +630,12 @@ KZ_SETTLEMENTS: dict[str, str] = {
     "Байсерке": "77.0700,43.4300",
     "Шамалган": "76.5800,43.3600",
     "Ушконыр": "76.5300,43.2300",
-    "Иргели": "76.7400,43.2100",
+    "Иргели": "76.7678,43.2336",          # было 76.74,43.21 — это с. Булакты
     "Туздыбастау": "77.0200,43.2900",
     "Бесагаш": "77.1500,43.3300",
-    "Гульдала": "77.1000,43.3000",
+    "Гульдала": "77.0536,43.3507",        # было 77.10,43.30 — это с. Бельбулак
     "Панфилово": "77.2900,43.3600",
-    "Байтерек": "77.3700,43.3600",
+    "Байтерек": "77.2250,43.4028",        # было 77.37,43.36 — это с. Орикти
     "Тургень": "77.5700,43.4000",
     "Маловодное": "77.7200,43.4300",
     "Жаланаш": "78.6400,43.0400",
@@ -687,6 +689,8 @@ def _query_place_name(place: str) -> str:
     «Кабанбай (Абай)» → «Кабанбай»: скобки нужны только для уникальности
     ключа в справочнике, Яндексу они ломают запрос. Гео-привязку даёт вьюпорт.
     """
+    # « [KG]» — метка тёзки из другой страны в ключе справочника, не имя.
+    place = re.sub(r"\s*\[[A-Z]{2}\]\s*$", "", place)
     return re.sub(r"\s*\([^)]*\)\s*$", "", place).strip() or place
 
 #: Рабочий список из 19 городов — то, что реально нужно для GT-покрытия.
@@ -2256,6 +2260,9 @@ DOMAIN_LOCALE: dict[str, str] = {
 # Активный вьюпорт (устанавливается из --city / --ll в main()).
 MAP_LL: str | None = None
 MAP_Z: int = DEFAULT_CITY_Z
+#: MAP_LL — центр НП (из справочника или явного --ll), а не запасной центр
+#: страны. Только от такого центра можно судить, «ушла» ли выдача.
+MAP_LL_IS_PLACE = False
 
 
 def set_domain(code: str | None) -> None:
@@ -2277,11 +2284,14 @@ def set_domain(code: str | None) -> None:
 
 def set_viewport(city: str | None = None, ll: str | None = None, z: int | None = None) -> None:
     """Установить центр карты (ll=lon,lat) и зум для гео-привязки выдачи к KZ."""
-    global MAP_LL, MAP_Z
+    global MAP_LL, MAP_Z, MAP_LL_IS_PLACE
+    MAP_LL_IS_PLACE = False
     if ll:
         MAP_LL, MAP_Z = ll, (z or DEFAULT_CITY_Z)
+        MAP_LL_IS_PLACE = MAP_Z >= 9          # z=5 — это центр страны, не НП
     elif city and city in PLACES_ALL:
         MAP_LL, MAP_Z = PLACES_ALL[city], (z or DEFAULT_CITY_Z)
+        MAP_LL_IS_PLACE = True
     else:
         # Нет города/координат — центрируемся на всей стране домена, если известно.
         _, _, country_ll, country_z = DOMAIN_REGISTRY.get(
@@ -2314,6 +2324,14 @@ def maps_url() -> str:
 def org_url(seoname: str, org_id: str) -> str:
     """Ссылка на карточку организации (канонизируется на yandex.com, но любой хост резолвит)."""
     return f"{base_url()}/maps/org/{seoname}/{org_id}/"
+
+
+def _map_view_url() -> str:
+    """Карта без запроса, но с языком и текущим вьюпортом (MAP_LL/MAP_Z)."""
+    u = f"{maps_url()}?lang={LANG}"
+    if MAP_LL:
+        u += f"&ll={MAP_LL}&z={MAP_Z}"
+    return u
 
 
 def search_url(query: str, with_viewport: bool = True) -> str:
@@ -2839,6 +2857,9 @@ class Organization:
     is_verified: str = ""        # да, если владелец подтверждён (sources/businessProperties)
     # конверт запроса
     total_result_count: str = "" # data.totalResultCount по запросу
+    # НП по адресу из Яндекса (а не НП, на котором точку нашли) — считается
+    # заново при каждом сохранении книги, см. _place_of
+    place: str = ""
 
 
 FIELDNAMES = [f.name for f in fields(Organization)]
@@ -3052,8 +3073,7 @@ def get_proxy_rotator() -> ProxyRotator:
 
 #: `#js-button` здесь нет намеренно: голый id без пространства имён слишком
 #: легко совпадает с чужой кнопкой на обычной выдаче, а цена ложного
-#: срабатывания — пустой сбор и троттлинг x8 при живом Яндексе. Для КЛИКА по
-#: чекбоксу он остался в `_try_click_captcha`: там мы уже знаем, что капча есть.
+#: срабатывания — пустой сбор и троттлинг x8 при живом Яндексе.
 _CAPTCHA_SELECTORS = [
     "[class*='captcha']",
     "[class*='Captcha']",
@@ -3092,91 +3112,38 @@ def detect_captcha(page: Page) -> bool:
     return any(x in ("showcaptcha", "captcha", "checkcaptcha") for x in segs)
 
 
-def _bezier_mouse_move(page: Page, start_x: float, start_y: float,
-                       end_x: float, end_y: float, steps: int = 15) -> None:
-    """Двигаем мышь по кривой Безье (3 точки) — как человек.
+class CaptchaUnsolved(RuntimeError):
+    """Капча так и не ушла: запрос не выполнен, НП нельзя считать собранным.
 
-    Прямые линии палятся как автоматизация. Человек двигает мышь по дуге
-    с ускорением в начале и замедлением в конце.
+    Отдельный тип, а не пустой список. Пустой список значит «Яндекс честно
+    ничего не нашёл» — и НП уходил в `.cities.json`, после чего докачка его
+    больше не трогала: дыра в покрытии без единого следа в итоговой книге.
     """
-    # Контрольная точка — смещена вбок от прямой
-    ctrl_x = (start_x + end_x) / 2 + random.randint(-80, 80)
-    ctrl_y = (start_y + end_y) / 2 + random.randint(-60, 60)
-
-    for i in range(steps + 1):
-        t = i / steps
-        # Квадратичная Безье: B(t) = (1-t)²·P0 + 2(1-t)t·P1 + t²·P2
-        x = (1 - t) ** 2 * start_x + 2 * (1 - t) * t * ctrl_x + t ** 2 * end_x
-        y = (1 - t) ** 2 * start_y + 2 * (1 - t) * t * ctrl_y + t ** 2 * end_y
-        # Небольшой шум
-        x += random.randint(-2, 2)
-        y += random.randint(-2, 2)
-        page.mouse.move(x, y)
-        # Пауза: короткая в середине, длиннее в начале/конце (как человек)
-        if i < 3 or i > steps - 3:
-            page.wait_for_timeout(random.randint(20, 60))
-        else:
-            page.wait_for_timeout(random.randint(5, 20))
 
 
-def _try_click_captcha(page: Page) -> bool:
-    """Попробовать автоматически кликнуть 'Я не робот' (checkbox-капча).
+class CaptchaMidScroll(CaptchaUnsolved):
+    """Капча вылезла посреди прокрутки выдачи — хвост не собран.
 
-    Использует Bezier-кривую для движения мыши — прямые линии палятся.
+    Её ещё не пережидали: `_search_with_retry` повторяет запрос (на входе
+    повтор увидит капчу и подождёт), и только если она держится до последней
+    попытки — это «не решена». В grid-свипе и в --country повтора нет: там
+    это сразу «не решена», а НП/тайл остаётся несобранным и доберётся позже.
+    Раньше тут был голый RuntimeError: после трёх попыток запрос превращался
+    в «пусто», и НП помечался собранным.
     """
-    checkbox_sels = [
-        "[class*='CheckboxCaptcha'] .CheckboxCaptcha-Button",
-        "[class*='CheckboxCaptcha-Button']",
-        "#js-button",
-        "input[type='submit'][value*='робот']",
-        "button:has-text('робот')",
-        "[class*='captcha'] button",
-        ".smartcaptcha input[type='checkbox']",
-    ]
-    for sel in checkbox_sels:
-        try:
-            btn = page.locator(sel).first
-            if btn.count() > 0 and btn.is_visible():
-                box = btn.bounding_box()
-                if box:
-                    # Стартуем из случайной точки на странице
-                    start_x = random.randint(200, 600)
-                    start_y = random.randint(100, 400)
-                    page.mouse.move(start_x, start_y)
-                    page.wait_for_timeout(random.randint(200, 500))
-
-                    # Двигаем по Безье к кнопке
-                    target_x = box["x"] + box["width"] / 2 + random.randint(-3, 3)
-                    target_y = box["y"] + box["height"] / 2 + random.randint(-2, 2)
-                    _bezier_mouse_move(page, start_x, start_y, target_x, target_y)
-
-                    # Небольшая пауза перед кликом (человек "прицеливается")
-                    page.wait_for_timeout(random.randint(100, 300))
-
-                    # Клик по Безье-точке
-                    page.mouse.click(target_x, target_y)
-                else:
-                    # Нет bounding box — обычный клик
-                    btn.click()
-                log.info("Автоклик по кнопке капчи: %s", sel)
-                page.wait_for_timeout(3000)
-                return not detect_captcha(page)
-        except Exception:
-            continue
-    return False
 
 
 def handle_captcha(page: Page, headless: bool) -> bool:
-    """Обработать CAPTCHA: автоклик → сразу ручное решение.
+    """Переждать CAPTCHA. Сами мы её не решаем и ни на что в ней не кликаем.
 
-    Стратегия без платных сервисов:
-    1. Автоклик checkbox «Я не робот» (Bezier-мышь)
-    2. Если не помогло — сразу просим решить вручную (не тратим время на reload)
-    3. В headless — пауза + reload (надежда на протухание)
+    1. Пауза 15–25 сек и перезагрузка — капча часто уходит сама.
+    2. В видимом окне ждём до 5 минут, пока её решит человек; в headless —
+       ещё минута паузы и перезагрузка.
 
-    Один раз решил вручную → persistent profile запоминает → следующий раз без капчи.
+    Не ушла — возвращаем False, а вызывающий бросает `CaptchaUnsolved`:
+    лечение одно — остановиться, снизить число браузеров и продолжить позже.
 
-    Возвращает True если CAPTCHA решена, False если таймаут.
+    Возвращает True если CAPTCHA ушла, False если таймаут.
     """
     if not detect_captcha(page):
         return True
@@ -3184,13 +3151,7 @@ def handle_captcha(page: Page, headless: bool) -> bool:
     log.warning("=" * 60)
     log.warning("ОБНАРУЖЕНА CAPTCHA!")
 
-    # 1. Пробуем автоклик (checkbox «Я не робот») с Bezier-движением мыши
-    if _try_click_captcha(page):
-        log.info("CAPTCHA решена автокликом!")
-        log.warning("=" * 60)
-        return True
-
-    # 2. Пауза + reload — иногда капча протухает после ожидания
+    # 1. Пауза + reload — капча часто протухает после ожидания
     log.info("Пауза 15-25 сек + reload (капча может протухнуть)…")
     page.wait_for_timeout(random.randint(15000, 25000))
     try:
@@ -3200,15 +3161,10 @@ def handle_captcha(page: Page, headless: bool) -> bool:
             log.info("CAPTCHA исчезла после паузы и reload!")
             log.warning("=" * 60)
             return True
-        # Ещё раз пробуем автоклик — может теперь простая форма
-        if _try_click_captcha(page):
-            log.info("CAPTCHA решена автокликом после reload!")
-            log.warning("=" * 60)
-            return True
     except Exception:
         pass
 
-    # 3. Ручное решение / автоожидание
+    # 2. Ручное решение / автоожидание
     if headless:
         # В headless ждём подольше — капча может протухнуть
         log.warning("Headless-режим: пауза 60 сек + reload…")
@@ -3223,7 +3179,7 @@ def handle_captcha(page: Page, headless: bool) -> bool:
         except Exception:
             pass
     else:
-        # В видимом браузере — СРАЗУ просим решить вручную
+        # В видимом браузере — просим решить вручную
         log.warning("")
         log.warning("  >>> РЕШИТЕ КАПЧУ В БРАУЗЕРЕ! <<<")
         log.warning("  После решения парсер продолжит автоматически.")
@@ -3310,6 +3266,13 @@ class ResumeManager:
                 norm[en_key] = "" if v is None else str(v)
 
             org = Organization(**{f: norm.get(f, "") for f in FIELDNAMES if f in norm})
+            # Книги до разделения «Продуктовые / Супермаркеты» — переразмечаем
+            # при чтении: иначе старая строка «Продуктовые магазины» шла в
+            # слиянии первой и забирала точку себе. Только строки сбора по
+            # категориям (у них есть «Запрос»): в свипе и в одиночном запросе
+            # колонка «Поисковый запрос» — сам запрос, и её не трогаем.
+            if org.gt_slug in _GROCERY_SLUGS and org.source_query:
+                org.search_query, org.gt_slug = category_for(org, org.source_query)
             # Ключ — ТОТ ЖЕ _dedup_key, что и в живом сборе (org_id важнее
             # имени+адреса). Старый ключ «имя|адрес» схлопывал разные точки
             # сети с одинаковым названием и пустым/общим адресом: 30 АЗС
@@ -3496,7 +3459,8 @@ CATEGORIES: dict[str, list[str]] = {
 # иначе одни и те же запросы прогонялись бы дважды.
 # ---------------------------------------------------------------------------
 
-# GT-сегмент — РОВНО 5 категорий, один в один с рабочей таксономией (2ГИС).
+# GT-сегмент — 5 категорий, один в один с рабочей таксономией 2ГИС:
+# Заправки, Поесть, Продуктовые магазины, Супермаркеты, Гипермаркеты.
 # Пара: (слаг как в 2ГИС, поисковый запрос к Яндексу). Запрос он же название
 # листа в Excel, поэтому формулировки взяты те, которые Яндекс уверенно сводит
 # на свою рубрику.
@@ -3518,11 +3482,14 @@ GT_SEGMENT: list[tuple[str, str, list[str]]] = [
     ("gt_zapravki",     "Заправки",             ["Заправки"]),
     ("gt_poest",        "Поесть",               ["Кафе", "Ресторан",
                                                  "Быстрое питание", "Столовая"]),
-    # Супермаркеты идут сюда же: отдельной категорией они были почти пустыми,
-    # потому что Яндекс отдаёт те же точки и как «Магазин продуктов».
+    # Супермаркеты — отдельной категорией, как в 2ГИС (rubricId 350). Раньше
+    # они лежали в «Продуктовых»: отдельный лист выходил почти пустым, потому
+    # что Яндекс отдаёт те же точки и на «Магазин продуктов», а побеждал
+    # первый запрос. Теперь продуктовой точке категорию даёт её собственная
+    # основная рубрика в Яндексе (см. category_for), а не запрос.
     ("gt_produktovye",  "Продуктовые магазины", ["Магазин продуктов",
-                                                 "Супермаркет",
                                                  "Магазин смешанных товаров"]),
+    ("gt_supermarkety", "Супермаркеты",         ["Супермаркет"]),
     ("gt_gipermarkety", "Гипермаркеты",         ["Гипермаркет"]),
 ]
 
@@ -3536,6 +3503,49 @@ QUERY_CATEGORY: dict[str, tuple[str, str]] = {
 def category_of(query: str) -> tuple[str, str]:
     """Запрос → (название категории, слаг). Незнакомый запрос — сам себе имя."""
     return QUERY_CATEGORY.get(query, (query, ""))
+
+
+#: Продуктовая группа, где категорию точке даёт её основная рубрика в Яндексе.
+_GROCERY_SLUGS = frozenset({"gt_produktovye", "gt_supermarkety", "gt_gipermarkety"})
+#: Слаг основной рубрики Яндекса → категория. Классы рубрик тут не помогают:
+#: у «Магазина продуктов» и «Супермаркета» класс один — supermarket.
+_RUBRIC_SEO_CATEGORY = {
+    "grocery": "gt_produktovye", "convenience_store": "gt_produktovye",
+    "supermarket": "gt_supermarkety",
+    "food_hypermarket": "gt_gipermarkety", "hypermarket": "gt_gipermarkety",
+}
+#: Запасной путь — по названию основной рубрики (сниппет без API, макет).
+_RUBRIC_NAME_CATEGORY = {
+    "магазин продуктов": "gt_produktovye",
+    "магазин смешанных товаров": "gt_produktovye",
+    "супермаркет": "gt_supermarkety",
+    "продуктовый гипермаркет": "gt_gipermarkety", "гипермаркет": "gt_gipermarkety",
+}
+_SLUG_LABEL = {slug: label for slug, label, _qs in GT_SEGMENT}
+
+
+def category_for(org: "Organization", query: str) -> tuple[str, str]:
+    """Категория точки: по запросу, а в продуктовой группе — по её рубрике.
+
+    Один и тот же супермаркет Яндекс отдаёт и на «Магазин продуктов», и на
+    «Супермаркет». По запросу он попадал туда, где его нашли первым, и лист
+    «Супермаркеты» выходил почти пустым. Берём ПЕРВУЮ (основную) рубрику:
+    у сотен точек «Супермаркет» стоит второй после «Магазина продуктов».
+    """
+    label, slug = category_of(query)
+    if slug not in _GROCERY_SLUGS:
+        return label, slug
+    seo = (org.category_seonames or "").split(";")[0].strip().lower()
+    name = (org.category or "").split(",")[0].strip().lower()
+    # Незнакомая рубрика (мясная лавка, овощной) — «Продуктовые», с какого бы
+    # из двух запросов её ни нашли: лавку находят и «Магазином продуктов», и
+    # «Супермаркетом», и лист зависел бы от того, какой запрос шёл первым.
+    # «Гипермаркет» приносит и ТЦ с электроникой — они остаются в
+    # «Гипермаркетах», как было до разделения; «Продуктовые» — не свалка.
+    fallback = "gt_gipermarkety" if slug == "gt_gipermarkety" else "gt_produktovye"
+    own = (_RUBRIC_SEO_CATEGORY.get(seo) or _RUBRIC_NAME_CATEGORY.get(name)
+           or fallback)
+    return _SLUG_LABEL[own], own
 
 
 GT_ALL: list[str] = [q for _s, _l, qs in GT_SEGMENT for q in qs]
@@ -4711,7 +4721,7 @@ def scroll_and_parse(
             if settled_rounds >= SCROLL_STALE_FAST:
                 if detect_captcha(page):
                     get_throttle().on_captcha()
-                    raise RuntimeError(
+                    raise CaptchaMidScroll(
                         f"Капча посреди скролла — собрано лишь {len(orgs)}, "
                         "запрос надо повторить")
                 log.info("Выдача кончилась: список не растёт, низ достигнут, "
@@ -4730,7 +4740,7 @@ def scroll_and_parse(
             # больше никогда не пересобирала.
             if detect_captcha(page):
                 get_throttle().on_captcha()
-                raise RuntimeError(
+                raise CaptchaMidScroll(
                     f"Капча посреди скролла — собрано лишь {len(orgs)}, "
                     "запрос надо повторить")
             log.info("Новые результаты не появляются, завершаем (всего %d)", len(orgs))
@@ -5724,16 +5734,211 @@ _HOUSE_ONLY_RE = re.compile(
     re.IGNORECASE)
 
 
+#: Казахские буквы → русские: «Қаскелең» и «Каскелен» — один НП.
+_KK_TO_RU = str.maketrans({"қ": "к", "ғ": "г", "ң": "н", "ө": "о", "ұ": "у",
+                           "ү": "у", "һ": "х", "і": "и", "ә": "а", "ё": "е"})
+#: Латинские двойники кириллицы — в адресах Яндекса встречаются («кентi»).
+_LAT_TO_CYR = str.maketrans({"a": "а", "e": "е", "o": "о", "c": "с", "p": "р",
+                             "x": "х", "y": "у", "k": "к", "i": "і", "m": "м",
+                             "t": "т", "h": "н", "b": "в"})
+#: Как Яндекс подписывает НП в адресе: «село Коксай», «посёлок Нура»,
+#: «Іргелі ауылы», «село имени Турара Рыскулова».
+_PLACE_PREFIX_RE = re.compile(
+    r"^(?:(?:посёлок|поселок) городского типа|село имени|аул имени|посёлок|"
+    r"поселок|село|аул|город|станция|кент|г\.|с\.|п\.)\s+", re.IGNORECASE)
+_PLACE_SUFFIX_RE = re.compile(
+    r"\s+(?:ауылы|ауыл|кенті|кенти|қаласы|каласы|селосы)$", re.IGNORECASE)
+#: Не НП, а дачи и промзоны: «садоводческий кооператив …», «ДП СО Строитель».
+_NOT_PLACE_RE = re.compile(
+    r"^(?:садоводческ\w*|садов\w*\s+(?:участ|товарищ|общест|кооперат|масс)|"
+    r"дачн\w*\s+(?:масс|участ|товарищ|кооперат|общест)|"
+    r"(?:снт|сот|пкст|дп|ст)\b|жилой массив|массив\b|промзона|"
+    r"потребительский кооператив|кооператив\b)", re.IGNORECASE)
+#: Имена из адресов, которые с ключом справочника не сводятся буквами.
+_PLACE_ALIASES = {
+    "орал": "Уральск", "оскемен": "Усть-Каменогорск", "караганды": "Караганда",
+    "туркистан": "Туркестан", "арысь": "Арыс", "зеренды": "Зеренда",
+    "шынгырлау": "Чингирлау", "нурсултан": "Астана", "петропавл": "Петропавловск",
+    "алмаата": "Алматы", "семипалатинск": "Семей", "гурьев": "Атырау",
+    "чимкент": "Шымкент",
+}
+#: Имя из адреса дальше этого от центра одноимённого НП — чужой тёзка.
+PLACE_MATCH_KM = 50.0
+#: Для сверки по «скелету» (казахское написание: Екібастұз/Экибастуз,
+#: Балқаш/Балхаш, Сәтбаев/Сатпаев) порог строже — совпадение грубое.
+PLACE_SKELETON_KM = 30.0
+#: Дача/промзона: ближайший НП не дальше этого, иначе — НП поиска.
+PLACE_NEAREST_KM = 15.0
+_PLACE_INDEX: dict[str, list[str]] = {}
+_PLACE_INDEX_STEM: dict[str, list[str]] = {}
+_PLACE_INDEX_SKEL: dict[str, list[str]] = {}
+_PLACE_CENTERS: dict[str, tuple[float, float]] = {}
+
+
+@functools.lru_cache(maxsize=65536)
+def _place_norm(text: str) -> str:
+    """Имя НП для сверки адреса со справочником: без регистра, скобок,
+    «село/посёлок/ауылы», казахских букв, пробелов и дефисов."""
+    t = unicodedata.normalize("NFC", text or "").strip()
+    t = re.sub(r"\s*\[[A-Za-z]{2}\]\s*$", "", t)  # метка тёзки из другой страны
+    t = t.lower().translate(_LAT_TO_CYR)
+    t = _PLACE_SUFFIX_RE.sub("", _PLACE_PREFIX_RE.sub("", t))
+    t = t.translate(_KK_TO_RU)
+    t = re.sub(r"\s*\([^)]*\)", "", t)
+    return re.sub(r"[\s\-]+", " ", t).strip()
+
+
+def _place_stem(norm: str) -> str:
+    """Родительный падеж → основа: «отеген батыра» ~ «отеген батыр»."""
+    return " ".join(re.sub(r"(?:ова|ева|ина|ов|ев|ин|а|я|ы|и)$", "", w)
+                    if len(w) > 4 else w for w in norm.split())
+
+
+_SKEL_PAIRS = str.maketrans({"б": "п", "д": "т", "г": "к", "х": "к", "з": "с",
+                             "в": "ф", "ж": "ш", "щ": "ш", "ц": "с"})
+
+
+def _place_skeleton(norm: str) -> str:
+    """Согласные без звонкости: «екибастуз»/«экибастуз» → «кпстс»,
+    «балкаш»/«балхаш» → «плкш», «сатбаев»/«сатпаев» → «стпф»."""
+    t = norm.replace(" ", "").translate(_SKEL_PAIRS)
+    return re.sub(r"[аеёиоуыэюяйьъ]", "", t)
+
+
 def _refresh_locality_index() -> None:
-    """Пересобрать набор известных НП для `_loose_addr`.
+    """Пересобрать набор известных НП для `_loose_addr` и индексы для _place_of.
 
     Нужен после `load_osm_places`: множество считается на импорте, а
     справочник пополняется в рантайме. Без пересчёта адреса вида
     «Актоган, ул. Абая, 1» переставали распознаваться как «НП + улица»,
     и дедуп DOM↔API по таким сёлам разъезжался.
     """
-    global _KZ_CITIES_LOWER
+    global _KZ_CITIES_LOWER, _PLACE_INDEX, _PLACE_INDEX_STEM, _PLACE_INDEX_SKEL
+    global _PLACE_CENTERS
     _KZ_CITIES_LOWER = {_query_place_name(c).lower() for c in PLACES_ALL}
+    idx: dict[str, list[str]] = {}
+    stem: dict[str, list[str]] = {}
+    skel: dict[str, list[str]] = {}
+    centers: dict[str, tuple[float, float]] = {}
+    for key, ll in PLACES_ALL.items():
+        n = _place_norm(key)
+        idx.setdefault(n.replace(" ", ""), []).append(key)
+        stem.setdefault(_place_stem(n).replace(" ", ""), []).append(key)
+        sk = _place_skeleton(n)
+        if len(sk) >= 4:        # из трёх согласных коллизий слишком много
+            skel.setdefault(sk, []).append(key)
+        try:
+            lon, lat = (float(x) for x in ll.split(","))
+            centers[key] = (lat, lon)
+        except ValueError:
+            pass
+    for alias, target in _PLACE_ALIASES.items():
+        if target in PLACES_ALL and target not in idx.get(alias, []):
+            idx.setdefault(alias, []).append(target)
+    _PLACE_INDEX, _PLACE_INDEX_STEM, _PLACE_INDEX_SKEL = idx, stem, skel
+    _PLACE_CENTERS = centers
+
+
+def _nearest_of(keys, lat: float, lon: float, max_km: float) -> str:
+    """Ближайший к точке НП из списка ключей, не дальше max_km; иначе ""."""
+    best, best_km = "", max_km
+    for key in keys:
+        c = _PLACE_CENTERS.get(key)
+        if not c:
+            continue
+        p1, p2 = math.radians(c[0]), math.radians(lat)
+        h = (math.sin((p2 - p1) / 2) ** 2 + math.cos(p1) * math.cos(p2)
+             * math.sin(math.radians(lon - c[1]) / 2) ** 2)
+        km = 6371.0 * 2 * math.asin(math.sqrt(h))
+        if km <= best_km:
+            best, best_km = key, km
+    return best
+
+
+def _org_latlon(org: "Organization") -> tuple[float, float] | None:
+    try:
+        lat, lon = float(org.latitude), float(org.longitude)
+    except (TypeError, ValueError):
+        return None
+    return (lat, lon) if (-90 <= lat <= 90 and -180 <= lon <= 180) else None
+
+
+def _place_match(org: "Organization") -> str:
+    """Ключ справочника для НП из адреса точки; "" — не нашли.
+
+    Тёзок разводим по координатам: имя, совпавшее с НП дальше PLACE_MATCH_KM,
+    — это другой НП с тем же именем, а не он.
+    """
+    loc = (org.locality or "").strip()
+    if not loc:
+        return ""
+    n = _place_norm(loc)
+    ll = _org_latlon(org)
+    for index, key, max_km in (
+            (_PLACE_INDEX, n.replace(" ", ""), PLACE_MATCH_KM),
+            (_PLACE_INDEX_STEM, _place_stem(n).replace(" ", ""), PLACE_MATCH_KM),
+            (_PLACE_INDEX_SKEL, _place_skeleton(n), PLACE_SKELETON_KM)):
+        cands = index.get(key) if key and (index is not _PLACE_INDEX_SKEL
+                                           or len(key) >= 4) else None
+        if not cands:
+            continue
+        if ll:
+            hit = _nearest_of(cands, ll[0], ll[1], max_km)
+            if hit:
+                return hit
+        elif index is not _PLACE_INDEX_SKEL:
+            if (org.city or "") in cands:
+                return org.city
+            if len(cands) == 1:
+                return cands[0]
+    return ""
+
+
+def _place_key(org: "Organization") -> str:
+    """Ключ справочника для точки: НП из адреса, а для дач и промзон —
+    ближайший НП не дальше PLACE_NEAREST_KM. "" — в справочнике не нашли."""
+    key = _place_match(org)
+    if key:
+        return key
+    loc = (org.locality or "").strip()
+    if loc and _NOT_PLACE_RE.match(unicodedata.normalize("NFC", loc)):
+        ll = _org_latlon(org)
+        if ll:
+            return _nearest_of(_PLACE_CENTERS, ll[0], ll[1], PLACE_NEAREST_KM)
+    return ""
+
+
+def _place_of(org: "Organization") -> str:
+    """НП точки по её адресу в Яндексе, а не по НП, на котором её нашли.
+
+    НП поиска врёт: окно карты накрывает соседей, а при слиянии выигрывает
+    НП, искавшийся первым. В прогоне 13.09.2026 так 1249 точек Астаны
+    числились за селом Кабанбай батыра, а всего не на своём НП было 22%.
+
+    Порядок: НП из адреса, найденный в справочнике → дача/промзона — ближайший
+    НП справочника → имя из адреса как есть (НП вне справочника) → НП поиска,
+    если адреса нет вовсе.
+    """
+    key = _place_key(org)
+    if key:
+        return key
+    loc = unicodedata.normalize("NFC", org.locality or "").strip()
+    if not loc or _NOT_PLACE_RE.match(loc):
+        return (org.city or "").strip() or loc
+    n = _place_norm(loc)
+    if _PLACE_INDEX.get(n.replace(" ", "")) or _PLACE_INDEX_STEM.get(
+            _place_stem(n).replace(" ", "")):
+        # Имя справочнику известно, но точка за PLACE_MATCH_KM от него:
+        # «Усть-Каменогорск» в 300 км от города. Адресу тут веры нет — НП поиска.
+        return (org.city or "").strip() or loc
+    return _PLACE_SUFFIX_RE.sub("", _PLACE_PREFIX_RE.sub("", loc)).strip() or loc
+
+
+def _fill_places(orgs: list["Organization"]) -> None:
+    """Проставить «НП (по адресу)» перед записью — всегда заново: у воркера
+    справочник НП меньше, а в старых книгах колонки нет вовсе."""
+    for o in orgs:
+        o.place = _place_of(o)
 
 
 # Первичная сборка объединений: до этой строки PLACES_ALL пуст, потому что
@@ -6063,6 +6268,7 @@ def _atomic_write_text(path: Path, text: str) -> None:
 
 
 def save_csv(orgs: list[Organization], path: Path) -> None:
+    _fill_places(orgs)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = _tmp_path(path)
     with open(tmp, "w", newline="", encoding="utf-8-sig") as f:
@@ -6075,6 +6281,7 @@ def save_csv(orgs: list[Organization], path: Path) -> None:
 
 
 def save_json(orgs: list[Organization], path: Path) -> None:
+    _fill_places(orgs)
     path.parent.mkdir(parents=True, exist_ok=True)
     data = {
         "total": len(orgs),
@@ -6149,6 +6356,7 @@ HEADERS_RU = {
     "awards": "Награды",
     "is_verified": "Подтверждён владельцем",
     "total_result_count": "Всего найдено",
+    "place": "НП (по адресу)",
 }
 
 
@@ -6248,6 +6456,7 @@ def _write_sheet(ws, orgs: list[Organization]) -> None:
 
 
 def save_xlsx(orgs: list[Organization], path: Path) -> None:
+    _fill_places(orgs)
     try:
         from openpyxl import Workbook  # noqa: F401 — проверка наличия библиотеки
     except ImportError:
@@ -6319,7 +6528,15 @@ def _major_city_of(org: Organization) -> str:
     там работа режется по тайлам, а не по НП. Поэтому вторым заходом ищем
     город в адресе — иначе весь национальный свип целиком уехал бы в сёла.
     """
+    # НП по адресу (проставлен при сохранении, см. _fill_places) — главнее НП
+    # поиска. Но только ключ справочника: голое имя из адреса («село Жамбыл» за
+    # 400 км от Тараза) совпало бы с псевдонимом крупного города и увело село в
+    # «Крупные города». Тип строки сводки и разрез листов считаются отсюда же,
+    # поэтому у одного НП они больше не расходятся.
+    place = (org.place or "").strip()
     city = (org.city or "").strip()
+    if place and place != city:
+        return _MAJOR_CANON.get(_norm_name(place), "") if place in PLACES_ALL else ""
     if city:
         # ВАЖНО: уточнение в скобках НЕ отбрасываем. Именно им справочник
         # различает тёзок: «Актау» — город на Каспии, «Актау
@@ -6431,7 +6648,7 @@ def _write_summary_sheet(ws, results: dict[str, list[Organization]]) -> None:
     for cat in cats:
         for o in results[cat]:
             major = _major_city_of(o)
-            name = (o.city or "").strip() or major or "(без НП)"
+            name = (o.place or o.city or "").strip() or major or "(без НП)"
             counts.setdefault(name, {})[cat] = counts.setdefault(name, {}).get(cat, 0) + 1
             kind[name] = "Крупный город" if major else "Аул/село"
 
@@ -6481,6 +6698,7 @@ def save_xlsx_by_categories(
     all_orgs: list[Organization] = []
     for orgs in results.values():
         all_orgs.extend(orgs)
+    _fill_places(all_orgs)      # сводка и разрез «города / сёла» — по нему
     try:
         wb = _new_workbook()
 
@@ -7162,8 +7380,8 @@ def _search_and_collect(
         if detect_captcha(page):
             throttle.on_captcha()
             if not handle_captcha(page, headless):
-                log.error("CAPTCHA не решена, пропускаю запрос: %s", query)
-                return []
+                log.error("CAPTCHA не решена, запрос не выполнен: %s", query)
+                raise CaptchaUnsolved(query)
         else:
             throttle.on_success()
 
@@ -7253,7 +7471,7 @@ def _collect_current_results(
                 get_throttle().on_captcha()
                 if not handle_captcha(page, headless):
                     record_error(f"Капча на выдаче «{query}» не решена")
-                    return []
+                    raise CaptchaUnsolved(query)
                 try:
                     page.wait_for_selector(item_sel or ITEM_SEL, timeout=10000)
                     found = True
@@ -7384,7 +7602,6 @@ def _grid_search(
     throttle = get_throttle()
     all_orgs: list[Organization] = []
     seen: set[str] = set()
-
     for idx, ll in enumerate(tiles, 1):
         MAP_LL, MAP_Z = ll, GRID_TILE_Z
         log.info("Grid [%d/%d] вьюпорт ll=%s z=%d", idx, len(tiles), ll, GRID_TILE_Z)
@@ -7407,7 +7624,10 @@ def _grid_search(
                 throttle.on_captcha()
                 if not handle_captcha(page, headless):
                     record_error(f"Grid-тайл {ll}: капча не решена")
-                    continue
+                    # Сразу наверх: остальные тайлы под той же капчей — это
+                    # ещё по 5 минут ожидания на каждый ради сбора, который
+                    # всё равно не засчитается (запрос не выполнен целиком).
+                    raise CaptchaUnsolved(query)
             else:
                 throttle.on_success()
 
@@ -7527,15 +7747,36 @@ def _search_with_retry(
                 page.wait_for_timeout(random.randint(5000, 10000))
             else:
                 return []
+        except CaptchaMidScroll as exc:
+            # Капчу посреди скролла ещё не пережидали: повтор увидит её на
+            # входе и подождёт. Держится до последней попытки — «не решена».
+            if attempt >= max_retries:
+                raise
+            wait_sec = attempt * 10
+            log.warning("%s. Retry через %d сек (попытка %d/%d)",
+                        exc, wait_sec, attempt, max_retries)
+            page.wait_for_timeout(wait_sec * 1000)
+            try:
+                page.goto(_map_view_url(), wait_until="domcontentloaded", timeout=15000)
+                page.wait_for_timeout(random.randint(2000, 4000))
+            except Exception:
+                pass
+        except CaptchaUnsolved:
+            # Капчу уже пережидали и она не ушла. Повторять бессмысленно:
+            # каждый круг — ещё до 5 минут ожидания той же капчи. Решает
+            # вызывающий: НП не помечается собранным.
+            raise
         except Exception as exc:
             if attempt < max_retries:
                 wait_sec = attempt * 10
                 log.warning("Ошибка при поиске «%s»: %s. Retry через %d сек (попытка %d/%d)",
                             query, exc, wait_sec, attempt, max_retries)
                 page.wait_for_timeout(wait_sec * 1000)
-                # Возвращаемся на карты перед retry
+                # Возвращаемся на карты перед retry — на карту ЭТОГО НП: голый
+                # maps_url() уводил карту в регион Яндекса по умолчанию, и
+                # следующий ввод в строку поиска шёл уже там.
                 try:
-                    page.goto(maps_url(), wait_until="domcontentloaded", timeout=15000)
+                    page.goto(_map_view_url(), wait_until="domcontentloaded", timeout=15000)
                     page.wait_for_timeout(random.randint(2000, 4000))
                 except Exception:
                     pass
@@ -7770,13 +8011,24 @@ def run_parser(
 
             for org in orgs:
                 org.search_query = query
-                org.gt_slug = category_of(query)[1]
+                org.gt_slug = category_for(org, query)[1]
 
             if detail:
                 _enrich_orgs(ctx, orgs)
 
             # Persistent context сохраняет всё автоматически при закрытии
             ctx.close()
+    except CaptchaUnsolved:
+        # Собранное до капчи уже лежит в промежуточных сохранениях — пустой
+        # список затёр бы его пустой книгой.
+        orgs = list(incremental_orgs)
+        for org in orgs:
+            org.search_query = query
+            org.gt_slug = category_for(org, query)[1]
+        record_error(f"«{query}»: капча не решена — сбор неполный "
+                     f"({len(orgs)} организаций до капчи)")
+        log.error("Капча не решена — сохраняю собранное до неё (%d). Снизь число "
+                  "браузеров, подожди и повтори с --resume.", len(orgs))
     except Exception as exc:
         record_error(f"Критическая ошибка прогона: {exc}")
         log.error("Прогон прерван ошибкой: %s", exc)
@@ -7957,15 +8209,24 @@ def run_category_parser(
     cooldown_sec: int = 90,
     grid: int = 1,
     session: "BrowserSession | None" = None,
+    captcha_missed: list[str] | None = None,
 ) -> dict[str, list[Organization]]:
     """Парсер по категориям: для каждой категории запускает поиск «категория город».
 
     session — уже открытый браузер. Передаётся из --all-cities, чтобы не
     поднимать Chrome и не прогреваться заново на каждый населённый пункт.
+
+    captcha_missed — сюда кладутся запросы, на которых капча так и не ушла.
+    Непустой список значит «НП не собран», и --all-cities не пишет его в
+    `.cities.json`: следующий запуск доберёт недостающие запросы.
     """
     global _warmed_up
     if session is None:
         _warmed_up = False  # свой контекст браузера — прогрев заново
+    # Центр НП — запоминаем до сбора: grid-свип переставляет MAP_LL на свои
+    # тайлы и обратно не возвращает. НП нет в справочнике — центра нет: от
+    # запасного центра страны любая выдача выглядела бы «ушедшей».
+    center_ll = MAP_LL if (MAP_LL and MAP_LL_IS_PLACE) else ""
     tiles = viewport_grid(MAP_LL, grid) if (grid > 1 and MAP_LL) else None
     if tiles:
         log.info("Grid-свип: %d вьюпортов (%dx%d) на каждую категорию", len(tiles), grid, grid)
@@ -8021,6 +8282,18 @@ def run_category_parser(
       def _collect_on(ctx: Any, page: Any) -> None:
         """Пройти все категории города на уже открытой вкладке."""
 
+        # Общий браузер (--all-cities): карта стоит там, где кончился поиск по
+        # прошлому НП, и запрос «<рубрика> <НП>» Яндекс разбирал ОТТУДА —
+        # тёзки уводили выдачу за сотни километров. Переводим карту на этот
+        # НП. Первый НП сессии сюда не попадает: его карту ставит прогрев.
+        if _warmed_up and center_ll:
+            try:
+                page.goto(_map_view_url(), wait_until="domcontentloaded",
+                          timeout=30000)
+                page.wait_for_timeout(_pace(random.randint(1500, 3000)))
+            except Exception as exc:
+                log.debug("Карта не перешла на НП %s: %s", city, exc)
+
         for q_idx, cat_query in (cat_iter_tqdm if cat_iter_tqdm else enumerate(queries, 1)):
             # Скобочное уточнение области («Кабанбай (Абай)») в текст запроса
             # не попадает — Яндексу оно ломает поиск, гео-привязку даёт вьюпорт.
@@ -8037,24 +8310,44 @@ def run_category_parser(
             log.info("━━━ [%d/%d] %s ━━━", q_idx, total_queries, full_query)
             q_started = time.time()
 
-            orgs = _search_with_retry(
-                page, full_query, max_results_per_category,
-                scroll_pause, api_intercept, headless=headless, tiles=tiles,
-            )
+            try:
+                orgs = _search_with_retry(
+                    page, full_query, max_results_per_category,
+                    scroll_pause, api_intercept, headless=headless, tiles=tiles,
+                )
+                if orgs and not tiles and center_ll:
+                    orgs, retry_started = _retry_if_drifted(
+                        page, orgs, cat_query, full_query, center_ll,
+                        max_results_per_category, scroll_pause, api_intercept,
+                        headless)
+                    if retry_started:
+                        # Пауза до следующей рубрики считается от ПОВТОРА:
+                        # иначе время двух поисков шло «кредитом» и пауза
+                        # после пары запросов выходила короче положенной.
+                        q_started = retry_started
+            except CaptchaUnsolved:
+                record_error(f"«{full_query}»: капча не решена — НП не собран")
+                if captcha_missed is not None:
+                    captcha_missed.append(cat_query)
+                # Следующие рубрики этого НП почти наверняка упрутся в ту же
+                # капчу, а каждая — до 5 минут ожидания.
+                break
             if not orgs:
                 record_error(f"Пустой результат по запросу «{full_query}» "
                              f"(возможна капча/блокировка)")
 
-            # Дедупликация по имени+адресу
-            cat_label, cat_slug = category_of(cat_query)
-            seen_cat = seen_by_cat.setdefault(cat_label, set())
+            # Дедупликация по имени+адресу — внутри категории ТОЧКИ, а не
+            # запроса: в продуктовой группе они расходятся (category_for).
+            cat_label, _cat_slug = category_of(cat_query)
             unique_orgs: list[Organization] = []
             for org in orgs:
+                o_label, o_slug = category_for(org, cat_query)
+                seen_cat = seen_by_cat.setdefault(o_label, set())
                 key = _dedup_key(org)
                 if key not in seen_cat:
                     seen_cat.add(key)
-                    org.search_query = cat_label
-                    org.gt_slug = cat_slug
+                    org.search_query = o_label
+                    org.gt_slug = o_slug
                     org.source_query = cat_query
                     org.city = city
                     unique_orgs.append(org)
@@ -8062,9 +8355,15 @@ def run_category_parser(
             if detail:
                 _enrich_orgs(ctx, unique_orgs)
 
-            results.setdefault(cat_label, []).extend(unique_orgs)
-            log.info("«%s» по запросу «%s»: +%d (в категории всего %d)",
-                     cat_label, cat_query, len(unique_orgs), len(results[cat_label]))
+            for org in unique_orgs:
+                results.setdefault(org.search_query, []).append(org)
+            per_label: dict[str, int] = {}
+            for org in unique_orgs:
+                per_label[org.search_query] = per_label.get(org.search_query, 0) + 1
+            log.info("«%s» по запросу «%s»: +%d (%s)", cat_label, cat_query,
+                     len(unique_orgs),
+                     ", ".join(f"{k}: всего {len(results.get(k, []))}"
+                               for k in (per_label or {cat_label: 0})))
 
             # Промежуточное сохранение после каждой категории.
             # ОБЯЗАТЕЛЬНО вместе с resume-строками: при resume_path == output
@@ -8228,6 +8527,125 @@ def _too_far_from_viewport(org: "Organization", center_ll: str) -> bool:
     return max(abs(olat - clat), dlon) > MAX_VIEWPORT_DRIFT_DEG
 
 
+#: Выдача «ушла от НП»: запрос «<рубрика> <НП>» Яндекс увёл к тёзке — Актау
+#: на Каспии вместо села Актау под Карагандой, российский Октябрьский вместо
+#: костанайского, Горно-Алтайск вместо города Алтай. В прогоне 13.09.2026 так
+#: ушли целиком 76 НП из 504 и ещё 83 — большей частью; своё по ним не
+#: собиралось вовсе. Признак — ПЕРВАЯ страница выдачи (DRIFT_HEAD точек с
+#: координатами): ближе DRIFT_NEAR_KM к центру НП меньше DRIFT_NEAR_SHARE.
+#: Именно первая: по мере скролла Яндекс законно расширяет выдачу вдаль
+#: (у Павлодара — до Барнаула), и доля по всему списку давала ложный повтор.
+DRIFT_NEAR_KM = 30.0
+DRIFT_NEAR_SHARE = 0.3
+DRIFT_MIN_COORDS = 3
+DRIFT_HEAD = 20
+#: Повтор ищет голую рубрику по карте НП: без топонима Яндекс ищет в видимой
+#: области. Окно z=12 (~30 км) вместо z=11 (~59 км) — меньше чужого соседства.
+DRIFT_RETRY_Z = 12
+
+
+def _km_to(org: "Organization", lat0: float, lon0: float) -> float | None:
+    """Расстояние от организации до точки, км; None — координат нет."""
+    try:
+        lat, lon = float(org.latitude), float(org.longitude)
+    except (TypeError, ValueError):
+        return None
+    if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+        return None
+    p1, p2 = math.radians(lat0), math.radians(lat)
+    h = (math.sin((p2 - p1) / 2) ** 2 + math.cos(p1) * math.cos(p2)
+         * math.sin(math.radians(lon - lon0) / 2) ** 2)
+    return 6371.0 * 2 * math.asin(math.sqrt(h))
+
+
+def _is_drifted(orgs: list["Organization"], center_ll: str) -> tuple[bool, int, int]:
+    """(ушла ли выдача, точек рядом, точек с координатами) — по первой странице."""
+    try:
+        lon0, lat0 = (float(x) for x in center_ll.split(","))
+    except ValueError:
+        return False, 0, 0
+    dist = (_km_to(o, lat0, lon0) for o in orgs)
+    head = [d for d in dist if d is not None][:DRIFT_HEAD]
+    near = sum(1 for d in head if d <= DRIFT_NEAR_KM)
+    drifted = len(head) >= DRIFT_MIN_COORDS and near < DRIFT_NEAR_SHARE * len(head)
+    return drifted, near, len(head)
+
+
+def _plausible_here(org: "Organization", center_ll: str) -> bool:
+    """Точка может относиться к НП: не зарубежная и не через полстраны.
+
+    Тот же фильтр, что в run_cities_parser: из ушедшей выдачи он оставляет
+    всё, что оставлял и раньше, — повтор только добавляет, не отнимает.
+    """
+    if org.address and _FOREIGN_ADDR_RE.search(org.address):
+        return False
+    return not _too_far_from_viewport(org, center_ll)
+
+
+def _retry_if_drifted(
+    page: Page,
+    orgs: list[Organization],
+    cat_query: str,
+    full_query: str,
+    center_ll: str,
+    max_results: int,
+    scroll_pause: float,
+    api_intercept: bool,
+    headless: bool,
+) -> tuple[list[Organization], float | None]:
+    """Выдача ушла от НП — повторить рубрику без названия по карте НП.
+
+    Возвращает (организации, время начала повтора или None, если повтора не
+    было). Сбой перехода на карту НП повтор отменяет, а не обрывает НП.
+    """
+    global MAP_LL, MAP_Z
+    drifted, near, known = _is_drifted(orgs, center_ll)
+    if not drifted:
+        return orgs, None
+    log.warning("↪ «%s»: выдача ушла от НП — на первой странице ближе %d км "
+                "лишь %d из %d точек. Ищу «%s» по карте НП, без названия",
+                full_query, DRIFT_NEAR_KM, near, known, cat_query)
+    # Повтор — это ещё один запрос к Яндексу: перед ним та же пауза, что
+    # между рубриками, целиком и с множителем троттлинга.
+    page.wait_for_timeout(get_throttle().get_pause(base_ms=random.randint(3000, 6000)))
+    saved = (MAP_LL, MAP_Z)
+    MAP_LL, MAP_Z = center_ll, max(MAP_Z, DRIFT_RETRY_Z)
+    try:
+        try:
+            page.goto(_map_view_url(), wait_until="domcontentloaded", timeout=30000)
+            page.wait_for_timeout(_pace(random.randint(1500, 3000)))
+        except Exception as exc:
+            log.warning("↪ карта не перешла на НП (%s) — оставляю выдачу как есть", exc)
+            return orgs, time.time()
+        # Засекаем ПОСЛЕ перехода: загрузка карты и намеренная пауза — не
+        # «простой» запроса, в кредит паузы до следующей рубрики не идут.
+        started = time.time()
+        again = _search_with_retry(page, cat_query, max_results, scroll_pause,
+                                   api_intercept, headless=headless)
+    finally:
+        MAP_LL, MAP_Z = saved
+    first = [o for o in orgs if _plausible_here(o, center_ll)]
+    seen_keys = {_dedup_key(o) for o in first}
+    kept = [o for o in again
+            if _plausible_here(o, center_ll) and _dedup_key(o) not in seen_keys]
+    log.info("↪ «%s» по карте НП: +%d новых точек (из ушедшей выдачи оставлено "
+             "%d, отброшено %d)", cat_query, len(kept), len(first),
+             len(orgs) - len(first))
+    out = first + kept
+    return (out[:max_results] if max_results else out), started
+
+
+def _captcha_stop_flag(out_path: Path) -> Path:
+    """Файл-флаг «прогон встал на капче» рядом с выгрузкой."""
+    return out_path.with_name(out_path.stem + ".captcha_stop")
+
+
+#: Сколько НП подряд с нерешённой капчей терпим, прежде чем остановиться.
+#: Капча, не уходящая раз за разом, — это бан по IP: дальше будет только хуже,
+#: а каждый такой НП стоит до пяти минут ожидания.
+MAX_CAPTCHA_NP_STREAK = 5
+
+
 def run_cities_parser(
     cities: list[str],
     categories: list[str],
@@ -8316,11 +8734,17 @@ def run_cities_parser(
     # давал: профиль persistent, куки переживают его всё равно.
     session = BrowserSession(kwargs.get("headless", True),
                              proxy_url=kwargs.get("proxy_url"))
+    captcha_streak = 0
+    # Флаг «остановился на капче» — по нему родитель не запускает добор сразу
+    # же с того же IP. Новый запуск той же командой — новая попытка.
+    stop_flag = _captcha_stop_flag(out_path)
+    stop_flag.unlink(missing_ok=True)
     try:
         for idx, city in enumerate(todo, 1):
             log.info("═══ Город %d/%d: %s ═══", idx, len(todo), city)
             set_viewport(city=city)
             part = parts_dir / f"{_safe_name(city)}.xlsx"
+            missed: list[str] = []
             try:
                 per_city = run_category_parser(
                     city=city,
@@ -8330,6 +8754,7 @@ def run_cities_parser(
                     # ПОСЕРЕДИНЕ города, уже собранные категории не переспрашиваем.
                     resume_path=part if part.exists() else None,
                     session=session,
+                    captcha_missed=missed,
                     **kwargs,
                 )
             except KeyboardInterrupt:
@@ -8376,7 +8801,16 @@ def run_cities_parser(
                     seen.add(key)
                     bucket.append(o)
                     added += 1
-            done.add(city)
+            if missed:
+                # Собранное частично уже в merged и в части НП; сам НП в
+                # .cities.json НЕ пишем — повторный запуск доберёт недостающие
+                # запросы (часть НП служит ему резюме).
+                captcha_streak += 1
+                log.warning("%s: капча не решена (%s) — НП не отмечен собранным, "
+                            "повторный запуск его доберёт", city, ", ".join(missed))
+            else:
+                captcha_streak = 0
+                done.add(city)
             notes = []
             if foreign:
                 notes.append(f"зарубежных {foreign}")
@@ -8401,8 +8835,36 @@ def run_cities_parser(
                                      json.dumps(sorted(done), ensure_ascii=False))
             except Exception as exc:
                 log.warning("Не сохранил прогресс по городам: %s", exc)
+            if captcha_streak >= MAX_CAPTCHA_NP_STREAK:
+                log.error("Капча не уходит %d НП подряд — останавливаюсь. Снизь "
+                          "число браузеров (-w), подожди и запусти ту же команду: "
+                          "прогон продолжится с места обрыва.", captcha_streak)
+                break      # флаг и досохранение — после цикла
+            if missed and idx < len(todo):
+                # Капча не ушла — остыть перед следующим НП, как в --country.
+                # Иначе следующий запрос шёл через пару секунд после неё.
+                cool_ms = _pace(int(kwargs.get("cooldown_sec") or 90) * 1000)
+                log.info("Пауза %d сек после нерешённой капчи…", cool_ms // 1000)
+                try:
+                    if session.opened:
+                        session.page.wait_for_timeout(cool_ms)
+                    else:
+                        time.sleep(cool_ms / 1000)
+                except KeyboardInterrupt:
+                    log.warning("Прервано пользователем во время паузы после капчи")
+                    break
+                except Exception:
+                    time.sleep(cool_ms / 1000)
     finally:
         session.close(stop_driver=True)
+        # Кончили на капче (серия или хвост шарда с капчей) — флаг ДО любой
+        # записи книги: упади сохранение, перезапущенный воркер всё равно не
+        # пошёл бы на тот же IP, а родитель не бросится добирать.
+        if captcha_streak:
+            try:
+                stop_flag.write_text(str(captcha_streak), encoding="utf-8")
+            except Exception:
+                pass
 
 
     # Досохраняем, если цикл прервали между пачками. Если последняя пачка
@@ -9482,14 +9944,33 @@ def run_country_sweep(
                                 break
                             page.wait_for_timeout(cooldown_sec * 1000)
                             continue
-                        captcha_streak = 0
                     else:
                         throttle.on_success()
-                        captcha_streak = 0
                     tile_orgs = _collect_current_results(
                         page, q, max_per_tile, scroll_pause, api_intercept,
                         on_org=None, headless=headless, collector=collector,
                     )
+                    # Серию капч обнуляем только после СОБРАННОЙ выдачи: капча
+                    # бывает и поздней — вход чистый, а на выдаче уже она. При
+                    # обнулении на входе серия не росла, и забаненный IP
+                    # долбился по кругу без конца.
+                    captcha_streak = 0
+                except CaptchaUnsolved:
+                    # Капча вылезла уже на выдаче — то же, что на входе: тайл
+                    # назад в очередь, а не «ошибка → через три раза пропуск».
+                    record_error(f"Тайл {MAP_LL} ({q}): капча на выдаче не решена")
+                    queue.append((lon, lat, span, z, q))
+                    captcha_streak += 1
+                    if captcha_streak >= MAX_CAPTCHA_STREAK:
+                        log.error(
+                            "Капча не решается %d тайлов подряд — IP "
+                            "забанен, крутиться дальше бессмысленно. "
+                            "Прогресс сохранён, продолжай позже той же "
+                            "командой (лучше сменив IP/уменьшив темп).",
+                            captcha_streak)
+                        break
+                    page.wait_for_timeout(cooldown_sec * 1000)
+                    continue
                 except Exception as exc:
                     record_error(f"Тайл {MAP_LL} ({q}): {exc}")
                     # №: тайл с ошибкой раньше помечался done — обрыв сети на
@@ -9523,7 +10004,7 @@ def run_country_sweep(
                         continue
                     if not o.search_query:
                         o.search_query = q
-                        o.gt_slug = category_of(q)[1]
+                        o.gt_slug = category_for(o, q)[1]
                     k = _dedup_key(o)
                     if k in seen:
                         continue
@@ -10525,6 +11006,14 @@ def _dispatch_parallel(args, workers: int, headless: bool,
                     continue
             missing = [c for c in cities if c not in done]
             if not missing:
+                return 0
+            stuck = [p for p in parts if _captcha_stop_flag(p).exists()]
+            if stuck:
+                # Воркеры встали на капче: добор тут же, с того же IP, свежим
+                # браузером — ровно то, от чего они остановились.
+                print(f"\n⛔ Воркеры остановились на капче — добор {len(missing)} "
+                      f"НП отложен. Подожди, снизь -w и запусти ту же команду: "
+                      f"прогон продолжится с места обрыва.")
                 return 0
             print(f"\n🩹 Добор: {len(missing)} город(ов) остались несобранными "
                   f"({', '.join(missing[:6])}{'…' if len(missing) > 6 else ''}) — "

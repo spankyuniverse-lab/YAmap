@@ -18,9 +18,27 @@ for q in qs:
     if lab not in labels:
         labels.append(lab)
 check(labels == ["Заправки", "Поесть", "Продуктовые магазины",
-                 "Гипермаркеты"], f"GT = 4 категории: {labels}")
-check(y.category_of("Супермаркет")[0] == "Продуктовые магазины",
-      "«Супермаркет» ложится в «Продуктовые магазины», отдельной категории нет")
+                 "Супермаркеты", "Гипермаркеты"], f"GT = 5 категорий, как в 2ГИС: {labels}")
+check(y.category_of("Супермаркет")[0] == "Супермаркеты",
+      "«Супермаркет» — своя категория, как rubricId 350 в 2ГИС")
+# Категорию продуктовой точке даёт её основная рубрика, а не запрос: один и
+# тот же супермаркет Яндекс отдаёт и на «Магазин продуктов».
+sup = y.Organization(name="s", category="Супермаркет, Магазин продуктов",
+                     category_seonames="supermarket; grocery")
+check(y.category_for(sup, "Магазин продуктов") == ("Супермаркеты", "gt_supermarkety"),
+      "супермаркет, найденный «Магазином продуктов», уходит в «Супермаркеты»")
+gro = y.Organization(name="g", category="Магазин продуктов, Супермаркет",
+                     category_seonames="grocery; supermarket")
+check(y.category_for(gro, "Супермаркет") == ("Продуктовые магазины", "gt_produktovye"),
+      "решает ПЕРВАЯ рубрика: «Супермаркет» вторым — это продуктовый")
+check(y.category_for(sup, "Кафе") == ("Поесть", "gt_poest"),
+      "вне продуктовой группы категорию даёт запрос")
+check(y.category_for(y.Organization(name="m", category="Магазин мяса"), "Супермаркет")
+      == ("Продуктовые магазины", "gt_produktovye"),
+      "незнакомая рубрика — «Продуктовые», с какого бы продуктового запроса ни нашли")
+check(y.category_for(y.Organization(name="t", category="Торговый центр"), "Гипермаркет")
+      == ("Гипермаркеты", "gt_gipermarkety"),
+      "ТЦ с «Гипермаркета» остаётся в «Гипермаркетах», а не в «Продуктовых»")
 check(len(qs) > 5, f"под категориями несколько запросов Яндексу: {len(qs)}")
 check(y.category_of("Ресторан")[0] == "Поесть", "«Ресторан» ложится в «Поесть»")
 check(y.category_of("Кафе")[1] == "gt_poest", "слаг у всех запросов категории один")
@@ -38,7 +56,7 @@ check(y.resolve_categories(["gt-fuel"]) == ["Заправки"],
 # Слаг есть у каждого запроса
 slugs = {y.category_of(q)[1] for q in qs}
 check(all(slugs) and slugs == {"gt_zapravki", "gt_poest", "gt_produktovye",
-                               "gt_gipermarkety"},
+                               "gt_supermarkety", "gt_gipermarkety"},
       f"слаги проставлены: {sorted(slugs)}")
 
 # Книга: лист на категорию, город — колонкой

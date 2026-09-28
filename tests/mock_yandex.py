@@ -34,17 +34,45 @@ _CITY_LL = {
     "Астана": (71.45, 51.17),
     "Шымкент": (69.60, 42.32),
     "Караганда": (73.11, 49.80),
+    # Знаменитый тёзка: на «<рубрика> Октябрьский» настоящий Яндекс уводит в
+    # российский Октябрьский (Башкирия), а не в костанайский — тест дрейфа.
+    "Октябрьский": (53.47, 54.48),
 }
 
 
-def _city_ll(city: str) -> tuple[float, float]:
-    return _CITY_LL.get((city or "").strip(), (76.89, 43.24))
+def _city_ll(city: str, ll: str = "") -> tuple[float, float]:
+    """Центр выдачи: известный город из текста, иначе окно карты (ll из URL).
+
+    Как у настоящего Яндекса: с топонимом в тексте он ищет у топонима, без
+    него — в видимой области карты.
+    """
+    city = (city or "").strip()
+    if city in _CITY_LL:
+        return _CITY_LL[city]
+    try:
+        lon, lat = (float(x) for x in ll.split(","))
+        return lon, lat
+    except (ValueError, AttributeError):
+        return (76.89, 43.24)
 
 
-def _org(query: str, city: str, n: int) -> dict:
+def _split_text(text: str) -> tuple[str, str]:
+    """«Ровно страница Алматы» → («Ровно страница», «Алматы»); голая рубрика →
+    (рубрика, ""). Сперва самая длинная рубрика макета, потом «хвост = город»."""
+    for key in sorted(CATALOG, key=len, reverse=True):
+        if text == key:
+            return key, ""
+        if text.startswith(key + " "):
+            return key, text[len(key) + 1:]
+    parts = text.rsplit(" ", 1)
+    return (parts[0], parts[1]) if len(parts) == 2 else (text, "")
+
+
+def _org(query: str, city: str, n: int, ll: str = "") -> dict:
     """Организация в том виде, в каком её кладёт в SSR настоящий Яндекс."""
+    cx, cy = _city_ll(city, ll)
     return {
-        "id": f"{abs(hash((query, city, n))) % 10**11}",
+        "id": f"{abs(hash((query, city or ll, n))) % 10**11}",
         "seoname": f"org_{n}",
         "name": f"{query} №{n} {city}",
         "categories": [{"name": query}],
@@ -58,7 +86,7 @@ def _org(query: str, city: str, n: int) -> dict:
         # выглядел правдоподобно ровно до тех пор, пока парсер не научился
         # отсеивать результаты, уехавшие от центра поиска (тёзки вроде двух
         # «Актау» в 1400 км друг от друга).
-        "coordinates": [_city_ll(city)[0] + n / 1000, _city_ll(city)[1] + n / 1000],
+        "coordinates": [cx + n / 1000, cy + n / 1000],
         "phones": [{"type": "phone", "formatted": f"+7 701 000-{n:04d}"}],
         "urls": [f"https://example.kz/{n}"],
         "ratingData": {"ratingValue": 4.0, "reviewCount": 10 + n},
@@ -67,9 +95,9 @@ def _org(query: str, city: str, n: int) -> dict:
     }
 
 
-def _html(query: str, city: str, page: int, total: int) -> str:
+def _html(query: str, city: str, page: int, total: int, ll: str = "") -> str:
     start = page * PAGE_SIZE
-    items = [_org(query, city, i) for i in range(start, min(start + PAGE_SIZE, total))]
+    items = [_org(query, city, i, ll) for i in range(start, min(start + PAGE_SIZE, total))]
     has_more = start + PAGE_SIZE < total
     state = json.dumps({"data": {"items": items}}, ensure_ascii=False)
 
@@ -124,7 +152,8 @@ def _html(query: str, city: str, page: int, total: int) -> str:
 <script>
 function loadMore(next) {{
   fetch('/maps/api/search?text=' + encodeURIComponent({json.dumps(query)}) +
-        '&city=' + encodeURIComponent({json.dumps(city)}) + '&page=' + next)
+        '&city=' + encodeURIComponent({json.dumps(city)}) +
+        '&ll=' + encodeURIComponent({json.dumps(ll)}) + '&page=' + next)
     .then(r => r.json())
     .then(d => {{
       const ul = document.getElementById('list');
@@ -156,9 +185,9 @@ class Handler(BaseHTTPRequestHandler):
         u = urllib.parse.urlparse(self.path)
         q = urllib.parse.parse_qs(u.query)
         text = (q.get("text") or [""])[0]
-        # «Заправки Алматы» → категория + город
-        parts = text.rsplit(" ", 1)
-        query, city = (parts[0], parts[1]) if len(parts) == 2 else (text, "")
+        ll = (q.get("ll") or [""])[0]
+        # «Заправки Алматы» → категория + город; «Заправки» → только категория
+        query, city = _split_text(text)
         total = CATALOG.get(query, 0)
 
         if u.path.startswith("/maps/api/search"):
@@ -183,7 +212,7 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     query, total = api_text, 0
             start = page * PAGE_SIZE
-            items = [_org(query, city, i) for i in range(start, min(start + PAGE_SIZE, total))]
+            items = [_org(query, city, i, ll) for i in range(start, min(start + PAGE_SIZE, total))]
             body = json.dumps({"data": {"items": items},
                                "hasMore": start + PAGE_SIZE < total},
                               ensure_ascii=False).encode()
@@ -194,7 +223,7 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
             return
 
-        body = _html(query, city, 0, total).encode()
+        body = _html(query, city, 0, total, ll).encode()
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
