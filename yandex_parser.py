@@ -2239,6 +2239,40 @@ _FOREIGN_ADDR_RE = re.compile(
     re.IGNORECASE,
 )
 
+#: Как Яндекс пишет страну организации (поле country / «Страна»).
+_COUNTRY_NAMES: dict[str, set[str]] = {
+    "kz": {"казахстан", "қазақстан", "kazakhstan", "республика казахстан"},
+    "uz": {"узбекистан", "ўзбекистон", "o'zbekiston", "oʻzbekiston", "uzbekistan"},
+    "kg": {"кыргызстан", "киргизия", "кыргыз республикасы", "kyrgyzstan"},
+}
+#: Адресные маркеры стран зоны сбора — отсекаем те, что НЕ в активных странах
+#: (при --countries kz узбекские и киргизские точки у границы — чужие).
+_ZONE_ADDR_RE: dict[str, re.Pattern] = {
+    "uz": re.compile(r"\bУзбекистан\b|\bЎзбекистон|\bТашкент\b(?!ская)|"
+                     r"\bТашкентская обл", re.IGNORECASE),
+    "kg": re.compile(r"\bКыргызстан\b|\bКиргизия\b|\bБишкек\b|\bЧуйская обл|"
+                     r"\bОшская обл|\bТаласская обл", re.IGNORECASE),
+    "kz": re.compile(r"\bКазахстан\b|\bҚазақстан\b", re.IGNORECASE),
+}
+
+
+def _outside_active_countries(org: "Organization") -> bool:
+    """Точка не из активных стран сбора: Россия, Китай — всегда; Узбекистан и
+    Киргизия — если их нет в --countries. По полю «Страна» из Яндекса, а без
+    него — по адресу."""
+    country = (org.country or "").strip().lower()
+    if country:
+        # Страну Яндекс пишет сам — ей и верим: адресу казахстанской точки на
+        # «улице Ташкент» по маркерам было бы не отличить от узбекской.
+        allowed = set().union(*(_COUNTRY_NAMES.get(c, set()) for c in ACTIVE_COUNTRIES))
+        return country not in allowed
+    addr = f"{org.address or ''} {org.full_address or ''}"
+    if _FOREIGN_ADDR_RE.search(addr):
+        return True
+    return any(rx.search(addr) for code, rx in _ZONE_ADDR_RE.items()
+               if code not in ACTIVE_COUNTRIES)
+
+
 # Таймзона/локаль браузера должны соответствовать домену (анти-фрод консистентность).
 DOMAIN_TZ: dict[str, str] = {
     "yandex.kz": "Asia/Almaty",
@@ -8282,6 +8316,10 @@ def run_category_parser(
       def _collect_on(ctx: Any, page: Any) -> None:
         """Пройти все категории города на уже открытой вкладке."""
 
+        # Выдача с названием НП хоть раз ушла к тёзке — остальные рубрики этого
+        # НП ищем сразу по карте: иначе каждая сперва сходила бы в Россию.
+        map_only = False
+
         # Общий браузер (--all-cities): карта стоит там, где кончился поиск по
         # прошлому НП, и запрос «<рубрика> <НП>» Яндекс разбирал ОТТУДА —
         # тёзки уводили выдачу за сотни километров. Переводим карту на этот
@@ -8311,20 +8349,34 @@ def run_category_parser(
             q_started = time.time()
 
             try:
-                orgs = _search_with_retry(
-                    page, full_query, max_results_per_category,
-                    scroll_pause, api_intercept, headless=headless, tiles=tiles,
-                )
-                if orgs and not tiles and center_ll:
-                    orgs, retry_started = _retry_if_drifted(
-                        page, orgs, cat_query, full_query, center_ll,
-                        max_results_per_category, scroll_pause, api_intercept,
-                        headless)
-                    if retry_started:
-                        # Пауза до следующей рубрики считается от ПОВТОРА:
-                        # иначе время двух поисков шло «кредитом» и пауза
-                        # после пары запросов выходила короче положенной.
-                        q_started = retry_started
+                if map_only:
+                    log.info("↪ «%s»: у этого НП выдача уже уходила — ищу «%s» "
+                             "сразу по карте НП", full_query, cat_query)
+                    try:
+                        orgs, _ = _search_on_map(
+                            page, cat_query, center_ll, max_results_per_category,
+                            scroll_pause, api_intercept, headless)
+                    except CaptchaUnsolved:
+                        raise
+                    except Exception as exc:
+                        log.warning("↪ карта не перешла на НП (%s)", exc)
+                        orgs = []
+                else:
+                    orgs = _search_with_retry(
+                        page, full_query, max_results_per_category,
+                        scroll_pause, api_intercept, headless=headless, tiles=tiles,
+                    )
+                    if orgs and not tiles and center_ll:
+                        orgs, retry_started = _retry_if_drifted(
+                            page, orgs, cat_query, full_query, center_ll,
+                            max_results_per_category, scroll_pause, api_intercept,
+                            headless)
+                        if retry_started:
+                            # Пауза до следующей рубрики — от ПОВТОРА: иначе
+                            # время двух поисков шло «кредитом» и пауза после
+                            # пары запросов выходила короче положенной.
+                            q_started = retry_started
+                            map_only = True
             except CaptchaUnsolved:
                 record_error(f"«{full_query}»: капча не решена — НП не собран")
                 if captcha_missed is not None:
@@ -8577,9 +8629,39 @@ def _plausible_here(org: "Organization", center_ll: str) -> bool:
     Тот же фильтр, что в run_cities_parser: из ушедшей выдачи он оставляет
     всё, что оставлял и раньше, — повтор только добавляет, не отнимает.
     """
-    if org.address and _FOREIGN_ADDR_RE.search(org.address):
+    if _outside_active_countries(org):
         return False
     return not _too_far_from_viewport(org, center_ll)
+
+
+def _search_on_map(
+    page: Page,
+    cat_query: str,
+    center_ll: str,
+    max_results: int,
+    scroll_pause: float,
+    api_intercept: bool,
+    headless: bool,
+) -> tuple[list[Organization], float]:
+    """Голая рубрика по карте НП (z ≥ DRIFT_RETRY_Z), без топонима в тексте.
+
+    Возвращает (правдоподобные для НП точки, время начала поиска — после
+    перехода карты). Сбой перехода бросается наверх, CaptchaUnsolved — тоже.
+    """
+    global MAP_LL, MAP_Z
+    saved = (MAP_LL, MAP_Z)
+    MAP_LL, MAP_Z = center_ll, max(MAP_Z, DRIFT_RETRY_Z)
+    try:
+        page.goto(_map_view_url(), wait_until="domcontentloaded", timeout=30000)
+        page.wait_for_timeout(_pace(random.randint(1500, 3000)))
+        # Засекаем ПОСЛЕ перехода: загрузка карты и намеренная пауза — не
+        # «простой» запроса, в кредит паузы до следующей рубрики не идут.
+        started = time.time()
+        found = _search_with_retry(page, cat_query, max_results, scroll_pause,
+                                   api_intercept, headless=headless)
+    finally:
+        MAP_LL, MAP_Z = saved
+    return [o for o in found if _plausible_here(o, center_ll)], started
 
 
 def _retry_if_drifted(
@@ -8598,7 +8680,6 @@ def _retry_if_drifted(
     Возвращает (организации, время начала повтора или None, если повтора не
     было). Сбой перехода на карту НП повтор отменяет, а не обрывает НП.
     """
-    global MAP_LL, MAP_Z
     drifted, near, known = _is_drifted(orgs, center_ll)
     if not drifted:
         return orgs, None
@@ -8608,26 +8689,17 @@ def _retry_if_drifted(
     # Повтор — это ещё один запрос к Яндексу: перед ним та же пауза, что
     # между рубриками, целиком и с множителем троттлинга.
     page.wait_for_timeout(get_throttle().get_pause(base_ms=random.randint(3000, 6000)))
-    saved = (MAP_LL, MAP_Z)
-    MAP_LL, MAP_Z = center_ll, max(MAP_Z, DRIFT_RETRY_Z)
     try:
-        try:
-            page.goto(_map_view_url(), wait_until="domcontentloaded", timeout=30000)
-            page.wait_for_timeout(_pace(random.randint(1500, 3000)))
-        except Exception as exc:
-            log.warning("↪ карта не перешла на НП (%s) — оставляю выдачу как есть", exc)
-            return orgs, time.time()
-        # Засекаем ПОСЛЕ перехода: загрузка карты и намеренная пауза — не
-        # «простой» запроса, в кредит паузы до следующей рубрики не идут.
-        started = time.time()
-        again = _search_with_retry(page, cat_query, max_results, scroll_pause,
-                                   api_intercept, headless=headless)
-    finally:
-        MAP_LL, MAP_Z = saved
+        again, started = _search_on_map(page, cat_query, center_ll, max_results,
+                                         scroll_pause, api_intercept, headless)
+    except CaptchaUnsolved:
+        raise
+    except Exception as exc:
+        log.warning("↪ карта не перешла на НП (%s) — оставляю выдачу как есть", exc)
+        return orgs, time.time()
     first = [o for o in orgs if _plausible_here(o, center_ll)]
     seen_keys = {_dedup_key(o) for o in first}
-    kept = [o for o in again
-            if _plausible_here(o, center_ll) and _dedup_key(o) not in seen_keys]
+    kept = [o for o in again if _dedup_key(o) not in seen_keys]
     log.info("↪ «%s» по карте НП: +%d новых точек (из ушедшей выдачи оставлено "
              "%d, отброшено %d)", cat_query, len(kept), len(first),
              len(orgs) - len(first))
@@ -8676,8 +8748,11 @@ def run_cities_parser(
     # после первого же города.
     done: set[str] = _done_cities(out_path)
 
-    def _seed(orgs: list[Organization]) -> None:
+    def _seed(orgs: list[Organization], center_ll: str = "") -> None:
         for o in orgs:
+            # Часть НП пишется до фильтра — при докачке чужое возвращалось бы.
+            if _outside_active_countries(o) or _too_far_from_viewport(o, center_ll):
+                continue
             key = _dedup_key(o)
             if key not in seen:
                 seen.add(key)
@@ -8707,7 +8782,7 @@ def run_cities_parser(
         if book_mtime and part.stat().st_mtime < book_mtime - 5:
             skipped += 1          # эта часть уже слита в книгу
             continue
-        _seed(_load_existing_orgs(part))
+        _seed(_load_existing_orgs(part), PLACES_ALL.get(city, ""))
         read_parts += 1
     if done or seen:
         log.info("Резюме: %d городов уже пройдено, %d организаций поднято"
@@ -8782,7 +8857,7 @@ def run_cities_parser(
                     # попадала в выгрузку из режима городов и выбрасывалась из
                     # режима страны, то есть слияние двух файлов давало разное
                     # число строк в зависимости от порядка.
-                    if o.address and _FOREIGN_ADDR_RE.search(o.address):
+                    if _outside_active_countries(o):
                         foreign += 1
                         continue
                     # Название НП может совпадать с известным городом за тысячу
@@ -9329,6 +9404,8 @@ def _merge_parts(parts: list[Path], out_path: Path) -> list[Organization]:
             continue
         seen_files.add(src)
         for o in _load_existing_orgs(src):
+            if _outside_active_countries(o):
+                continue
             key = _dedup_key(o)
             if key in seen:
                 continue
@@ -9999,7 +10076,7 @@ def run_country_sweep(
                 for o in tile_orgs:
                     # Приграничный вьюпорт видит чужие города (Ташкент от
                     # Сарыагаша в 20 км) — зарубежные адреса не берём.
-                    if o.address and _FOREIGN_ADDR_RE.search(o.address):
+                    if _outside_active_countries(o):
                         foreign_dropped += 1
                         continue
                     if not o.search_query:

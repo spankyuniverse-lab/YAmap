@@ -271,6 +271,20 @@ def drift_units() -> None:
         check((o.place, y._major_city_of(o)) == (want_place, want_major),
               f"{loc} → {want_place}{' (крупный)' if want_major else ''}",
               (y._place_of(o), y._major_city_of(o)))
+    # Только страны сбора: Россия — всегда чужая, Киргизия — если её нет в --countries
+    y.set_countries(["kz"])
+    out_ = y._outside_active_countries
+    check(out_(O(name="a", country="Россия")), "Россия — чужая")
+    check(out_(O(name="b", country="Кыргызстан")), "при --countries kz Киргизия — чужая")
+    check(out_(O(name="c", address="Бишкек, проспект Чуй, 1")),
+          "без поля страны — по адресу: Бишкек чужой")
+    check(not out_(O(name="d", country="Казахстан", address="Алматы, улица Ташкент, 5")),
+          "казахстанская точка на «улице Ташкент» — своя (стране верим)")
+    check(not out_(O(name="e", address="Алматы, Ташкентская улица, 1")),
+          "«Ташкентская улица» — не Ташкент")
+    y.set_countries(["kz", "kg"])
+    check(not out_(O(name="f", country="Кыргызстан")), "при --countries kz,kg Киргизия своя")
+
     # Метка страны у тёзки не ломается латиницей → кириллицей
     y.set_countries(None)
     check(y._place_norm("Благовещенка [KG]") == "благовещенка",
@@ -291,7 +305,7 @@ def drift_e2e() -> None:
         print("ПРОПУСК: браузер не найден (playwright/chromium не установлен)")
         return
     import mock_yandex
-    base, srv = mock_yandex.start({"Заправки": 7})
+    base, srv = mock_yandex.start({"Заправки": 7, "Кафе": 5})
     env = dict(os.environ)
     env.update({"YAMAP_BASE_URL": base, "YAMAP_BROWSER_PATH": browser,
                 "YAMAP_HEADLESS": "1", "PYTHONIOENCODING": "utf-8",
@@ -301,7 +315,7 @@ def drift_e2e() -> None:
         r = subprocess.run(
             [sys.executable, str(HERE.parent / "yandex_parser.py"),
              "--all-cities", "--cities", "Алматы,Октябрьский", "--countries", "kz",
-             "--category", "Заправки", "-n", "50", "-o", str(out)],
+             "--category", "Заправки", "Кафе", "-n", "50", "-o", str(out)],
             cwd=HERE, env=env, capture_output=True, text=True, timeout=600)
     finally:
         srv.shutdown()
@@ -310,6 +324,9 @@ def drift_e2e() -> None:
     drifts = log.count("выдача ушла от НП")
     check(drifts == 1, "повтор ровно один — у Октябрьского, не у Алматы", drifts)
     check("Ищу «Заправки» по карте НП" in log, "повтор — голая рубрика без названия")
+    check(log.count("у этого НП выдача уже уходила") == 1,
+          "следующая рубрика Октябрьского — сразу по карте, без захода к тёзке",
+          log.count("у этого НП выдача уже уходила"))
     if not out.exists():
         check(False, "книга создана")
         return
@@ -320,10 +337,10 @@ def drift_e2e() -> None:
     rows = [r for r in ws.iter_rows(min_row=2, values_only=True)]
     okt = [r for r in rows if r[ic] == "Октябрьский"]
     lon0, lat0 = (float(x) for x in y.PLACES_ALL["Октябрьский"].split(","))
-    check(len(okt) == 7, f"у Октябрьского свои 7 заправок: {len(okt)}")
+    check(len(okt) == 12, f"у Октябрьского свои 7 заправок и 5 кафе: {len(okt)}")
     far = [r for r in okt if km(lat0, lon0, float(r[ila]), float(r[ilo])) > 40]
     check(not far, "ни одной точки из российского тёзки", len(far))
-    check(sum(1 for r in rows if r[ic] == "Алматы") == 7, "Алматы собрана как обычно")
+    check(sum(1 for r in rows if r[ic] == "Алматы") == 12, "Алматы собрана как обычно")
 
 
 def _clean_own() -> None:
