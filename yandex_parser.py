@@ -10333,6 +10333,12 @@ def main() -> None:
              "у --country (--category gt-село и т.п.).",
     )
     parser.add_argument(
+        "--no-split", action="store_true",
+        help="--routes/--country: не делить «плотные» тайлы на 4. Плотный тайл — "
+             "это город, а города собирает --all-cities; на трассах деление "
+             "лишь заново листает городские кафе по 6 минут на тайл.",
+    )
+    parser.add_argument(
         "--corridor", type=int, default=3,
         help="Ширина коридора --routes в тайлах (по умолч. 3: тайл трассы + "
              "по одному с каждой стороны ≈ 60 км полоса; 1 — быстрее, но "
@@ -10819,6 +10825,7 @@ def main() -> None:
             shard=shard,
             base_tiles=tiles,
             label="Казахстан — трассы",
+            adaptive=not getattr(args, "no_split", False),
         )
         print(f"\nГотово (или приостановлено)! Собрано {len(orgs)} организаций -> {output}")
         return
@@ -10865,6 +10872,7 @@ def main() -> None:
             cooldown_every=args.cooldown_every or 40,
             cooldown_sec=args.cooldown_sec,
             shard=shard,
+            adaptive=not getattr(args, "no_split", False),
         )
         print(f"\nГотово (или приостановлено)! Собрано {len(orgs)} организаций -> {output}")
         return
@@ -10987,6 +10995,8 @@ def _dispatch_parallel(args, workers: int, headless: bool,
     # --run-dir тоже не нужен по той же причине.
     if getattr(args, "url_only", False):
         base.append("--url-only")
+    if getattr(args, "no_split", False):
+        base.append("--no-split")
     if getattr(args, "fast_api", False):
         base.append("--fast-api")
     if args.detail:
