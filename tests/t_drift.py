@@ -242,8 +242,14 @@ def drift_units() -> None:
     y.set_viewport(city="Павлодар")
     stop = y._drift_stop_check(Coll(away + [org(500 + i, 2.5, -1.0) for i in range(10)]))
     check(bool(stop and stop()), "первая страница чужая — прокрутка встаёт")
-    stop = y._drift_stop_check(Coll(local + tail))
-    check(stop is not None and stop() == "", "своя первая страница — листаем дальше")
+    stop = y._drift_stop_check(Coll(local + [org(700 + i, 0.05, 0.05) for i in range(40)]))
+    check(stop is not None and stop() == "", "своя выдача — листаем дальше")
+    # Своя первая страница, но хвост уполз за 40 км — дальше не листаем
+    far_tail = [org(600 + i, 0.8, 0.5) for i in range(30)]           # ~95 км
+    stop = y._drift_stop_check(Coll(local + far_tail))
+    check(bool(stop and stop()), "хвост выдачи 30 точек подряд за 40 км — прокрутка встаёт")
+    stop = y._drift_stop_check(Coll(local + far_tail[:20] + [org(800, 0.02, 0.02)] + far_tail[20:]))
+    check(stop is not None and stop() == "", "хвост перемешан со своими — листаем дальше")
     y.set_viewport(city="Такого-НП-нет")
     check(y._drift_stop_check(Coll(away)) is None, "без центра НП проверки нет")
     y.set_viewport(city="Павлодар")

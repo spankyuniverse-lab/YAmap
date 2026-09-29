@@ -8678,27 +8678,44 @@ def _search_on_map(
     return [o for o in found if _plausible_here(o, center_ll)], started
 
 
+#: Хвост выдачи ушёл от НП: FAR_TAIL_RUN последних точек подряд дальше
+#: FAR_TAIL_KM. У села с горсткой своих точек Яндекс листает выдачу всё
+#: дальше: «Столовая» у Аксуата — 857 точек и полчаса скролла ради 35 своих.
+#: Дальние точки и так собирает поиск по их собственным НП.
+FAR_TAIL_KM = 40.0
+FAR_TAIL_RUN = 30
+
+
 def _drift_stop_check(collector: "_ApiCollector | None"):
-    """Проверка для scroll_and_parse: первые DRIFT_HEAD точек API с
-    координатами легли не у НП — листать дальше незачем, повтор по карте
-    всё равно будет. Центр — только настоящий центр НП (MAP_LL_IS_PLACE)."""
+    """Проверка для scroll_and_parse по точкам API с координатами:
+    первые DRIFT_HEAD легли не у НП — выдача ушла (будет повтор по карте);
+    последние FAR_TAIL_RUN подряд дальше FAR_TAIL_KM — хвост уполз от НП.
+    Центр — только настоящий центр НП (MAP_LL_IS_PLACE)."""
     if collector is None or not (MAP_LL and MAP_LL_IS_PLACE):
         return None
     center = MAP_LL
-    decided = {"done": False}
+    try:
+        lon0, lat0 = (float(x) for x in center.split(","))
+    except ValueError:
+        return None
+    head = {"done": False}
 
     def check() -> str:
-        if decided["done"]:
-            return ""
         with_coords = [o for o in list(collector.by_key.values())
                        if o.latitude and o.longitude]
-        if len(with_coords) < DRIFT_HEAD:
-            return ""
-        decided["done"] = True
-        drifted, near, known = _is_drifted(with_coords, center)
-        if drifted:
-            return (f"Выдача ушла от НП: из первых {known} точек ближе "
-                    f"{DRIFT_NEAR_KM:.0f} км лишь {near}")
+        if not head["done"]:
+            if len(with_coords) < DRIFT_HEAD:
+                return ""
+            head["done"] = True
+            drifted, near, known = _is_drifted(with_coords, center)
+            if drifted:
+                return (f"Выдача ушла от НП: из первых {known} точек ближе "
+                        f"{DRIFT_NEAR_KM:.0f} км лишь {near}")
+        if len(with_coords) >= DRIFT_HEAD + FAR_TAIL_RUN:
+            tail = [_km_to(o, lat0, lon0) for o in with_coords[-FAR_TAIL_RUN:]]
+            if all(d is not None and d > FAR_TAIL_KM for d in tail):
+                return (f"Хвост выдачи ушёл от НП: {FAR_TAIL_RUN} точек подряд "
+                        f"дальше {FAR_TAIL_KM:.0f} км")
         return ""
 
     return check
