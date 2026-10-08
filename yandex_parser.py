@@ -2894,6 +2894,13 @@ class Organization:
     # НП по адресу из Яндекса (а не НП, на котором точку нашли) — считается
     # заново при каждом сохранении книги, см. _place_of
     place: str = ""
+    # загруженность по часам (histogramData): 7 дней × 24 часа, доли недельных
+    # визитов (в сумме 1.0) — форма потока, не объём; есть не у всех точек
+    visit_profile: str = ""      # JSON {"mon":[24 доли],…}, округлено
+    visit_peak_hour: str = ""    # час с наибольшей средней долей, 0–23
+    visit_weekend_share: str = ""  # доля визитов в субботу и воскресенье
+    visit_evening_share: str = ""  # доля визитов 17:00–22:59
+    review_aspects: str = ""     # aspects: «Персонал 12 (+6/−4); Бензин 11 (+8/−3)»
 
 
 FIELDNAMES = [f.name for f in fields(Organization)]
@@ -5267,6 +5274,41 @@ def _explicit_zero(data: dict) -> bool:
     return False
 
 
+_WEEK_KEYS = (("monday", "mon"), ("tuesday", "tue"), ("wednesday", "wed"),
+              ("thursday", "thu"), ("friday", "fri"), ("saturday", "sat"),
+              ("sunday", "sun"))
+
+
+def _fill_visit_profile(org: "Organization", hist: Any) -> None:
+    """histogramData Яндекса → профиль и метрики загруженности.
+
+    Это доли недельных визитов по часам (в сумме ~1.0): форма потока, а не
+    число людей. Объём даёт число оценок (rating_count) — вместе они
+    оценивают трафик точки и её пики.
+    """
+    if not isinstance(hist, dict):
+        return
+    days: dict[str, list[float]] = {}
+    for full, short in _WEEK_KEYS:
+        vals = hist.get(full)
+        if not isinstance(vals, list) or len(vals) != 24:
+            return
+        try:
+            days[short] = [float(v) for v in vals]
+        except (TypeError, ValueError):
+            return
+    total = sum(sum(v) for v in days.values())
+    if total <= 0:
+        return
+    by_hour = [sum(days[d][h] for d in days) for h in range(24)]
+    org.visit_profile = json.dumps(
+        {d: [round(x / total, 4) for x in v] for d, v in days.items()},
+        separators=(",", ":"))
+    org.visit_peak_hour = str(max(range(24), key=lambda h: by_hour[h]))
+    org.visit_weekend_share = f"{(sum(days['sat']) + sum(days['sun'])) / total:.3f}"
+    org.visit_evening_share = f"{sum(by_hour[17:23]) / total:.3f}"
+
+
 def _org_from_item(feat: dict, total_count: str = "") -> Organization | None:
     """Собрать Organization из одного элемента API.
 
@@ -5431,6 +5473,18 @@ def _org_from_item(feat: dict, total_count: str = "") -> Organization | None:
     if isinstance(chain, dict):
         org.chain_id = _s(chain.get("id"))
         org.chain_name = _s(chain.get("name"))
+
+    # --- загруженность по часам и темы отзывов (тот же ответ, без запросов) ---
+    _fill_visit_profile(org, props.get("histogramData"))
+    asp = props.get("aspects")
+    if isinstance(asp, list) and asp:
+        parts = []
+        for a in asp:
+            if not isinstance(a, dict) or not a.get("text"):
+                continue
+            parts.append(f"{a.get('text')} {a.get('count', 0)} "
+                         f"(+{a.get('positive', 0)}/−{a.get('negative', 0)})")
+        org.review_aspects = "; ".join(parts)
 
     # --- рейтинг / отзывы ---
     rd = props.get("ratingData") or {}
@@ -6400,6 +6454,11 @@ HEADERS_RU = {
     "is_verified": "Подтверждён владельцем",
     "total_result_count": "Всего найдено",
     "place": "НП (по адресу)",
+    "visit_profile": "Загруженность по часам (доли недели)",
+    "visit_peak_hour": "Час пик",
+    "visit_weekend_share": "Доля выходных",
+    "visit_evening_share": "Доля вечера 17–23",
+    "review_aspects": "Темы отзывов",
 }
 
 

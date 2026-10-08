@@ -306,6 +306,27 @@ def drift_units() -> None:
     y.set_countries(["kz", "kg"])
     check(not out_(O(name="f", country="Кыргызстан")), "при --countries kz,kg Киргизия своя")
 
+    # Загруженность по часам из ответа Яндекса (histogramData) и темы отзывов
+    hist = {d: [0.0] * 24 for d in ("monday", "tuesday", "wednesday", "thursday",
+                                     "friday", "saturday", "sunday")}
+    for d in hist:
+        hist[d][18] = 3.0                      # вечерний пик каждый день
+        hist[d][9] = 1.0
+    hist["saturday"][18] = hist["sunday"][18] = 6.0
+    item = {"title": "ТРЦ", "type": "business", "histogramData": hist,
+            "aspects": [{"text": "Парковка", "count": 5, "positive": 4, "negative": 1}],
+            "ratingData": {"ratingValue": 4.5, "ratingCount": 900, "reviewCount": 120}}
+    o = y._org_from_item(item)
+    check(o is not None and o.visit_peak_hour == "18", "час пик из профиля", o and o.visit_peak_hour)
+    check(o is not None and abs(float(o.visit_weekend_share) - 14 / 34) < 0.002,
+          "доля выходных посчитана", o and o.visit_weekend_share)
+    check(o is not None and o.review_aspects == "Парковка 5 (+4/−1)", "темы отзывов",
+          o and o.review_aspects)
+    check(o is not None and abs(sum(sum(v) for v in json.loads(o.visit_profile).values()) - 1) < 0.01,
+          "профиль нормирован к 1")
+    bad = y._org_from_item({"title": "X", "type": "business", "histogramData": {"monday": [1]}})
+    check(bad is not None and bad.visit_profile == "", "кривой профиль не ломает разбор")
+
     # Метка страны у тёзки не ломается латиницей → кириллицей
     y.set_countries(None)
     check(y._place_norm("Благовещенка [KG]") == "благовещенка",
